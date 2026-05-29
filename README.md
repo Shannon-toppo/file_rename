@@ -72,6 +72,3 @@ python download.py -a list.txt -f mp3
 - タグ書き込み（`write_title`）は形式別です: `.mp3` / `.wav` は ID3 の `TIT2` フレーム、`.m4a` は MP4 の `\xa9nam` アトム。
 - LLM 応答とファイル数が一致しない場合は、誤ったファイルにタイトルを付けるのを避けるため処理を中断します。
 
-## 注意
-
-- `files/` 配下の音声ファイルは大容量かつ著作物のため、`.gitignore` でバージョン管理から除外しています（`files/.gitkeep` のみ追跡）。
