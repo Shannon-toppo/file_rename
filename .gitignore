@@ -1,6 +1,7 @@
 # 音声ファイル（大容量・著作物のためコミットしない）
 files/*
 !files/.gitkeep
+list.txt
 
 # Python
 __pycache__/
