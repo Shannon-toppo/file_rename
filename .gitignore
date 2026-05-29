@@ -1,0 +1,12 @@
+# 音声ファイル（大容量・著作物のためコミットしない）
+files/*
+!files/.gitkeep
+
+# Python
+__pycache__/
+*.py[oc]
+.venv/
+venv/
+
+# 環境変数
+.env
