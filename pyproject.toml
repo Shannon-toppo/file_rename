@@ -1,0 +1,18 @@
+[project]
+name = "file-rename"
+version = "0.1.0"
+description = "音声ファイルのタイトル推測・メタデータ書き込みスクリプト（mv2title のコンシューマ）"
+requires-python = ">=3.12"
+dependencies = [
+    "mutagen>=1.47",
+    "mv2title",
+    "python-dotenv>=1.0",
+    "yt-dlp>=2025.1.26",
+]
+
+[tool.uv]
+# スクリプト集であってパッケージではない（ビルド・インストールしない）
+package = false
+
+[tool.uv.sources]
+mv2title = { path = "../mv2title", editable = true }

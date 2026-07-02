@@ -21,10 +21,11 @@ import argparse
 import sys
 from pathlib import Path
 
+from mv2title import extract_titles
 from yt_dlp import YoutubeDL
 
-# rename.py（同階層）を再利用する。import 時に rename 側の
-# load_dotenv / sys.path 設定 / mv2title import がまとめて行われる。
+# rename.py（同階層）の write_title / FILES_DIR / make_client を再利用する。
+# import 時に rename 側の load_dotenv（mv2title/.env の読み込み）も行われる。
 import rename
 
 
@@ -84,12 +85,10 @@ def tag_with_rename(filepaths: list[Path]) -> None:
     if not filepaths:
         return
 
-    rename.connect.init()
     stems = [f.stem for f in filepaths]
     try:
-        results = rename.main_json.main(
-            stems, batch_size=5, bypass_check=True, debug_mode=False
-        )
+        client = rename.make_client()
+        results = extract_titles(stems, client, batch_size=5, bypass_check=True)
     except ValueError as e:
         print(f"Error: {e}")
         return
@@ -106,8 +105,8 @@ def tag_with_rename(filepaths: list[Path]) -> None:
         )
         return
 
-    for filepath, obj in zip(filepaths, results):
-        title = obj.get("title") or None
+    for filepath, res in zip(filepaths, results):
+        title = res.title or None
         if not title:
             print(f"  [SKIP] {filepath.name}  ->  empty title")
             continue

@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import sys
 from pathlib import Path
+
 from dotenv import load_dotenv
+from mutagen.id3 import ID3
+from mutagen.id3._frames import TIT2
+from mutagen.id3._util import ID3NoHeaderError
+from mutagen.mp4 import MP4
+from mutagen.wave import WAVE
+from mv2title import Config, LLMClient, extract_titles
 
 _ROOT = Path(__file__).parent.parent
 
-# mv2title/.env を先に読み込んでから connect.py のモジュールレベル load_dotenv() と競合させない
+# 接続設定は mv2title 側の .env を共用する（Config.from_env() が環境変数を読む前に載せる）
 load_dotenv(_ROOT / "mv2title" / ".env")
-
-sys.path.insert(0, str(_ROOT))
-
-from mv2title import connect, main_json  # noqa: E402
-from mutagen.id3 import ID3  # noqa: E402
-from mutagen.id3._frames import TIT2  # noqa: E402
-from mutagen.id3._util import ID3NoHeaderError  # noqa: E402
-from mutagen.wave import WAVE  # noqa: E402
-from mutagen.mp4 import MP4  # noqa: E402
 
 FILES_DIR = Path(__file__).parent / "files"
 SUPPORTED_EXTS = (".mp3", ".wav", ".m4a")
@@ -27,6 +24,11 @@ def get_music_files():
     for ext in SUPPORTED_EXTS:
         files.extend(FILES_DIR.glob(f"*{ext}"))
     return sorted(files)
+
+
+def make_client() -> LLMClient:
+    """mv2title/.env の設定で LLMClient を作る（download.py からも使う）。"""
+    return LLMClient(Config.from_env())
 
 
 def write_title(filepath: Path, title: str):
@@ -66,9 +68,9 @@ def main():
         print(f"  {f.name}")
 
     print("\nSending to mv2title...")
-    connect.init()
     try:
-        results = main_json.main(filenames, batch_size=5, bypass_check=True, debug_mode=False)
+        client = make_client()
+        results = extract_titles(filenames, client, batch_size=5, bypass_check=True)
     except ValueError as e:
         print(f"Error: {e}")
         return
@@ -77,8 +79,8 @@ def main():
         print("Error: mv2title returned an empty response.")
         return
 
-    # main_json.send_batches_json は入力順を保ったまま結果を返すので、
-    # 位置で対応付ける。長さ不一致時は誤マッチを避けるため中断する。
+    # extract_titles は入力と同数・同順で返す契約だが、誤マッチはファイルを壊すため
+    # 念のため長さを確認してから位置で対応付ける。
     if len(results) != len(music_files):
         print(
             f"Error: response length ({len(results)}) does not match file count "
@@ -87,11 +89,11 @@ def main():
         return
 
     print("\nWriting titles to metadata:")
-    for filepath, obj in zip(music_files, results):
-        if not obj.get("valid", False):
+    for filepath, res in zip(music_files, results):
+        if not res.valid:
             print(f"  [SKIP] {filepath.name}  ->  validation failed")
             continue
-        title = obj.get("title") or None
+        title = res.title or None
         if not title:
             print(f"  [SKIP] {filepath.name}  ->  empty title")
             continue

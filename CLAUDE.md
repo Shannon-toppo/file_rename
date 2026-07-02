@@ -12,27 +12,26 @@ This folder holds **consumer scripts for the `mv2title` library** (which lives i
 
 ## How it wires to mv2title
 
-Both scripts bootstrap the same way (see top of `rename.py`):
+Dependencies are declared in this folder's own `pyproject.toml` (uv-managed, `package = false`): **mutagen**, **yt-dlp**, **python-dotenv**, and **mv2title as an editable path dependency** (`[tool.uv.sources] mv2title = { path = "../mv2title", editable = true }`). Run `uv sync` here to create the venv — no `sys.path` manipulation anywhere.
 
-1. `load_dotenv(_ROOT / "mv2title" / ".env")` is called **before** importing `mv2title.connect`, so the env (`BASE_URL`, `API_KEY`, `MODEL`, `SYSTEM_PROMPT`) is loaded ahead of `connect.py`'s own module-level `load_dotenv()`. Keep this ordering.
-2. `sys.path.insert(0, str(_ROOT))` (parent of this folder) makes `from mv2title import connect, main_json` resolve.
-3. `connect.init()` **must be called before** any inference (the library does not call it itself).
-
-`download.py` imports `rename` directly and reuses `rename.write_title`, `rename.FILES_DIR`, `rename.connect`, and `rename.main_json` — so importing `rename` is what triggers the bootstrap above. Don't duplicate the env/path setup in new scripts; import `rename` instead.
+- `rename.py` calls `load_dotenv(_ROOT / "mv2title" / ".env")` at import so the sibling package's `.env` (`BASE_URL`, `API_KEY`, `MODEL`, `SYSTEM_PROMPT`) is on `os.environ` before `Config.from_env()` reads it.
+- Inference uses the mv2title 0.3.0 API: `client = LLMClient(Config.from_env())` (wrapped in `rename.make_client()`) and `extract_titles(stems, client, batch_size=5, bypass_check=True)`, which returns `TitleResult` objects (`.title` / `.valid`).
+- `download.py` imports `rename` and reuses `rename.write_title`, `rename.FILES_DIR`, and `rename.make_client` — importing `rename` also triggers the dotenv load above. Don't duplicate env setup in new scripts; import `rename` instead.
 
 ## Pipeline specifics
 
-- Inference uses `main_json.main(stems, batch_size=5, bypass_check=True, ...)` — `bypass_check=True` means results are returned even if validation fails, so callers **must guard against length mismatch themselves**: both scripts compare `len(results) == len(files)` and abort on mismatch to avoid mis-assigning titles to the wrong file (results are returned in input order, matched positionally).
+- `bypass_check=True` means results are returned even if validation fails, so callers **must guard against length mismatch themselves**: both scripts compare `len(results) == len(files)` and abort on mismatch to avoid mis-assigning titles to the wrong file (results are returned in input order, matched positionally).
 - `write_title` is format-specific: `TIT2` frame for `.mp3`/`.wav` (mutagen ID3), `\xa9nam` atom for `.m4a` (MP4). `SUPPORTED_EXTS` / `download.py`'s `--format choices` are limited to these three.
 
 ## Running
 
-- `python rename.py` — tags everything in `files/`.
-- `python download.py <URL> [-f mp3|wav|m4a]` — single URL (default format `mp3`).
-- `python download.py -a urls.txt [-f ...]` — one URL per line (blank lines and `#` comments ignored).
+- `uv sync` — once, to create the venv with all dependencies.
+- `uv run python rename.py` — tags everything in `files/`.
+- `uv run python download.py <URL> [-f mp3|wav|m4a]` — single URL (default format `mp3`).
+- `uv run python download.py -a urls.txt [-f ...]` — one URL per line (blank lines and `#` comments ignored).
 - A playlist URL downloads all entries; a `watch?v=...&list=...` URL downloads only the single video (`noplaylist=True`). Failed playlist entries are skipped (`ignoreerrors=True`).
 
 ## Dependencies / gotchas
 
-- Needs **mutagen** and **yt-dlp** installed, plus **ffmpeg on PATH** for `download.py`'s mp3/wav conversion. None of these are declared in `../mv2title/pyproject.toml` — they must be present in the active environment.
+- **ffmpeg on PATH** is still required for `download.py`'s mp3/wav conversion (not pip-installable).
 - Requires a running OpenAI-compatible LLM endpoint configured via `../mv2title/.env` (see that package's CLAUDE.md).
