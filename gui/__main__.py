@@ -1,0 +1,18 @@
+# -*- coding: utf-8 -*-
+"""GUI のエントリポイント: `uv run python -m gui` で起動する。"""
+import sys
+
+from PySide6.QtWidgets import QApplication
+
+from .main_window import MainWindow
+
+
+def main() -> None:
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

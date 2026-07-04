@@ -1,0 +1,769 @@
+# -*- coding: utf-8 -*-
+"""MainWindow: テーブル UI と自動フローの結線。
+
+ワーカーは 1 本だけ走らせる（実行中は開始系ボタンを無効化）。ワーカーからの
+シグナルはすべてメインスレッドのスロットで受け、そこでのみモデルを更新する
+（スレッド規約は workers.py を参照）。
+"""
+import logging
+import shutil
+import threading
+from pathlib import Path
+
+from PySide6.QtCore import QItemSelectionModel, QRect, QSettings, Qt, QThreadPool, QUrl
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QDropEvent,
+    QGuiApplication,
+    QKeySequence,
+    QUndoStack,
+)
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QHBoxLayout,
+    QMainWindow,
+    QMenu,
+    QPlainTextEdit,
+    QPushButton,
+    QStyledItemDelegate,
+    QTableView,
+    QVBoxLayout,
+    QWidget,
+)
+
+import core
+from core import Status, Track
+
+
+def apply_color_scheme(name: str) -> None:
+    """アプリ全体のテーマを切り替える（"system" / "light" / "dark"）。
+
+    Qt 6.8+ の QStyleHints.setColorScheme を使う。"system"（= Unknown）は
+    OS のテーマ追従に戻す。未対応の Qt では何もしない。
+    """
+    hints = QGuiApplication.styleHints()
+    if not hasattr(hints, "setColorScheme"):
+        return
+    scheme = {
+        "light": Qt.ColorScheme.Light,
+        "dark": Qt.ColorScheme.Dark,
+    }.get(name, Qt.ColorScheme.Unknown)
+    hints.setColorScheme(scheme)
+
+from .clipboard import resolve_paste_targets, selection_to_tsv
+from .commands import ClearTitleCommand, EditArtistCommand, EditTitleCommand
+from .logpanel import LogPanel, QtLogHandler, attach_handler, detach_handler
+from .model import COL_ARTIST, COL_STATUS, COL_TITLE, PERCENT_ROLE, TrackTableModel
+from .settings_dialog import SettingsDialog
+from .workers import MODE_FULL, MODE_INFER, MODE_WRITE, PipelineWorker
+
+
+class MainWindow(QMainWindow):
+    """file_rename GUI のメインウィンドウ。"""
+
+    def __init__(self, restore_settings: bool = True):
+        super().__init__()
+        self.setWindowTitle("file_rename GUI")
+        self.resize(920, 560)
+
+        self._model = TrackTableModel()
+        self._pool = QThreadPool.globalInstance()
+        self._cancel = threading.Event()
+        self._running = False
+        # タイトル編集・ペースト・Delete クリアの undo/redo
+        self._undo = QUndoStack(self)
+        # 設定ダイアログで変更できる動作設定（QSettings で永続化）
+        self._out_dir: Path | None = None  # None = core.FILES_DIR
+        self._batch_size: int = core.BATCH_SIZE
+        self._expand_playlist: bool = False  # 混在 URL をリスト展開するか
+        self._theme: str = "system"  # "system" / "light" / "dark"
+        # ログパネルの表示レベル（"DEBUG"/"INFO"/"WARNING"/"ERROR"）。
+        # フィルタはハンドラ側 1 箇所で行う（logpanel.attach_handler 参照）
+        self._log_level: str = "WARNING"
+
+        self._build_ui()
+        # ウィンドウサイズ・列幅・トグル類の永続化。テストでは QSettings を
+        # 汚さないよう restore_settings=False で復元/保存を無効化する。
+        self._settings = QSettings("mv2title", "file_rename_gui") if restore_settings else None
+        if self._settings is not None:
+            self._restore_settings()
+            apply_color_scheme(self._theme)
+        # 復元後のログレベルをハンドラへ反映（restore 無効時は既定 WARNING）
+        self._log_handler.setLevel(getattr(logging, self._log_level))
+        if shutil.which("ffmpeg") is None:
+            self.statusBar().showMessage(
+                "警告: ffmpeg が見つかりません。mp3/wav 変換に必要です（PATH を確認してください）"
+            )
+        else:
+            self.statusBar().showMessage("準備完了")
+
+    # -- UI 構築 -------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+
+        # 上段: URL 入力 + 追加系ボタン
+        top = QHBoxLayout()
+        self._url_edit = QPlainTextEdit()
+        self._url_edit.setPlaceholderText("URL を改行区切りで貼り付け（複数可）")
+        self._url_edit.setFixedHeight(64)  # 3 行程度
+        top.addWidget(self._url_edit, stretch=1)
+
+        btn_col = QVBoxLayout()
+        add_btn = QPushButton("追加")
+        add_btn.clicked.connect(self._on_add_urls)
+        file_btn = QPushButton("ファイル追加")
+        file_btn.clicked.connect(self._on_add_files)
+        import_btn = QPushButton("files/ 取り込み")
+        import_btn.clicked.connect(self._on_import_dir)
+        for b in (add_btn, file_btn, import_btn):
+            btn_col.addWidget(b)
+        top.addLayout(btn_col)
+        root.addLayout(top)
+
+        # ツールバー行: 実行 / 停止 / 形式 / 自動書き込み
+        bar = QHBoxLayout()
+        self._run_btn = QPushButton("▶ 実行")
+        self._run_btn.clicked.connect(self._on_run)
+        self._stop_btn = QPushButton("■ 停止")
+        self._stop_btn.clicked.connect(self._on_stop)
+        self._stop_btn.setEnabled(False)
+        bar.addWidget(self._run_btn)
+        bar.addWidget(self._stop_btn)
+        bar.addSpacing(16)
+        self._fmt_combo = QComboBox()
+        self._fmt_combo.addItems(core.SUPPORTED_FORMATS)
+        self._fmt_combo.setCurrentText("mp3")
+        bar.addWidget(self._fmt_combo)
+        self._auto_write = QCheckBox("自動書き込み")
+        self._auto_write.setChecked(True)
+        bar.addWidget(self._auto_write)
+        bar.addStretch(1)
+        settings_btn = QPushButton("設定")
+        settings_btn.clicked.connect(self._on_settings)
+        bar.addWidget(settings_btn)
+        root.addLayout(bar)
+
+        # 上段の追加系ボタンと [設定] の幅を統一する（最長ラベル基準。
+        # 縦積みの列は自動で最長幅に揃うが、[設定] は別レイアウトなので明示する）
+        same_width = (add_btn, file_btn, import_btn, settings_btn)
+        width = max(b.sizeHint().width() for b in same_width)
+        for b in same_width:
+            b.setFixedWidth(width)
+
+        # 中央: テーブル
+        self._view = _DropTableView(self)
+        self._view.setModel(self._model)
+        self._view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._view.horizontalHeader().setStretchLastSection(True)
+        self._view.setColumnWidth(1, 240)
+        self._view.setColumnWidth(3, 200)
+        self._view.setColumnWidth(COL_ARTIST, 140)
+        # Excel 風: F2 / 直接タイプ / ダブルクリック / 選択セルクリックで編集開始
+        # （実行中は _set_running が NoEditTriggers に切り替える）
+        self._edit_triggers = (
+            QAbstractItemView.EditTrigger.AnyKeyPressed
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+            | QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.SelectedClicked
+        )
+        self._view.setEditTriggers(self._edit_triggers)
+        # 編集はコマンド化して QUndoStack へ積む（二重適用を避けるため
+        # setModelData で model.setData を直接呼ばず、コマンド経由にする）
+        self._view.setItemDelegateForColumn(COL_TITLE, _UndoEditDelegate(self))
+        self._view.setItemDelegateForColumn(COL_ARTIST, _UndoEditDelegate(self))
+        # 状態列: DL 中は進捗バーを描画（テキストの % だけでは視認しづらいため）
+        self._view.setItemDelegateForColumn(COL_STATUS, _ProgressDelegate(self._view))
+        # ヘッダクリックでソート（実行中は _set_running で無効化する）
+        self._view.setSortingEnabled(True)
+        # 右クリックメニュー
+        self._view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._view.customContextMenuRequested.connect(self._show_context_menu)
+        root.addWidget(self._view, stretch=1)
+
+        # 下段: 選択行への操作
+        bottom = QHBoxLayout()
+        reinfer_btn = QPushButton("選択行を再推定")
+        reinfer_btn.clicked.connect(self._on_reinfer)
+        write_btn = QPushButton("選択行を書き込み")
+        write_btn.clicked.connect(self._on_write_selected)
+        del_btn = QPushButton("行削除")
+        del_btn.clicked.connect(self._on_delete_rows)
+        artist_btn = QPushButton("チャンネル名→アーティスト")
+        artist_btn.setToolTip(
+            "選択行（未選択なら全行）のアーティスト欄にチャンネル名をそのまま入れる"
+        )
+        artist_btn.clicked.connect(self._on_fill_artists)
+        for b in (reinfer_btn, write_btn, artist_btn, del_btn):
+            bottom.addWidget(b)
+        bottom.addStretch(1)
+        log_btn = QPushButton("ログ")
+        log_btn.setCheckable(True)
+        bottom.addWidget(log_btn)
+        root.addLayout(bottom)
+
+        # 折りたたみ式のログパネル（既定は非表示）。ハンドラはワーカースレッド
+        # からも呼ばれるため、QtLogHandler → QueuedConnection → パネルの構成
+        # （スレッド規約は gui/logpanel.py 参照）
+        self._log_handler = QtLogHandler()
+        self._log_panel = LogPanel(self._log_handler)
+        self._log_panel.setVisible(False)
+        self._log_panel.setFixedHeight(120)
+        attach_handler(self._log_handler)
+        log_btn.toggled.connect(self._log_panel.setVisible)
+        root.addWidget(self._log_panel)
+
+        # 実行中に無効化するボタン群（1 本ルールの担保）
+        self._busy_buttons = [
+            self._run_btn,
+            reinfer_btn,
+            write_btn,
+            artist_btn,
+            add_btn,
+            file_btn,
+            import_btn,
+            del_btn,
+        ]
+
+        # undo/redo（Ctrl+Z / Ctrl+Y）。ウィンドウにアクションを載せる
+        undo_action = self._undo.createUndoAction(self, "元に戻す")
+        undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        redo_action = self._undo.createRedoAction(self, "やり直し")
+        redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        self.addAction(undo_action)
+        self.addAction(redo_action)
+
+        # undo コマンドは行番号(int)を保持するため、行の並び・構成が変わったら
+        # 過去のコマンドは無効（別の行に復元されてしまう）。行削除・差し替え
+        # （rowsRemoved）とソート（layoutChanged）でスタックを破棄する。
+        # 末尾への行追加(rowsInserted のみ)は既存行がずれないので対象外。
+        self._model.rowsRemoved.connect(lambda *_: self._undo.clear())
+        self._model.layoutChanged.connect(lambda *_: self._undo.clear())
+
+    # -- 行追加系 ------------------------------------------------------------
+
+    def add_urls(self, urls: list[str]) -> int:
+        """URL ごとにプレースホルダ行を追加する。追加件数を返す。"""
+        tracks = [Track(stem=u, url=u, status=Status.QUEUED) for u in urls]
+        self._model.add_tracks(tracks)
+        return len(tracks)
+
+    def add_files(self, paths: list[Path]) -> int:
+        """ローカルファイル行を追加する。追加件数を返す。"""
+        tracks = [core.track_from_file(p) for p in paths]
+        self._model.add_tracks(tracks)
+        return len(tracks)
+
+    def _on_add_urls(self) -> None:
+        text = self._url_edit.toPlainText()
+        urls = [line.strip() for line in text.splitlines() if line.strip()]
+        if not urls:
+            self.statusBar().showMessage("URL が入力されていません")
+            return
+        n = self.add_urls(urls)
+        self._url_edit.clear()
+        self.statusBar().showMessage(f"{n} 件の URL を追加しました")
+
+    def _on_add_files(self) -> None:
+        pattern = "音声ファイル (" + " ".join(f"*{e}" for e in core.SUPPORTED_EXTS) + ")"
+        paths, _ = QFileDialog.getOpenFileNames(self, "音声ファイルを追加", "", pattern)
+        if not paths:
+            return
+        n = self.add_files([Path(p) for p in paths])
+        self.statusBar().showMessage(f"{n} 件のファイルを追加しました")
+
+    def _on_import_dir(self) -> None:
+        files = core.list_music_files()
+        if not files:
+            self.statusBar().showMessage(f"{core.FILES_DIR} に音声ファイルがありません")
+            return
+        n = self.add_files(files)
+        self.statusBar().showMessage(f"files/ から {n} 件を取り込みました")
+
+    # -- パイプライン起動 ----------------------------------------------------
+
+    def _on_run(self) -> None:
+        tracks = self._model.tracks()
+        if not tracks:
+            self.statusBar().showMessage("処理対象がありません")
+            return
+        worker = PipelineWorker(
+            tracks,
+            mode=MODE_FULL,
+            fmt=self._fmt_combo.currentText(),
+            auto_write=self._auto_write.isChecked(),
+            cancel=self._reset_cancel(),
+            batch_size=self._batch_size,
+            out_dir=self._out_dir,
+            expand_playlist=self._expand_playlist,
+        )
+        self._start(worker, "実行中...")
+
+    def _on_reinfer(self) -> None:
+        rows = self._selected_rows()
+        if not rows:
+            self.statusBar().showMessage("行が選択されていません")
+            return
+        tracks = [self._model.track_at(r) for r in rows]
+        worker = PipelineWorker(
+            tracks,
+            mode=MODE_INFER,
+            force=True,
+            cancel=self._reset_cancel(),
+            batch_size=self._batch_size,
+        )
+        self._start(worker, "再推定中...")
+
+    def _on_write_selected(self) -> None:
+        rows = self._selected_rows()
+        if not rows:
+            self.statusBar().showMessage("行が選択されていません")
+            return
+        tracks = [self._model.track_at(r) for r in rows]
+        worker = PipelineWorker(tracks, mode=MODE_WRITE, cancel=self._reset_cancel())
+        self._start(worker, "書き込み中...")
+
+    def _start(self, worker: PipelineWorker, message: str) -> None:
+        if self._running:
+            self.statusBar().showMessage("処理が実行中です")
+            return
+        # queued connection でメインスレッドに乗せる
+        worker.signals.track_updated.connect(
+            self._model.refresh_track, Qt.ConnectionType.QueuedConnection
+        )
+        worker.signals.tracks_ready.connect(
+            self._model.replace_track, Qt.ConnectionType.QueuedConnection
+        )
+        worker.signals.progress.connect(
+            self._model.set_percent, Qt.ConnectionType.QueuedConnection
+        )
+        worker.signals.error.connect(self._on_worker_error, Qt.ConnectionType.QueuedConnection)
+        worker.signals.connection_failed.connect(
+            self._on_connection_failed, Qt.ConnectionType.QueuedConnection
+        )
+        worker.signals.write_summary.connect(
+            self._on_write_summary, Qt.ConnectionType.QueuedConnection
+        )
+        worker.signals.finished.connect(self._on_worker_finished, Qt.ConnectionType.QueuedConnection)
+        self._set_running(True)
+        self.statusBar().showMessage(message)
+        self._pool.start(worker)
+
+    # -- ワーカーのシグナル受信（メインスレッド）----------------------------
+
+    def _on_worker_error(self, message: str) -> None:
+        self.statusBar().showMessage(f"エラー: {message}")
+
+    def _on_connection_failed(self, message: str) -> None:
+        """LLM 未接続 → DL のみの縮退モードへ切り替わったときの通知。"""
+        self.statusBar().showMessage(
+            f"LLM エンドポイントに接続できません。DL のみ実行します（{message}）"
+        )
+
+    def _on_write_summary(self, done: int, skipped: int, errors: int) -> None:
+        """書き込み結果の集計をステータスバーに表示（完了が分かりづらい問題の対策）。"""
+        self.statusBar().showMessage(
+            f"書き込み: 完了 {done} 件 / スキップ {skipped} 件 / 失敗 {errors} 件"
+        )
+
+    def _on_worker_finished(self) -> None:
+        self._set_running(False)
+        if self.statusBar().currentMessage().endswith("中..."):
+            self.statusBar().showMessage("完了")
+
+    # -- 設定 ---------------------------------------------------------------
+
+    def _on_settings(self) -> None:
+        dlg = SettingsDialog(
+            self,
+            out_dir=self._out_dir,
+            fmt=self._fmt_combo.currentText(),
+            batch_size=self._batch_size,
+            auto_write=self._auto_write.isChecked(),
+            expand_playlist=self._expand_playlist,
+            theme=self._theme,
+            log_level=self._log_level,
+        )
+        if not dlg.exec():
+            return
+        self.apply_settings(dlg.values())
+
+    def apply_settings(self, values: dict) -> None:
+        """設定ダイアログの値を反映し、QSettings へ保存する。"""
+        out_dir = values["out_dir"]
+        # 既定の FILES_DIR と同じなら None（=core 既定）として扱う
+        self._out_dir = None if out_dir == core.FILES_DIR else out_dir
+        self._batch_size = int(values["batch_size"])
+        self._expand_playlist = bool(values.get("expand_playlist", False))
+        new_theme = str(values.get("theme", "system"))
+        if new_theme != self._theme:
+            self._theme = new_theme
+            apply_color_scheme(new_theme)
+        # ログパネルの表示レベルをハンドラへ反映（フィルタはハンドラ 1 箇所）
+        self._log_level = str(values.get("log_level", "WARNING"))
+        self._log_handler.setLevel(getattr(logging, self._log_level))
+        self._fmt_combo.setCurrentText(values["fmt"])
+        self._auto_write.setChecked(bool(values["auto_write"]))
+        if self._settings is not None:
+            self._settings.setValue(
+                "options/out_dir", str(self._out_dir) if self._out_dir else ""
+            )
+            self._settings.setValue("options/batch_size", self._batch_size)
+            self._settings.setValue("options/expand_playlist", self._expand_playlist)
+            self._settings.setValue("options/theme", self._theme)
+            self._settings.setValue("options/log_level", self._log_level)
+        self.statusBar().showMessage("設定を保存しました")
+
+    # -- 下段操作 ------------------------------------------------------------
+
+    def _on_delete_rows(self) -> None:
+        rows = self._selected_rows()
+        if not rows:
+            return
+        self._model.remove_rows(rows)
+        self.statusBar().showMessage(f"{len(rows)} 行を削除しました（ファイルは残ります）")
+
+    # -- 補助 ---------------------------------------------------------------
+
+    def _selected_rows(self) -> list[int]:
+        return sorted({idx.row() for idx in self._view.selectionModel().selectedRows()})
+
+    def _reset_cancel(self) -> threading.Event:
+        self._cancel = threading.Event()
+        return self._cancel
+
+    def _set_running(self, running: bool) -> None:
+        self._running = running
+        for b in self._busy_buttons:
+            b.setEnabled(not running)
+        self._stop_btn.setEnabled(running)
+        # 実行中はソート禁止（ワーカーの行同一性・進捗 dict を壊さないため）
+        self._view.setSortingEnabled(not running)
+        # 実行中はセル編集も禁止（ワーカーが Track を書き換え中のため。
+        # ペースト/Delete は各メソッド側でガード済み、ここは直接編集のガード）
+        self._view.setEditTriggers(
+            self._edit_triggers if not running else QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+
+    def _on_stop(self) -> None:
+        self._cancel.set()
+        self.statusBar().showMessage("停止を要求しました...")
+
+    # -- Excel 風操作: コピー / ペースト / Delete / 編集コマンド化 -----------
+
+    def copy_selection(self) -> None:
+        """選択セル範囲を TSV でクリップボードへコピーする。"""
+        indexes = self._view.selectionModel().selectedIndexes()
+        tsv = selection_to_tsv(self._model, indexes)
+        if tsv:
+            QGuiApplication.clipboard().setText(tsv)
+
+    def paste_clipboard(self) -> None:
+        """クリップボードの TSV を現在セルを左上として貼り付ける。
+
+        編集可能列（推定タイトル）に落ちるセルのみ反映する。反映は
+        EditTitleCommand として 1 つの macro にまとめ、1 回の undo で戻す。
+        """
+        if self._running:
+            return  # 実行中はワーカーが Track を触るため貼り付けを抑止
+        text = QGuiApplication.clipboard().text()
+        if not text:
+            return
+        start = self._view.currentIndex()
+        if not start.isValid():
+            return
+        self.paste_tsv_via_commands(start, text)
+
+    def paste_tsv_via_commands(self, start_index, text: str) -> int:
+        """TSV を Edit 系コマンドの macro として貼り付ける。反映セル数を返す。
+
+        clipboard.resolve_paste_targets で「編集可能列（タイトル/アーティスト）
+        のみ」の対象を求め、実際の適用はコマンド経由（＝undo 可能）にする。
+        複数セルは 1 つの macro にまとめ、1 回の undo で全部戻す。
+        """
+        edits = resolve_paste_targets(self._model, start_index, text)
+        if not edits:
+            return 0
+        self._undo.beginMacro("貼り付け")
+        for row, col, value in edits:
+            self.push_edit(row, col, value)
+        self._undo.endMacro()
+        return len(edits)
+
+    def push_edit(self, row: int, col: int, value: str) -> None:
+        """デリゲート確定を列に応じた Edit 系コマンドとしてスタックへ積む。"""
+        if col == COL_ARTIST:
+            self._undo.push(EditArtistCommand(self._model, row, value))
+        else:
+            self._undo.push(EditTitleCommand(self._model, row, value))
+
+    def _on_fill_artists(self) -> None:
+        """選択行（未選択なら全行）のアーティスト欄にチャンネル名をコピーする。
+
+        推定はしない（ユーザー要望）。undo は 1 回でまとめて戻る。
+        """
+        if self._running:
+            return
+        rows = self._selected_rows() or list(range(self._model.rowCount()))
+        targets = [r for r in rows if self._model.track_at(r).channel]
+        if not targets:
+            self.statusBar().showMessage("チャンネル名を持つ行がありません")
+            return
+        self._undo.beginMacro("チャンネル名をアーティストへ")
+        for row in targets:
+            channel = self._model.track_at(row).channel or ""
+            self._undo.push(EditArtistCommand(self._model, row, channel))
+        self._undo.endMacro()
+        # 対象行を選択状態にしてフォーカスをテーブルへ戻す。ボタン押下で
+        # フォーカスが外れると選択が非アクティブ色（ダークテーマではほぼ
+        # 不可視）になり「解除された」ように見えるため、そのまま
+        # [選択行を書き込み] へ進める状態を明示的に作る。
+        self._select_rows(targets)
+        self.statusBar().showMessage(f"{len(targets)} 行のアーティスト欄にチャンネル名を入れました")
+
+    def _select_rows(self, rows: list[int]) -> None:
+        """指定行を行選択し、テーブルへフォーカスを戻す。"""
+        sel = self._view.selectionModel()
+        sel.clearSelection()
+        flags = (
+            QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+        )
+        for row in rows:
+            sel.select(self._model.index(row, 0), flags)
+        self._view.setFocus()
+
+    def clear_selected_titles(self) -> None:
+        """選択行の推定タイトルをクリアする（Delete）。macro で 1 回 undo。"""
+        if self._running:
+            return
+        rows = self._selected_rows()
+        if not rows:
+            return
+        self._undo.beginMacro("タイトルをクリア")
+        for row in rows:
+            self._undo.push(ClearTitleCommand(self._model, row))
+        self._undo.endMacro()
+        self.statusBar().showMessage(f"{len(rows)} 行のタイトルをクリアしました")
+
+    # -- 右クリックメニュー --------------------------------------------------
+
+    def _show_context_menu(self, pos) -> None:
+        menu = self.build_context_menu()
+        menu.exec(self._view.viewport().mapToGlobal(pos))
+
+    def build_context_menu(self) -> QMenu:
+        """テーブル上の右クリックメニューを構築して返す（テストで検査可能）。
+
+        パイプライン実行中は再推定/書き込み/行削除を無効化する。
+        「URL をブラウザで開く」は url を持つ行がある場合のみ有効。
+        """
+        menu = QMenu(self._view)
+        rows = self._selected_rows()
+
+        reinfer = menu.addAction("選択行を再推定")
+        reinfer.triggered.connect(self._on_reinfer)
+        write = menu.addAction("選択行を書き込み")
+        write.triggered.connect(self._on_write_selected)
+        delete = menu.addAction("行削除")
+        delete.triggered.connect(self._on_delete_rows)
+        menu.addSeparator()
+        open_url = menu.addAction("URL をブラウザで開く")
+        open_url.triggered.connect(self._on_open_urls)
+
+        # 実行中は破壊的/パイプライン操作を無効化
+        for act in (reinfer, write, delete):
+            act.setEnabled(bool(rows) and not self._running)
+        # url を持つ選択行が 1 つでもあれば有効
+        has_url = any(self._model.track_at(r).url for r in rows)
+        open_url.setEnabled(has_url)
+        return menu
+
+    def _on_open_urls(self) -> None:
+        """選択行の url をブラウザで開く。"""
+        for row in self._selected_rows():
+            url = self._model.track_at(row).url
+            if url:
+                QDesktopServices.openUrl(QUrl(url))
+
+    # -- QSettings による永続化 ---------------------------------------------
+
+    def _restore_settings(self) -> None:
+        """ウィンドウサイズ・列幅・トグル類を復元する。"""
+        s = self._settings
+        assert s is not None
+        geometry = s.value("window/geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        header_state = s.value("table/header")
+        if header_state is not None:
+            self._view.horizontalHeader().restoreState(header_state)
+        auto = s.value("options/auto_write")
+        if auto is not None:
+            # QSettings は bool を文字列で返すことがあるため正規化する
+            self._auto_write.setChecked(auto in (True, "true", "True", 1, "1"))
+        fmt = s.value("options/format")
+        if fmt in core.SUPPORTED_FORMATS:
+            self._fmt_combo.setCurrentText(fmt)
+        out_dir = s.value("options/out_dir")
+        if out_dir:
+            self._out_dir = Path(str(out_dir))
+        batch = s.value("options/batch_size")
+        if batch is not None:
+            try:
+                self._batch_size = max(1, int(batch))
+            except (TypeError, ValueError):
+                pass
+        expand = s.value("options/expand_playlist")
+        if expand is not None:
+            self._expand_playlist = expand in (True, "true", "True", 1, "1")
+        theme = s.value("options/theme")
+        if theme in ("system", "light", "dark"):
+            self._theme = theme
+        log_level = s.value("options/log_level")
+        if log_level in ("DEBUG", "INFO", "WARNING", "ERROR"):
+            self._log_level = log_level
+
+    def _save_settings(self) -> None:
+        s = self._settings
+        if s is None:
+            return
+        s.setValue("window/geometry", self.saveGeometry())
+        s.setValue("table/header", self._view.horizontalHeader().saveState())
+        s.setValue("options/auto_write", self._auto_write.isChecked())
+        s.setValue("options/format", self._fmt_combo.currentText())
+
+    def closeEvent(self, event) -> None:
+        self._save_settings()
+        # ログハンドラを外す（テスト等で多重生成してもロガーに蓄積しないように）
+        detach_handler(self._log_handler)
+        super().closeEvent(event)
+
+    # -- ドラッグ&ドロップ（_DropTableView から委譲）------------------------
+
+    def handle_dropped_paths(self, paths: list[Path]) -> None:
+        supported = [p for p in paths if p.suffix.lower() in core.SUPPORTED_EXTS]
+        if not supported:
+            self.statusBar().showMessage("対応する音声ファイルがありません")
+            return
+        n = self.add_files(supported)
+        self.statusBar().showMessage(f"ドロップで {n} 件を追加しました")
+
+
+class _DropTableView(QTableView):
+    """対応拡張子のローカルファイルをドロップで行追加できる QTableView。"""
+
+    def __init__(self, window: MainWindow):
+        super().__init__()
+        self._window = window
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        urls = event.mimeData().urls()
+        paths = [Path(u.toLocalFile()) for u in urls if u.isLocalFile()]
+        if paths:
+            self._window.handle_dropped_paths(paths)
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        """Excel 風のキーボード操作を処理する。
+
+        - Ctrl+C: 選択セル範囲を TSV でコピー
+        - Ctrl+V: クリップボードの TSV を貼り付け（タイトル列のみ）
+        - Delete: 選択行の推定タイトルをクリア
+        それ以外は既定処理（F2/直接タイプでの編集開始・Enter 移動等）へ委譲。
+        """
+        if event.matches(QKeySequence.StandardKey.Copy):
+            self._window.copy_selection()
+            event.accept()
+            return
+        if event.matches(QKeySequence.StandardKey.Paste):
+            self._window.paste_clipboard()
+            event.accept()
+            return
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self._window.clear_selected_titles()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class _ProgressDelegate(QStyledItemDelegate):
+    """状態列のデリゲート。DL 中の行には進捗バーを自前で描画する。
+
+    QStyle の CE_ProgressBar はテーマ（特に Windows のダークテーマ）次第で
+    文字が読みづらくなるため、スタイルに依存しない自前描画にする:
+    白地のグルーヴ + 青のチャンク + 濃色のパーセント文字。
+    モデルの PERCENT_ROLE が数値を返す間（= DOWNLOADING で進捗既知）だけ
+    バーを描き、それ以外は既定の描画（状態テキスト + 背景色）に任せる。
+    """
+
+    _BORDER = QColor(140, 140, 140)
+    _GROOVE = QColor(252, 252, 252)
+    _CHUNK = QColor(120, 180, 250)
+    _TEXT = QColor(32, 32, 32)
+
+    def paint(self, painter, option, index) -> None:
+        percent = index.data(PERCENT_ROLE)
+        if percent is None:
+            super().paint(painter, option, index)
+            return
+        painter.save()
+        # 行の背景色（DL 中の薄青）を先に塗って、他の列と見た目を揃える
+        bg = index.data(Qt.ItemDataRole.BackgroundRole)
+        if bg is not None:
+            painter.fillRect(option.rect, bg)
+        rect = option.rect.adjusted(3, 4, -4, -5)
+        # グルーヴ（白地）と枠
+        painter.setPen(self._BORDER)
+        painter.setBrush(self._GROOVE)
+        painter.drawRect(rect)
+        # チャンク（進捗分の青）
+        ratio = max(0.0, min(percent, 100.0)) / 100.0
+        chunk = QRect(rect.x() + 1, rect.y() + 1, int((rect.width() - 1) * ratio), rect.height() - 1)
+        painter.fillRect(chunk, self._CHUNK)
+        # パーセント文字（チャンク/グルーヴどちらの上でも読める濃色）。
+        # 表示文字列はモデルの状態列テキスト（「DL中 2/5 45%」等）を使う
+        painter.setPen(self._TEXT)
+        text = index.data(Qt.ItemDataRole.DisplayRole) or f"DL中 {int(percent)}%"
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(text))
+        painter.restore()
+
+
+class _UndoEditDelegate(QStyledItemDelegate):
+    """推定タイトル列のデリゲート。確定を EditTitleCommand としてスタックへ積む。
+
+    既定の setModelData は model.setData を直接呼ぶが、それだと undo スタックを
+    経由しない。ここで setData を呼ばず MainWindow.push_edit へ回すことで、
+    「UI からの編集はすべて QUndoStack に積む」構造にする（二重適用も防ぐ）。
+    """
+
+    def __init__(self, window: MainWindow):
+        super().__init__(window)
+        self._window = window
+
+    def setModelData(self, editor, model, index) -> None:
+        # エディタから確定値を取り出す（QLineEdit 前提だが汎用に property 経由）
+        value = editor.property(editor.metaObject().userProperty().name())
+        text = "" if value is None else str(value)
+        self._window.push_edit(index.row(), index.column(), text)
