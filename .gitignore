@@ -11,3 +11,4 @@ venv/
 
 # 環境変数
 .env
+.DS_Store
