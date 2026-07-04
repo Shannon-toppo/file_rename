@@ -325,6 +325,17 @@ def test_download_tracks_bad_format():
         core.download_tracks("u", "flac")
 
 
+def test_download_tracks_prefers_japanese_metadata(fake_ydl, tmp_path):
+    """翻訳メタデータの優先言語として ja を yt-dlp へ渡す。
+
+    YouTube は既定で英語版タイトル/チャンネル名を返すため、日本語版が
+    あればそれを取得する（無ければ原語のまま）ようにする回帰テスト。
+    """
+    fake_ydl.info = entry_for(tmp_path, "a")
+    core.download_tracks("u", "mp3")
+    assert fake_ydl.last_opts["extractor_args"] == {"youtube": {"lang": ["ja"]}}
+
+
 def test_download_tracks_expand_playlist_option(fake_ydl, tmp_path):
     """expand_playlist=True で混在 URL もリスト展開（noplaylist=False）になる。"""
     fake_ydl.info = entry_for(tmp_path, "a")

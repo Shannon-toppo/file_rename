@@ -34,6 +34,8 @@ FILES_DIR = Path(__file__).parent / "files"
 SUPPORTED_EXTS = (".mp3", ".wav", ".m4a")
 SUPPORTED_FORMATS = ("mp3", "wav", "m4a")
 BATCH_SIZE = 5
+# YouTube の翻訳メタデータ(タイトル/チャンネル名)の優先言語
+METADATA_LANG = "ja"
 
 
 class CancelledError(Exception):
@@ -195,6 +197,11 @@ def download_tracks(
         "noplaylist": not expand_playlist,
         "ignoreerrors": True,  # 一部の動画が失敗してもリスト全体を止めない
         "progress_hooks": [hook],
+        # YouTube は既定で英語のメタデータを返すため、投稿者が英訳を用意して
+        # いる動画では英語のタイトル/チャンネル名になってしまう。翻訳メタデータ
+        # の優先言語を日本語に指定する（日本語版が無ければ原語のまま）。
+        # タイトルはファイル名(= 推定の入力)にも使われるためここで効く。
+        "extractor_args": {"youtube": {"lang": [METADATA_LANG]}},
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
