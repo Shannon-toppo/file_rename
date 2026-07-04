@@ -14,7 +14,6 @@ from gui.model import (
     COL_ARTIST,
     COL_CHANNEL,
     COL_FORMAT,
-    COL_INDEX,
     COL_STATUS,
     COL_STEM,
     COL_TITLE,
@@ -33,12 +32,12 @@ def _idx(model, row, col):
 
 def test_columns_and_headers():
     model = TrackTableModel()
-    assert model.columnCount() == 7
+    assert model.columnCount() == 6
     headers = [
         model.headerData(c, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole)
-        for c in range(7)
+        for c in range(6)
     ]
-    assert headers == ["#", "元タイトル", "チャンネル", "推定タイトル", "アーティスト", "状態", "形式"]
+    assert headers == ["元タイトル", "チャンネル", "推定タイトル", "アーティスト", "状態", "形式"]
 
 
 def test_display_values():
@@ -50,7 +49,6 @@ def test_display_values():
     )
     model = TrackTableModel([t])
     role = Qt.ItemDataRole.DisplayRole
-    assert model.data(_idx(model, 0, COL_INDEX), role) == 1
     assert model.data(_idx(model, 0, COL_STEM), role) == "Artist - Song [MV]"
     assert model.data(_idx(model, 0, COL_CHANNEL), role) == "ArtistCh"
     assert model.data(_idx(model, 0, COL_TITLE), role) == "Song"
@@ -71,8 +69,11 @@ def test_only_title_column_editable():
     model = TrackTableModel([Track(stem="x")])
     editable_flag = Qt.ItemFlag.ItemIsEditable
     assert model.flags(_idx(model, 0, COL_TITLE)) & editable_flag
-    for col in (COL_INDEX, COL_STEM, COL_CHANNEL, COL_STATUS, COL_FORMAT):
+    # チャンネル・状態・形式は編集不可。元タイトルは本文コピー用に
+    # ItemIsEditable を持つが、setData では書き換わらない（別テストで担保）。
+    for col in (COL_CHANNEL, COL_STATUS, COL_FORMAT):
         assert not (model.flags(_idx(model, 0, col)) & editable_flag)
+    assert model.flags(_idx(model, 0, COL_STEM)) & editable_flag
 
 
 def test_setdata_marks_manual_and_pending():
