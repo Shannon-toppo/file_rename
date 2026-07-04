@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QHBoxLayout,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QPlainTextEdit,
@@ -57,7 +58,7 @@ def apply_color_scheme(name: str) -> None:
 from .clipboard import resolve_paste_targets, selection_to_tsv
 from .commands import ClearTitleCommand, EditArtistCommand, EditTitleCommand
 from .logpanel import LogPanel, QtLogHandler, attach_handler, detach_handler
-from .model import COL_ARTIST, COL_STATUS, COL_TITLE, PERCENT_ROLE, TrackTableModel
+from .model import COL_ARTIST, COL_STATUS, COL_STEM, COL_TITLE, PERCENT_ROLE, TrackTableModel
 from .settings_dialog import SettingsDialog
 from .workers import MODE_FULL, MODE_INFER, MODE_WRITE, PipelineWorker
 
@@ -163,8 +164,8 @@ class MainWindow(QMainWindow):
         self._view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._view.horizontalHeader().setStretchLastSection(True)
-        self._view.setColumnWidth(1, 240)
-        self._view.setColumnWidth(3, 200)
+        self._view.setColumnWidth(COL_STEM, 240)
+        self._view.setColumnWidth(COL_TITLE, 200)
         self._view.setColumnWidth(COL_ARTIST, 140)
         # Excel 風: F2 / 直接タイプ / ダブルクリック / 選択セルクリックで編集開始
         # （実行中は _set_running が NoEditTriggers に切り替える）
@@ -179,6 +180,8 @@ class MainWindow(QMainWindow):
         # setModelData で model.setData を直接呼ばず、コマンド経由にする）
         self._view.setItemDelegateForColumn(COL_TITLE, _UndoEditDelegate(self))
         self._view.setItemDelegateForColumn(COL_ARTIST, _UndoEditDelegate(self))
+        # 元タイトルは編集不可だが、本文の部分コピーのため読み取り専用エディタを開く
+        self._view.setItemDelegateForColumn(COL_STEM, _ReadOnlyCopyDelegate(self))
         # 状態列: DL 中は進捗バーを描画（テキストの % だけでは視認しづらいため）
         self._view.setItemDelegateForColumn(COL_STATUS, _ProgressDelegate(self._view))
         # ヘッダクリックでソート（実行中は _set_running で無効化する）
@@ -201,7 +204,7 @@ class MainWindow(QMainWindow):
             "選択行（未選択なら全行）のアーティスト欄にチャンネル名をそのまま入れる"
         )
         artist_btn.clicked.connect(self._on_fill_artists)
-        for b in (reinfer_btn, write_btn, artist_btn, del_btn):
+        for b in (reinfer_btn, artist_btn, write_btn, del_btn):
             bottom.addWidget(b)
         bottom.addStretch(1)
         log_btn = QPushButton("ログ")
@@ -602,7 +605,10 @@ class MainWindow(QMainWindow):
         if geometry is not None:
             self.restoreGeometry(geometry)
         header_state = s.value("table/header")
-        if header_state is not None:
+        # 列数が変わった（列を追加/削除した）後は、古い saveState を復元すると
+        # 幅が 1 列ずれるため、保存時の列数が一致するときだけ復元する。
+        saved_cols = s.value("table/columns")
+        if header_state is not None and str(saved_cols) == str(self._model.columnCount()):
             self._view.horizontalHeader().restoreState(header_state)
         auto = s.value("options/auto_write")
         if auto is not None:
@@ -636,6 +642,7 @@ class MainWindow(QMainWindow):
             return
         s.setValue("window/geometry", self.saveGeometry())
         s.setValue("table/header", self._view.horizontalHeader().saveState())
+        s.setValue("table/columns", self._model.columnCount())
         s.setValue("options/auto_write", self._auto_write.isChecked())
         s.setValue("options/format", self._fmt_combo.currentText())
 
@@ -767,3 +774,21 @@ class _UndoEditDelegate(QStyledItemDelegate):
         value = editor.property(editor.metaObject().userProperty().name())
         text = "" if value is None else str(value)
         self._window.push_edit(index.row(), index.column(), text)
+
+
+class _ReadOnlyCopyDelegate(QStyledItemDelegate):
+    """元タイトル列のデリゲート。本文の部分選択・コピーだけを許す。
+
+    セルをダブルクリック等で開くと読み取り専用の QLineEdit が出るので、
+    ユーザーは一部分を選択して Ctrl+C できるが、値は書き換わらない
+    （setModelData を no-op にしているため）。
+    """
+
+    def createEditor(self, parent, option, index):
+        editor = QLineEdit(parent)
+        editor.setReadOnly(True)
+        return editor
+
+    def setModelData(self, editor, model, index) -> None:
+        # 読み取り専用なので何も書き戻さない
+        return

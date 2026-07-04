@@ -241,16 +241,6 @@ def test_sort_reorders_tracks():
     assert stems == ["cherry", "banana", "apple"]
 
 
-def test_sort_index_column_is_noop():
-    from gui.model import COL_INDEX
-
-    tracks = [Track(stem="c"), Track(stem="a"), Track(stem="b")]
-    model = _make_model(tracks)
-    model.sort(COL_INDEX, Qt.SortOrder.AscendingOrder)
-    stems = [model.track_at(r).stem for r in range(model.rowCount())]
-    assert stems == ["c", "a", "b"]  # 並び順は変わらない
-
-
 # ---------------------------------------------------------------------------
 # 右クリックメニュー
 # ---------------------------------------------------------------------------

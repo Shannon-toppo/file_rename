@@ -11,16 +11,19 @@ from PySide6.QtGui import QColor
 from core import Status, Track
 
 # カラム定義（順序が表示順）
-COL_INDEX = 0  # #（1-based）
-COL_STEM = 1  # 元タイトル（ファイル名 stem / URL）
-COL_CHANNEL = 2  # チャンネル
-COL_TITLE = 3  # 推定タイトル（編集可）
-COL_ARTIST = 4  # アーティスト（編集可。推定はしない）
-COL_STATUS = 5  # 状態
-COL_FORMAT = 6  # 形式（拡張子）
-_HEADERS = ("#", "元タイトル", "チャンネル", "推定タイトル", "アーティスト", "状態", "形式")
+COL_STEM = 0  # 元タイトル（ファイル名 stem / URL）
+COL_CHANNEL = 1  # チャンネル
+COL_TITLE = 2  # 推定タイトル（編集可）
+COL_ARTIST = 3  # アーティスト（編集可。推定はしない）
+COL_STATUS = 4  # 状態
+COL_FORMAT = 5  # 形式（拡張子）
+# 行番号は Qt 標準の縦ヘッダ（headerData の Vertical）が担うため、専用の # 列は持たない
+_HEADERS = ("元タイトル", "チャンネル", "推定タイトル", "アーティスト", "状態", "形式")
 # 編集可能な列（クリップボード貼り付け・デリゲートで共用）
 EDITABLE_COLUMNS = (COL_TITLE, COL_ARTIST)
+# 値は書き換えないが、読み取り専用エディタを開いて本文の部分選択・コピーを許す列。
+# EDITABLE_COLUMNS とは別扱い（貼り付け対象にはしない）。
+COPYABLE_COLUMNS = (COL_STEM,)
 
 # 状態別の背景色（QColor 直書き）
 _COLOR_DONE = QColor(213, 245, 213)  # 薄緑
@@ -76,8 +79,10 @@ class TrackTableModel(QAbstractTableModel):
         if not index.isValid():
             return Qt.ItemFlag.NoItemFlags
         base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-        # 推定タイトル列とアーティスト列のみ編集可
-        if index.column() in EDITABLE_COLUMNS:
+        # 推定タイトル・アーティストは編集可。元タイトルは本文コピー用に
+        # 読み取り専用エディタを開けるよう、同じく ItemIsEditable を付ける
+        # （実際に書き換わるかはデリゲート側で決まる）。
+        if index.column() in EDITABLE_COLUMNS or index.column() in COPYABLE_COLUMNS:
             return base | Qt.ItemFlag.ItemIsEditable
         return base
 
@@ -118,8 +123,6 @@ class TrackTableModel(QAbstractTableModel):
     # -- 表示ヘルパ ----------------------------------------------------------
 
     def _display(self, row: int, track: Track, col: int, edit: bool = False):
-        if col == COL_INDEX:
-            return row + 1
         if col == COL_STEM:
             return track.stem
         if col == COL_CHANNEL:
@@ -309,11 +312,8 @@ class TrackTableModel(QAbstractTableModel):
 
         QSortFilterProxyModel を使わないのは、ワーカーが行を同一性(is)で探し、
         進捗 dict を行番号で持つため（proxy の行マッピングと相性が悪い）。
-        # 列は「現在の並び順」なので no-op。それ以外は表示文字列でソートする。
         進捗 dict は並びが崩れるためクリアする（_reindex_percent と同様）。
         """
-        if column == COL_INDEX:
-            return  # # 列は現在順そのものなので何もしない
         reverse = order == Qt.SortOrder.DescendingOrder
         self.layoutAboutToBeChanged.emit()
         self._tracks.sort(key=lambda t: self._sort_key(t, column), reverse=reverse)
