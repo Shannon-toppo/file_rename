@@ -1,0 +1,3 @@
+# チェックアウトを LF に統一する（Windows の autocrlf による CRLF 化で
+# フォーマッタ・diff が揺れるのを防ぐ。mv2title 側で踏んだ問題の予防）
+* text=auto eol=lf
