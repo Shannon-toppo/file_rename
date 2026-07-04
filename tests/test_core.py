@@ -237,6 +237,9 @@ def fake_ydl(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "YoutubeDL", FakeYDL)
     # 出力先も一時ディレクトリへ
     monkeypatch.setattr(core, "FILES_DIR", tmp_path)
+    # ローカライズ済みタイトルの取得は実 HTTP を叩くため必ず無効化する
+    # (使うテストは個別に上書きする)
+    monkeypatch.setattr(core, "_fetch_localized_title", lambda *a, **k: None)
     FakeYDL.info = None
     FakeYDL.hook_feed = []
     FakeYDL.last_opts = None
@@ -323,6 +326,50 @@ def test_download_tracks_empty_raises(fake_ydl, tmp_path):
 def test_download_tracks_bad_format():
     with pytest.raises(ValueError):
         core.download_tracks("u", "flac")
+
+
+def test_download_tracks_uses_localized_title_as_stem(fake_ydl, tmp_path, monkeypatch):
+    """watch 画面の日本語タイトルが取れたら推定入力(stem)に使う。
+
+    player API 由来の yt-dlp タイトル(= ファイル名)は翻訳されないため、
+    翻訳付き動画では next API の日本語タイトルを優先する回帰テスト。
+    """
+    entry = entry_for(tmp_path, "natori - Propose [VDdLF1YubI0]")
+    entry["id"] = "VDdLF1YubI0"
+    fake_ydl.info = entry
+    monkeypatch.setattr(
+        core, "_fetch_localized_title", lambda vid, **k: "なとり - プロポーズ"
+    )
+    tracks = core.download_tracks("u", "mp3")
+    assert tracks[0].stem == "なとり - プロポーズ"
+    # ファイル自体は yt-dlp のタイトルのまま(タグだけ日本語になる)
+    assert tracks[0].filepath.stem == "natori - Propose [VDdLF1YubI0]"
+
+    # 取得失敗(None)ならファイル名 stem へフォールバック
+    monkeypatch.setattr(core, "_fetch_localized_title", lambda vid, **k: None)
+    tracks = core.download_tracks("u", "mp3")
+    assert tracks[0].stem == "natori - Propose [VDdLF1YubI0]"
+
+
+def test_find_primary_title_parsing():
+    """next API 応答の構造探索(runs / simpleText / 見つからない)。"""
+    runs = {
+        "contents": [
+            {"videoPrimaryInfoRenderer": {"title": {"runs": [{"text": "なとり - "}, {"text": "プロポーズ"}]}}}
+        ]
+    }
+    assert core._find_primary_title(runs) == "なとり - プロポーズ"
+    simple = {"a": [{"videoPrimaryInfoRenderer": {"title": {"simpleText": "曲名"}}}]}
+    assert core._find_primary_title(simple) == "曲名"
+    assert core._find_primary_title({"contents": []}) is None
+
+
+def test_fetch_localized_title_network_failure_returns_none(monkeypatch):
+    def boom(req, timeout=0):
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    assert core._fetch_localized_title("VDdLF1YubI0") is None
 
 
 def test_download_tracks_prefers_japanese_metadata(fake_ydl, tmp_path):

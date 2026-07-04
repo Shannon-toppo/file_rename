@@ -8,6 +8,7 @@
 新しいスクリプトでも env 設定を重複させず、このモジュールを import すること。
 """
 import logging
+import json
 import threading
 import urllib.error
 import urllib.request
@@ -144,6 +145,71 @@ def check_connection(timeout: float = 3.0) -> tuple[bool, str]:
 DownloadProgress = Callable[[str, float, "int | None", "int | None"], None]
 
 
+def _fetch_localized_title(
+    video_id: str, lang: str = METADATA_LANG, timeout: float = 5.0
+) -> str | None:
+    """YouTube の watch 画面(innertube next API)から表示言語 lang のタイトルを取る。
+
+    yt-dlp が参照する player API の videoDetails.title はロケール非依存で、
+    投稿者が翻訳タイトルを用意していても常に既定言語を返す。一方ブラウザの
+    動画見出しは next API 由来で、hl に応じて翻訳される
+    (実測: VDdLF1YubI0 は player=英語 / next=日本語)。
+
+    構造変更や通信失敗など、どんな理由でも失敗したら None を返す
+    (呼び出し元は yt-dlp のタイトルへフォールバックする)。
+    """
+    payload = json.dumps(
+        {
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": "2.20250101.00.00",
+                    "hl": lang,
+                }
+            },
+            "videoId": video_id,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        "https://www.youtube.com/youtubei/v1/next",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.load(resp)
+    except Exception:
+        return None
+    return _find_primary_title(data)
+
+
+def _find_primary_title(node) -> str | None:
+    """next API 応答から videoPrimaryInfoRenderer.title のテキストを探す。
+
+    応答構造は YouTube 側の変更で変わり得るため、キー位置を決め打ちせず
+    再帰的に探索する(見つからなければ None)。
+    """
+    if isinstance(node, dict):
+        renderer = node.get("videoPrimaryInfoRenderer")
+        if isinstance(renderer, dict):
+            title = renderer.get("title") or {}
+            runs = title.get("runs") or []
+            text = "".join(r.get("text", "") for r in runs) or title.get("simpleText")
+            if text:
+                return text
+        for value in node.values():
+            found = _find_primary_title(value)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_primary_title(value)
+            if found:
+                return found
+    return None
+
+
 def download_tracks(
     url: str,
     fmt: str = "mp3",
@@ -235,9 +301,14 @@ def download_tracks(
             path = Path(ydl.prepare_filename(entry)).with_suffix(f".{fmt}")
             if not path.exists():
                 continue
+            # 推定の入力(stem)には、可能なら watch 画面の日本語タイトルを使う。
+            # yt-dlp のタイトル(= ファイル名)は player API 由来で翻訳されない
+            # ため、翻訳付き動画では英語のままになる(_fetch_localized_title 参照)。
+            video_id = entry.get("id")
+            localized = _fetch_localized_title(video_id) if video_id else None
             tracks.append(
                 Track(
-                    stem=path.stem,
+                    stem=localized or path.stem,
                     url=entry.get("webpage_url") or url,
                     filepath=path,
                     channel=entry.get("channel") or entry.get("uploader"),
