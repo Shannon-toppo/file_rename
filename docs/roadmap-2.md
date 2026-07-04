@@ -38,30 +38,30 @@
 | `_on_fill_artists` 後に対象行を再選択し、テーブルへフォーカスを戻す(`_select_rows` 新設)。ボタン押下でフォーカスが外れると選択が非アクティブ色(ダークテーマではほぼ不可視)になるのが「解除された」ように見える原因 | 【F】(小規模のため直接) | ✅ |
 | 回帰テスト: 選択行が維持される / 未選択→全行のケースでは埋めた行が選択される | 【S】 | ✅ 104 テスト全緑 |
 
-## フェーズ B: GitHub 公開準備
+## フェーズ B: GitHub 公開準備 ✅ 実施済み (2026-07-05)
 
 | タスク | 委譲 | 状態 |
 |---|---|---|
-| `git rm --cached list.txt`(ファイルは残す)+ README の記述更新 | 【F】git 操作 | |
-| `.gitattributes`(`* text=auto eol=lf`)追加 + 作業コピーの LF 正規化 | 【F】git 操作 | |
-| 未コミット作業を 4 コミットへ分割: ① コア分離(core.py / CLI / tests/test_core.py / pyproject) ② GUI 本体(gui/ + tests) ③ ドキュメント(README / CLAUDE.md / docs/) ④ リポジトリ衛生(list.txt 解除 + .gitattributes) | 【F】git 操作 | |
-| コミット一覧を提示 → push | 【F】 | |
+| `git rm --cached list.txt`(ファイルは残す)+ README の記述更新 | 【F】git 操作 | ✅ |
+| `.gitattributes`(`* text=auto eol=lf`)追加 + 作業コピーの LF 正規化 | 【F】git 操作 | ✅ |
+| 未コミット作業を 4 コミットへ分割: ① コア分離(core.py / CLI / tests/test_core.py / pyproject) ② GUI 本体(gui/ + tests) ③ ドキュメント(README / CLAUDE.md / docs/) ④ リポジトリ衛生(list.txt 解除 + .gitattributes) | 【F】git 操作 | ✅ 15bab34 / 25007ce / 050f00d / 6ee32d1 |
+| コミット一覧を提示 → push | 【F】 | ✅ |
 
-## フェーズ C: CI(GitHub Actions)
+## フェーズ C: CI(GitHub Actions) ✅ 実施済み (2026-07-05)
 
 | タスク | 委譲 | 状態 |
 |---|---|---|
-| `.github/workflows/ci.yml`: windows-latest + macos-latest で `QT_QPA_PLATFORM=offscreen uv run pytest`。mv2title を隣接 path に checkout(パス依存の再現。mv2title がプライベートなら PAT が必要) | 【F】(小規模のため直接) | |
+| `.github/workflows/ci.yml`: windows-latest + macos-latest で `QT_QPA_PLATFORM=offscreen uv run pytest`。mv2title を隣接 path に checkout(パス依存の再現。**mv2title は公開と確認済み**なので PAT 不要) | 【F】(小規模のため直接) | ✅ 初回実行 success(両 OS 緑) |
 | Linux は Qt の追加システムライブラリが必要なため対象外(必要になったら追加) | — | 記録のみ |
 
 ## フェーズ D: Mac 対応
 
 | タスク | 委譲 | 状態 |
 |---|---|---|
-| コード監査: pathlib 統一済み / ショートカットは `QKeySequence.StandardKey`(Mac では自動で Cmd 割当)/ Delete・Backspace 両対応済み / QSettings・offscreen テストはクロスプラットフォーム → コード変更は原則不要の見込み | 【F】 | |
-| `docs/macos-setup.md` 新設: Mac 初心者向け手順書(Homebrew → uv/ffmpeg/git → 2 リポジトリ clone → LM Studio → .env → uv sync → 起動)+ トラブルシュート | 【O】委譲(Fable レビュー) | |
-| README のショートカット表記に Mac(Cmd)を併記 | 【S】(上記と同一エージェント) | |
-| 実機確認チェックリスト(下記)をユーザーが Mac で実施 | 【F】ユーザー | |
+| コード監査: pathlib 統一済み / ショートカットは `QKeySequence.StandardKey`(Mac では自動で Cmd 割当)/ Delete・Backspace 両対応済み / QSettings・offscreen テストはクロスプラットフォーム → コード変更は原則不要の見込み | 【F】 | ✅ 変更不要を確認(CI の macOS ジョブ緑) |
+| `docs/macos-setup.md` 新設: Mac 初心者向け手順書(Homebrew → uv/ffmpeg/git → 2 リポジトリ clone → LM Studio → .env → uv sync → 起動)+ トラブルシュート | 【O】委譲(Fable レビュー) | ✅ レビューで誤字 1 件修正 |
+| README のショートカット表記に Mac(Cmd)を併記 | 【S】(上記と同一エージェント) | ✅ ペースト対象列の古い記述も同時に修正 |
+| 実機確認チェックリスト(下記)をユーザーが Mac で実施 | 【F】ユーザー | ⏸ ユーザー実施待ち |
 
 ### Mac 実機チェックリスト
 
