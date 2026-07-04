@@ -1,0 +1,43 @@
+# オフラインテスト（LLM・ネットワーク不要）を Windows / macOS で実行する。
+# mv2title へ editable パス依存（../mv2title）しているため、隣接パスに
+# mv2title（公開リポジトリ）も checkout して開発時と同じ配置を再現する。
+# Linux は Qt の追加システムライブラリが必要になるため対象外（roadmap-2.md）。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout file_rename
+        uses: actions/checkout@v4
+        with:
+          path: file_rename
+
+      - name: Checkout mv2title (editable path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: Shannon-toppo/mv2title
+          path: mv2title
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync dependencies
+        working-directory: file_rename
+        run: uv sync
+
+      - name: Run offline tests
+        working-directory: file_rename
+        env:
+          # ヘッドレス環境で Qt を動かす（tests/conftest.py でも設定しているが明示）
+          QT_QPA_PLATFORM: offscreen
+        run: uv run pytest tests/ -q
