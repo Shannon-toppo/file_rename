@@ -392,6 +392,15 @@ def test_download_tracks_expand_playlist_option(fake_ydl, tmp_path):
     assert fake_ydl.last_opts["noplaylist"] is False
 
 
+def test_download_tracks_normalize_option(fake_ydl, tmp_path):
+    """normalize=True（既定）で loudnorm フィルタが postprocessor_args に入る。"""
+    fake_ydl.info = entry_for(tmp_path, "a")
+    core.download_tracks("u", "mp3")  # 既定 ON
+    assert fake_ydl.last_opts["postprocessor_args"] == ["-af", core.NORMALIZE_FILTER]
+    core.download_tracks("u", "mp3", normalize=False)
+    assert "postprocessor_args" not in fake_ydl.last_opts  # OFF なら付けない
+
+
 def test_download_tracks_out_dir(fake_ydl, tmp_path):
     """out_dir 指定時は FILES_DIR ではなくそこへ保存する（フォルダも作成）。"""
     fake_ydl.info = entry_for(tmp_path, "a")

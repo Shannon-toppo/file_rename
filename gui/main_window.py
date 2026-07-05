@@ -81,6 +81,7 @@ class MainWindow(QMainWindow):
         self._out_dir: Path | None = None  # None = core.FILES_DIR
         self._batch_size: int = core.BATCH_SIZE
         self._expand_playlist: bool = False  # 混在 URL をリスト展開するか
+        self._normalize: bool = True  # DL 時に音量ノーマライズを掛けるか（既定 ON）
         self._theme: str = "system"  # "system" / "light" / "dark"
         # ログパネルの表示レベル（"DEBUG"/"INFO"/"WARNING"/"ERROR"）。
         # フィルタはハンドラ側 1 箇所で行う（logpanel.attach_handler 参照）
@@ -306,6 +307,7 @@ class MainWindow(QMainWindow):
             batch_size=self._batch_size,
             out_dir=self._out_dir,
             expand_playlist=self._expand_playlist,
+            normalize=self._normalize,
         )
         self._start(worker, "実行中...")
 
@@ -391,6 +393,7 @@ class MainWindow(QMainWindow):
             batch_size=self._batch_size,
             auto_write=self._auto_write.isChecked(),
             expand_playlist=self._expand_playlist,
+            normalize=self._normalize,
             theme=self._theme,
             log_level=self._log_level,
         )
@@ -405,6 +408,7 @@ class MainWindow(QMainWindow):
         self._out_dir = None if out_dir == core.FILES_DIR else out_dir
         self._batch_size = int(values["batch_size"])
         self._expand_playlist = bool(values.get("expand_playlist", False))
+        self._normalize = bool(values.get("normalize", True))
         new_theme = str(values.get("theme", "system"))
         if new_theme != self._theme:
             self._theme = new_theme
@@ -420,6 +424,7 @@ class MainWindow(QMainWindow):
             )
             self._settings.setValue("options/batch_size", self._batch_size)
             self._settings.setValue("options/expand_playlist", self._expand_playlist)
+            self._settings.setValue("options/normalize", self._normalize)
             self._settings.setValue("options/theme", self._theme)
             self._settings.setValue("options/log_level", self._log_level)
         self.statusBar().showMessage("設定を保存しました")
@@ -629,6 +634,9 @@ class MainWindow(QMainWindow):
         expand = s.value("options/expand_playlist")
         if expand is not None:
             self._expand_playlist = expand in (True, "true", "True", 1, "1")
+        normalize = s.value("options/normalize")
+        if normalize is not None:
+            self._normalize = normalize in (True, "true", "True", 1, "1")
         theme = s.value("options/theme")
         if theme in ("system", "light", "dark"):
             self._theme = theme

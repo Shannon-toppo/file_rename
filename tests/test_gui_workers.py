@@ -265,10 +265,12 @@ def test_worker_passes_download_and_infer_options(qtbot, monkeypatch, tmp_path):
         cancel=None,
         out_dir=None,
         expand_playlist=False,
+        normalize=True,
         logger=None,
     ):
         captured["out_dir"] = out_dir
         captured["expand_playlist"] = expand_playlist
+        captured["normalize"] = normalize
         return [Track(stem="a", filepath="a.mp3")]
 
     def fake_infer(tracks, client=None, batch_size=5, force=False):
@@ -290,9 +292,15 @@ def test_worker_passes_download_and_infer_options(qtbot, monkeypatch, tmp_path):
         batch_size=7,
         out_dir=tmp_path,
         expand_playlist=True,
+        normalize=False,
     )
     run_worker(qtbot, worker)
-    assert captured == {"out_dir": tmp_path, "batch_size": 7, "expand_playlist": True}
+    assert captured == {
+        "out_dir": tmp_path,
+        "batch_size": 7,
+        "expand_playlist": True,
+        "normalize": False,
+    }
 
 
 def test_worker_passes_yt_dlp_logger_to_download(qtbot, monkeypatch):

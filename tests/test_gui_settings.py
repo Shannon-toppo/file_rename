@@ -35,6 +35,7 @@ def test_settings_dialog_roundtrip(qtbot, tmp_path):
         batch_size=9,
         auto_write=False,
         expand_playlist=True,
+        normalize=False,
         theme="dark",
         log_level="DEBUG",
     )
@@ -45,6 +46,7 @@ def test_settings_dialog_roundtrip(qtbot, tmp_path):
         "batch_size": 9,
         "auto_write": False,
         "expand_playlist": True,
+        "normalize": False,
         "theme": "dark",
         "log_level": "DEBUG",
     }
@@ -59,6 +61,7 @@ def test_settings_dialog_defaults(qtbot):
     assert v["batch_size"] == core.BATCH_SIZE
     assert v["auto_write"] is True
     assert v["expand_playlist"] is False  # 既定は現行どおり動画 1 本のみ
+    assert v["normalize"] is True  # 既定で音量ノーマライズ ON
     assert v["theme"] == "system"  # 既定は OS テーマに追従
     assert v["log_level"] == "WARNING"  # 既定は警告レベル
 
@@ -84,6 +87,7 @@ def test_apply_settings_updates_window(main_window, tmp_path):
             "batch_size": 12,
             "auto_write": False,
             "expand_playlist": True,
+            "normalize": False,
         }
     )
     assert win._out_dir == tmp_path
@@ -91,6 +95,7 @@ def test_apply_settings_updates_window(main_window, tmp_path):
     assert win._fmt_combo.currentText() == "m4a"
     assert win._auto_write.isChecked() is False
     assert win._expand_playlist is True
+    assert win._normalize is False
 
 
 def test_apply_settings_default_dir_becomes_none(main_window):
