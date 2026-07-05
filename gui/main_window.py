@@ -25,11 +25,13 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QMainWindow,
     QMenu,
     QPlainTextEdit,
     QPushButton,
+    QSlider,
     QStyledItemDelegate,
     QTableView,
     QVBoxLayout,
@@ -38,6 +40,14 @@ from PySide6.QtWidgets import (
 
 import core
 from core import Status, Track
+
+from .clipboard import resolve_paste_targets, selection_to_tsv
+from .commands import ClearTitleCommand, EditArtistCommand, EditTitleCommand
+from .logpanel import LogPanel, QtLogHandler, attach_handler, detach_handler
+from .model import COL_ARTIST, COL_STATUS, COL_STEM, COL_TITLE, PERCENT_ROLE, TrackTableModel
+from .player import PreviewPlayer, format_time
+from .settings_dialog import SettingsDialog
+from .workers import MODE_FULL, MODE_INFER, MODE_WRITE, PipelineWorker
 
 
 def apply_color_scheme(name: str) -> None:
@@ -55,12 +65,10 @@ def apply_color_scheme(name: str) -> None:
     }.get(name, Qt.ColorScheme.Unknown)
     hints.setColorScheme(scheme)
 
-from .clipboard import resolve_paste_targets, selection_to_tsv
-from .commands import ClearTitleCommand, EditArtistCommand, EditTitleCommand
-from .logpanel import LogPanel, QtLogHandler, attach_handler, detach_handler
-from .model import COL_ARTIST, COL_STATUS, COL_STEM, COL_TITLE, PERCENT_ROLE, TrackTableModel
-from .settings_dialog import SettingsDialog
-from .workers import MODE_FULL, MODE_INFER, MODE_WRITE, PipelineWorker
+
+def _as_bool(value) -> bool:
+    """QSettings の値を bool へ正規化する（bool が文字列で返ることがあるため）。"""
+    return value in (True, "true", "True", 1, "1")
 
 
 class MainWindow(QMainWindow):
@@ -82,12 +90,20 @@ class MainWindow(QMainWindow):
         self._batch_size: int = core.BATCH_SIZE
         self._expand_playlist: bool = False  # 混在 URL をリスト展開するか
         self._normalize: bool = True  # DL 時に音量ノーマライズを掛けるか（既定 ON）
+        self._loudness: float = core.NORMALIZE_TARGET_I  # ノーマライズ基準値 (LUFS)
+        self._trim_silence: bool = False  # 末尾の無音削除（試験的、既定 OFF）
         self._theme: str = "system"  # "system" / "light" / "dark"
         # ログパネルの表示レベル（"DEBUG"/"INFO"/"WARNING"/"ERROR"）。
         # フィルタはハンドラ側 1 箇所で行う（logpanel.attach_handler 参照）
         self._log_level: str = "WARNING"
 
         self._build_ui()
+        # 試聴プレーヤ（ノーマライズ・無音削除の結果確認用）。QtMultimedia の
+        # 実プレーヤは初回再生時に遅延生成される（gui/player.py 参照）
+        self._player = PreviewPlayer(self)
+        self._player.playing_changed.connect(self._on_playing_changed)
+        self._player.position_changed.connect(self._on_player_position)
+        self._player.duration_changed.connect(self._on_player_duration)
         # ウィンドウサイズ・列幅・トグル類の永続化。テストでは QSettings を
         # 汚さないよう restore_settings=False で復元/保存を無効化する。
         self._settings = QSettings("mv2title", "file_rename_gui") if restore_settings else None
@@ -192,6 +208,33 @@ class MainWindow(QMainWindow):
         self._view.customContextMenuRequested.connect(self._show_context_menu)
         root.addWidget(self._view, stretch=1)
 
+        # 試聴コントロール（処理結果の確認用）: ▶/⏸ ボタン + シークバー + 時間表示。
+        # ▶ は選択行を再生（同じファイルなら一時停止/再開のトグル）、末尾試聴は
+        # 無音削除の確認のため末尾 TAIL_SECS 秒だけ再生する
+        preview = QHBoxLayout()
+        self._play_btn = QPushButton("▶")
+        self._play_btn.setFixedWidth(36)
+        self._play_btn.setToolTip(
+            "選択行の音声を再生 / 一時停止（ノーマライズ・無音削除の結果確認用）"
+        )
+        self._play_btn.clicked.connect(self._on_preview)
+        self._seek_slider = QSlider(Qt.Orientation.Horizontal)
+        self._seek_slider.setRange(0, 0)
+        self._seek_slider.setToolTip("ドラッグで再生位置を移動")
+        self._seek_slider.sliderMoved.connect(self._on_seek)
+        self._time_label = QLabel("0:00 / 0:00")
+        self._duration_ms = 0  # 時間表示用（duration_changed で更新）
+        self._tail_btn = QPushButton("♪ 末尾試聴")
+        self._tail_btn.setToolTip(
+            f"選択行の末尾 {PreviewPlayer.TAIL_SECS:.0f} 秒だけ再生する（無音削除の確認用）"
+        )
+        self._tail_btn.clicked.connect(self._on_preview_tail)
+        preview.addWidget(self._play_btn)
+        preview.addWidget(self._seek_slider, stretch=1)
+        preview.addWidget(self._time_label)
+        preview.addWidget(self._tail_btn)
+        root.addLayout(preview)
+
         # 下段: 選択行への操作
         bottom = QHBoxLayout()
         reinfer_btn = QPushButton("選択行を再推定")
@@ -234,6 +277,8 @@ class MainWindow(QMainWindow):
             file_btn,
             import_btn,
             del_btn,
+            self._play_btn,
+            self._tail_btn,
         ]
 
         # undo/redo（Ctrl+Z / Ctrl+Y）。ウィンドウにアクションを載せる
@@ -308,6 +353,8 @@ class MainWindow(QMainWindow):
             out_dir=self._out_dir,
             expand_playlist=self._expand_playlist,
             normalize=self._normalize,
+            loudness=self._loudness,
+            trim_silence=self._trim_silence,
         )
         self._start(worker, "実行中...")
 
@@ -394,6 +441,8 @@ class MainWindow(QMainWindow):
             auto_write=self._auto_write.isChecked(),
             expand_playlist=self._expand_playlist,
             normalize=self._normalize,
+            loudness=self._loudness,
+            trim_silence=self._trim_silence,
             theme=self._theme,
             log_level=self._log_level,
         )
@@ -409,6 +458,8 @@ class MainWindow(QMainWindow):
         self._batch_size = int(values["batch_size"])
         self._expand_playlist = bool(values.get("expand_playlist", False))
         self._normalize = bool(values.get("normalize", True))
+        self._loudness = float(values.get("loudness", core.NORMALIZE_TARGET_I))
+        self._trim_silence = bool(values.get("trim_silence", False))
         new_theme = str(values.get("theme", "system"))
         if new_theme != self._theme:
             self._theme = new_theme
@@ -425,6 +476,8 @@ class MainWindow(QMainWindow):
             self._settings.setValue("options/batch_size", self._batch_size)
             self._settings.setValue("options/expand_playlist", self._expand_playlist)
             self._settings.setValue("options/normalize", self._normalize)
+            self._settings.setValue("options/loudness", self._loudness)
+            self._settings.setValue("options/trim_silence", self._trim_silence)
             self._settings.setValue("options/theme", self._theme)
             self._settings.setValue("options/log_level", self._log_level)
         self.statusBar().showMessage("設定を保存しました")
@@ -438,6 +491,91 @@ class MainWindow(QMainWindow):
         self._model.remove_rows(rows)
         self.statusBar().showMessage(f"{len(rows)} 行を削除しました（ファイルは残ります）")
 
+    # -- 試聴（プレビュー再生）----------------------------------------------
+
+    def _on_preview(self) -> None:
+        """▶ ボタン: 選択行を再生する。同じファイルの再生中は一時停止、一時停止中は再開。"""
+        track = self._preview_target()
+        if track is None:
+            # 選択が無くても再生中/一時停止中なら現在の曲をトグルする
+            if self._player.is_playing:
+                self._player.pause()
+            elif self._player.is_paused:
+                self._player.resume()
+            else:
+                self.statusBar().showMessage("試聴できる行がありません（ファイル未取得の行は不可）")
+            return
+        path = Path(track.filepath)
+        if not path.exists():
+            self.statusBar().showMessage(f"ファイルが見つかりません: {path}")
+            return
+        if self._player.current_path == path:
+            # 同じファイルなら一時停止/再開のトグル（先頭からやり直さない）
+            if self._player.is_playing:
+                self._player.pause()
+                return
+            if self._player.is_paused:
+                self._player.resume()
+                return
+        self._player.play(path)
+        self.statusBar().showMessage(f"試聴中: {path.name}")
+
+    def _on_preview_tail(self) -> None:
+        """選択行の末尾だけ再生する（無音削除の確認用）。"""
+        track = self._preview_target()
+        if track is None:
+            self.statusBar().showMessage("試聴できる行がありません（ファイル未取得の行は不可）")
+            return
+        path = Path(track.filepath)
+        if not path.exists():
+            self.statusBar().showMessage(f"ファイルが見つかりません: {path}")
+            return
+        self._player.play(path, tail_only=True)
+        self.statusBar().showMessage(f"試聴中（末尾のみ）: {path.name}")
+
+    def _preview_target(self) -> Track | None:
+        """試聴対象: 選択行のうち filepath を持つ最初の行（無ければ None）。"""
+        return next(
+            (
+                self._model.track_at(r)
+                for r in self._selected_rows()
+                if self._model.track_at(r).filepath is not None
+            ),
+            None,
+        )
+
+    def _on_seek(self, position_ms: int) -> None:
+        """シークバーのドラッグで再生位置を移動する。"""
+        self._player.seek(position_ms)
+
+    def _on_playing_changed(self, playing: bool) -> None:
+        """再生状態に合わせて ▶/⏸ ボタンの表示を切り替える。"""
+        self._play_btn.setText("⏸" if playing else "▶")
+        # 一時停止中は「試聴中」の表示を保つ（停止・再生終了時のみ戻す）
+        if (
+            not playing
+            and not self._player.is_paused
+            and self.statusBar().currentMessage().startswith("試聴中")
+        ):
+            self.statusBar().showMessage("準備完了")
+
+    def _on_player_position(self, position_ms: int) -> None:
+        """再生位置をシークバーと時間表示へ反映する（ドラッグ中は上書きしない）。"""
+        if not self._seek_slider.isSliderDown():
+            self._seek_slider.setValue(position_ms)
+        self._update_time_label(position_ms)
+
+    def _on_player_duration(self, duration_ms: int) -> None:
+        """曲の長さが確定したらシークバーの範囲と時間表示を更新する。"""
+        self._duration_ms = duration_ms
+        self._seek_slider.setRange(0, max(0, duration_ms))
+        self._update_time_label(self._seek_slider.value())
+
+    def _update_time_label(self, position_ms: int) -> None:
+        self._time_label.setText(
+            f"{format_time(position_ms)} / {format_time(self._duration_ms)}"
+        )
+
     # -- 補助 ---------------------------------------------------------------
 
     def _selected_rows(self) -> list[int]:
@@ -449,8 +587,12 @@ class MainWindow(QMainWindow):
 
     def _set_running(self, running: bool) -> None:
         self._running = running
+        if running:
+            # 実行中は対象ファイルが変換で書き換わり得るため試聴を止める
+            self._player.stop()
         for b in self._busy_buttons:
             b.setEnabled(not running)
+        self._seek_slider.setEnabled(not running)
         self._stop_btn.setEnabled(running)
         # 実行中はソート禁止（ワーカーの行同一性・進捗 dict を壊さないため）
         self._view.setSortingEnabled(not running)
@@ -617,8 +759,7 @@ class MainWindow(QMainWindow):
             self._view.horizontalHeader().restoreState(header_state)
         auto = s.value("options/auto_write")
         if auto is not None:
-            # QSettings は bool を文字列で返すことがあるため正規化する
-            self._auto_write.setChecked(auto in (True, "true", "True", 1, "1"))
+            self._auto_write.setChecked(_as_bool(auto))
         fmt = s.value("options/format")
         if fmt in core.SUPPORTED_FORMATS:
             self._fmt_combo.setCurrentText(fmt)
@@ -633,10 +774,19 @@ class MainWindow(QMainWindow):
                 pass
         expand = s.value("options/expand_playlist")
         if expand is not None:
-            self._expand_playlist = expand in (True, "true", "True", 1, "1")
+            self._expand_playlist = _as_bool(expand)
         normalize = s.value("options/normalize")
         if normalize is not None:
-            self._normalize = normalize in (True, "true", "True", 1, "1")
+            self._normalize = _as_bool(normalize)
+        loudness = s.value("options/loudness")
+        if loudness is not None:
+            try:
+                self._loudness = float(loudness)
+            except (TypeError, ValueError):
+                pass
+        trim = s.value("options/trim_silence")
+        if trim is not None:
+            self._trim_silence = _as_bool(trim)
         theme = s.value("options/theme")
         if theme in ("system", "light", "dark"):
             self._theme = theme
@@ -655,6 +805,7 @@ class MainWindow(QMainWindow):
         s.setValue("options/format", self._fmt_combo.currentText())
 
     def closeEvent(self, event) -> None:
+        self._player.stop()
         self._save_settings()
         # ログハンドラを外す（テスト等で多重生成してもロガーに蓄積しないように）
         detach_handler(self._log_handler)

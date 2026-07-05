@@ -3,10 +3,8 @@
 
 view/clipboard から切り離した純粋関数として置き、単体テスト可能にする。
 - selection_to_tsv: 選択セル範囲を TSV 文字列へ（表示値。手動 "✎ " は含めない）。
-- paste_tsv: TSV を現在セルを左上として貼り付け（編集可能列のみ反映）。
-
-反映は model.setData 経由で行うため、manual フラグ・PENDING 化などの
-既存の setData 副作用にそのまま乗る。
+- resolve_paste_targets: TSV を展開して貼り付け対象の (行, 列, 値) を求める。
+  実際の反映は MainWindow.paste_tsv_via_commands が undo コマンド経由で行う。
 """
 from collections.abc import Sequence
 
@@ -45,8 +43,6 @@ def resolve_paste_targets(
 
     編集可能列（推定タイトル / アーティスト列）に落ちるセルのみを対象にする。
     範囲外の行・列や編集不可セルは除外する。末尾の空行・CR は無視する。
-    setData 経由の貼り付け（paste_tsv）と undo コマンド経由の貼り付け
-    （main_window）で対象判定を共有するためのヘルパ。
     """
     if not start_index.isValid() or not text:
         return []
@@ -73,16 +69,3 @@ def resolve_paste_targets(
                 continue
             targets.append((row, col, value))
     return targets
-
-
-def paste_tsv(model, start_index: QModelIndex, text: str) -> int:
-    """TSV を start_index を左上として貼り付ける。反映セル数を返す。
-
-    編集可能列（推定タイトル / アーティスト列）に落ちるセルのみ setData で
-    反映し、それ以外の列に落ちるセルは無視する。末尾の空行はスキップする。
-    """
-    pasted = 0
-    for row, col, value in resolve_paste_targets(model, start_index, text):
-        if model.setData(model.index(row, col), value, Qt.ItemDataRole.EditRole):
-            pasted += 1
-    return pasted

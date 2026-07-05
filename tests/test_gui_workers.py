@@ -266,11 +266,15 @@ def test_worker_passes_download_and_infer_options(qtbot, monkeypatch, tmp_path):
         out_dir=None,
         expand_playlist=False,
         normalize=True,
+        loudness=core.NORMALIZE_TARGET_I,
+        trim_silence=False,
         logger=None,
     ):
         captured["out_dir"] = out_dir
         captured["expand_playlist"] = expand_playlist
         captured["normalize"] = normalize
+        captured["loudness"] = loudness
+        captured["trim_silence"] = trim_silence
         return [Track(stem="a", filepath="a.mp3")]
 
     def fake_infer(tracks, client=None, batch_size=5, force=False):
@@ -293,6 +297,8 @@ def test_worker_passes_download_and_infer_options(qtbot, monkeypatch, tmp_path):
         out_dir=tmp_path,
         expand_playlist=True,
         normalize=False,
+        loudness=-10.0,
+        trim_silence=True,
     )
     run_worker(qtbot, worker)
     assert captured == {
@@ -300,6 +306,8 @@ def test_worker_passes_download_and_infer_options(qtbot, monkeypatch, tmp_path):
         "batch_size": 7,
         "expand_playlist": True,
         "normalize": False,
+        "loudness": -10.0,
+        "trim_silence": True,
     }
 
 
