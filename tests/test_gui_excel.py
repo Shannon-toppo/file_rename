@@ -11,7 +11,7 @@ import pytest
 from PySide6.QtCore import QCoreApplication, Qt
 
 from core import Status, Track
-from gui.clipboard import paste_tsv, selection_to_tsv
+from gui.clipboard import resolve_paste_targets, selection_to_tsv
 from gui.commands import ClearTitleCommand, EditTitleCommand
 from gui.model import (
     COL_CHANNEL,
@@ -84,51 +84,37 @@ def test_selection_to_tsv_empty():
 
 
 # ---------------------------------------------------------------------------
-# paste_tsv
+# resolve_paste_targets（貼り付け対象の判定。反映は undo コマンド経由）
 # ---------------------------------------------------------------------------
 
 
-def test_paste_tsv_only_title_column_reflected():
-    tracks = [Track(stem="s1"), Track(stem="s2")]
-    model = _make_model(tracks)
-    # 開始セルをタイトル列にし、1 列分の TSV を 2 行貼り付け
-    n = paste_tsv(model, model.index(0, COL_TITLE), "aaa\nbbb")
-    assert n == 2
-    assert tracks[0].guessed_title == "aaa"
-    assert tracks[1].guessed_title == "bbb"
-    # setData 経由なので manual フラグが立ち PENDING になる
-    assert tracks[0].manual is True
-    assert tracks[0].status is Status.PENDING
+def test_resolve_paste_targets_title_column():
+    model = _make_model([Track(stem="s1"), Track(stem="s2")])
+    # 開始セルをタイトル列にし、1 列分の TSV を 2 行分展開
+    targets = resolve_paste_targets(model, model.index(0, COL_TITLE), "aaa\nbbb")
+    assert targets == [(0, COL_TITLE, "aaa"), (1, COL_TITLE, "bbb")]
 
 
-def test_paste_tsv_ignores_non_editable_columns():
-    tracks = [Track(stem="orig", channel="ch")]
-    model = _make_model(tracks)
-    # 開始セルを元タイトル列にする → タイトル列に落ちる分だけ反映、他は無視
+def test_resolve_paste_targets_ignores_non_editable_columns():
+    model = _make_model([Track(stem="orig", channel="ch")])
+    # 開始セルを元タイトル列にする → 編集可能列に落ちる分だけが対象
     # 行: [stem][channel][title] にまたがる 3 列 TSV
-    n = paste_tsv(model, model.index(0, COL_STEM), "X\tY\tZ")
-    # 反映されるのはタイトル列（3 列目 = COL_TITLE）に落ちる "Z" のみ
-    assert n == 1
-    assert tracks[0].stem == "orig"  # 元タイトルは書き換わらない
-    assert tracks[0].channel == "ch"  # チャンネルも書き換わらない
-    assert tracks[0].guessed_title == "Z"
+    targets = resolve_paste_targets(model, model.index(0, COL_STEM), "X\tY\tZ")
+    # 対象はタイトル列（3 列目 = COL_TITLE）に落ちる "Z" のみ
+    assert targets == [(0, COL_TITLE, "Z")]
 
 
-def test_paste_tsv_trailing_blank_line_ignored():
-    tracks = [Track(stem="s1")]
-    model = _make_model(tracks)
-    n = paste_tsv(model, model.index(0, COL_TITLE), "only\n")
-    assert n == 1
-    assert tracks[0].guessed_title == "only"
+def test_resolve_paste_targets_trailing_blank_line_ignored():
+    model = _make_model([Track(stem="s1")])
+    targets = resolve_paste_targets(model, model.index(0, COL_TITLE), "only\n")
+    assert targets == [(0, COL_TITLE, "only")]
 
 
-def test_paste_tsv_out_of_range_rows_skipped():
-    tracks = [Track(stem="s1")]
-    model = _make_model(tracks)
-    # 2 行分あるが行は 1 つしかない → 1 件のみ反映
-    n = paste_tsv(model, model.index(0, COL_TITLE), "a\nb")
-    assert n == 1
-    assert tracks[0].guessed_title == "a"
+def test_resolve_paste_targets_out_of_range_rows_skipped():
+    model = _make_model([Track(stem="s1")])
+    # 2 行分あるが行は 1 つしかない → 1 件のみ対象
+    targets = resolve_paste_targets(model, model.index(0, COL_TITLE), "a\nb")
+    assert targets == [(0, COL_TITLE, "a")]
 
 
 # ---------------------------------------------------------------------------

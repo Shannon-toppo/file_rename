@@ -396,9 +396,32 @@ def test_download_tracks_normalize_option(fake_ydl, tmp_path):
     """normalize=True（既定）で loudnorm フィルタが postprocessor_args に入る。"""
     fake_ydl.info = entry_for(tmp_path, "a")
     core.download_tracks("u", "mp3")  # 既定 ON
-    assert fake_ydl.last_opts["postprocessor_args"] == ["-af", core.NORMALIZE_FILTER]
+    assert fake_ydl.last_opts["postprocessor_args"] == ["-af", core.loudnorm_filter()]
     core.download_tracks("u", "mp3", normalize=False)
     assert "postprocessor_args" not in fake_ydl.last_opts  # OFF なら付けない
+
+
+def test_download_tracks_loudness_option(fake_ydl, tmp_path):
+    """loudness で loudnorm の基準値 (I) を変えられる（TP / LRA は固定）。"""
+    fake_ydl.info = entry_for(tmp_path, "a")
+    core.download_tracks("u", "mp3", loudness=-9.5)
+    assert fake_ydl.last_opts["postprocessor_args"] == [
+        "-af",
+        "loudnorm=I=-9.5:TP=-1.5:LRA=11",
+    ]
+
+
+def test_download_tracks_trim_silence_option(fake_ydl, tmp_path):
+    """trim_silence=True で末尾無音削除フィルタが loudnorm の前段に入る（既定 OFF）。"""
+    fake_ydl.info = entry_for(tmp_path, "a")
+    core.download_tracks("u", "mp3", trim_silence=True)
+    assert fake_ydl.last_opts["postprocessor_args"] == [
+        "-af",
+        core.TRIM_SILENCE_FILTER + "," + core.loudnorm_filter(),
+    ]
+    # ノーマライズ OFF でも無音削除は単独で使える
+    core.download_tracks("u", "mp3", normalize=False, trim_silence=True)
+    assert fake_ydl.last_opts["postprocessor_args"] == ["-af", core.TRIM_SILENCE_FILTER]
 
 
 def test_download_tracks_out_dir(fake_ydl, tmp_path):

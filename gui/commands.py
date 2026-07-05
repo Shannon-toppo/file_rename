@@ -18,7 +18,7 @@ class _StateCommand(QUndoCommand):
     """行のタイトル状態タプルを old/new で入れ替えるコマンドの基底。
 
     redo で new 状態、undo で old 状態を復元する。old/new は
-    model.title_state() が返す 5 要素タプル。
+    model.title_state() が返す 6 要素タプル。
     """
 
     def __init__(self, model, row: int, old_state: tuple, new_state: tuple, text: str):

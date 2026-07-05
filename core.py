@@ -37,10 +37,23 @@ SUPPORTED_FORMATS = ("mp3", "wav", "m4a")
 BATCH_SIZE = 5
 # YouTube の翻訳メタデータ(タイトル/チャンネル名)の優先言語
 METADATA_LANG = "ja"
-# 音量ノーマライズ(loudnorm)の ffmpeg 音声フィルタ。EBU R128 相当の
-# ターゲット(統合ラウドネス -14 LUFS / トゥルーピーク -1.5 dBTP / LRA 11)を
-# 単一パスで適用する。download_tracks(normalize=True) で使用。
-NORMALIZE_FILTER = "loudnorm=I=-14:TP=-1.5:LRA=11"
+# 音量ノーマライズ(loudnorm)の既定パラメータ。EBU R128 相当のターゲットを
+# 単一パスで適用する(download_tracks(normalize=True) で使用)。
+# 基準値(統合ラウドネス I)は設定 / CLI から変更できる。TP / LRA は固定。
+NORMALIZE_TARGET_I = -14.0  # 統合ラウドネス (LUFS)。音楽配信の標準的な値
+_NORMALIZE_TP = -1.5  # トゥルーピーク (dBTP)
+_NORMALIZE_LRA = 11.0  # ラウドネスレンジ (LU)
+# 末尾の無音削除(試験的)。areverse で末尾を先頭側へ持ってきて silenceremove を
+# 掛け、また元に戻す。-50dB 以下(ほぼ無音)だけを無音とみなし、1 秒は残す
+# 保守的な設定(フェードアウトや余韻を音楽本体ごと削らないため)。閾値は固定。
+TRIM_SILENCE_FILTER = (
+    "areverse,silenceremove=start_periods=1:start_threshold=-50dB:start_silence=1,areverse"
+)
+
+
+def loudnorm_filter(target_i: float = NORMALIZE_TARGET_I) -> str:
+    """基準値 target_i (LUFS) を使った loudnorm の ffmpeg フィルタ文字列を作る。"""
+    return f"loudnorm=I={target_i:g}:TP={_NORMALIZE_TP:g}:LRA={_NORMALIZE_LRA:g}"
 
 
 class CancelledError(Exception):
@@ -222,6 +235,8 @@ def download_tracks(
     out_dir: Path | None = None,
     expand_playlist: bool = False,
     normalize: bool = True,
+    loudness: float = NORMALIZE_TARGET_I,
+    trim_silence: bool = False,
     logger: logging.Logger | None = None,
 ) -> list[Track]:
     """URL の音声を指定形式でダウンロードし、Track のリストを返す。
@@ -232,7 +247,9 @@ def download_tracks(
     チャンネル名が取得できれば Track.channel に載せる。
     out_dir を指定すると FILES_DIR の代わりにそこへ保存する（GUI の設定用）。
     normalize=True（既定）だと ffmpeg の loudnorm フィルタで音量を揃える
-    （NORMALIZE_FILTER 参照）。ffmpeg の再エンコード時に適用される。
+    （基準値は loudness で変更可。loudnorm_filter 参照）。trim_silence=True だと
+    末尾の無音区間を削除する（試験的。TRIM_SILENCE_FILTER 参照）。どちらも
+    ffmpeg の再エンコード時に適用される。
     logger を渡すと yt-dlp の出力を stdout ではなくその Python ロガーへ流す
     （quiet=True 併用で logging 経由へ完全に切り替える。GUI のログパネル用）。
     None なら現状どおり yt-dlp が直接コンソールへ出力する（CLI 用）。
@@ -282,11 +299,17 @@ def download_tracks(
             }
         ],
     }
+    filters = []
+    if trim_silence:
+        # 無音を除いた本体でラウドネスを測れるよう、loudnorm より前段に置く
+        filters.append(TRIM_SILENCE_FILTER)
     if normalize:
-        # ffmpeg 音声フィルタとして loudnorm を FFmpegExtractAudio へ渡す。
-        # フラットな list は全 ffmpeg 系ポストプロセッサに適用される（ここでは
-        # 抽出のみ）。二重掛けを避けるため normalize が False のときは付けない。
-        opts["postprocessor_args"] = ["-af", NORMALIZE_FILTER]
+        filters.append(loudnorm_filter(loudness))
+    if filters:
+        # ffmpeg 音声フィルタとして FFmpegExtractAudio へ渡す。フラットな list は
+        # 全 ffmpeg 系ポストプロセッサに適用される（ここでは抽出のみ）。
+        # 二重掛けを避けるため、両方 OFF のときは付けない。
+        opts["postprocessor_args"] = ["-af", ",".join(filters)]
     if logger is not None:
         # yt-dlp の出力を logging 経由へ切り替える（quiet=True で stdout を止め、
         # logger へ渡した Python ロガーに info/warning/error/debug を流す）

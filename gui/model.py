@@ -191,8 +191,6 @@ class TrackTableModel(QAbstractTableModel):
         if row is None:
             self.add_tracks(tracks)
             return
-        # 進捗辞書のインデックスがずれるためクリアする
-        self._percent.pop(row, None)
         self.beginRemoveRows(QModelIndex(), row, row)
         del self._tracks[row]
         self.endRemoveRows()

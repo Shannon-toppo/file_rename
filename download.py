@@ -27,11 +27,19 @@ from pathlib import Path
 import core
 
 
-def process_url(url: str, fmt: str, normalize: bool = True) -> None:
+def process_url(
+    url: str,
+    fmt: str,
+    normalize: bool = True,
+    loudness: float = core.NORMALIZE_TARGET_I,
+    trim_silence: bool = False,
+) -> None:
     """1 件の URL をダウンロードしてメタデータを書き込む。"""
     print(f"Downloading audio ({fmt}) from: {url}")
     try:
-        tracks = core.download_tracks(url, fmt, normalize=normalize)
+        tracks = core.download_tracks(
+            url, fmt, normalize=normalize, loudness=loudness, trim_silence=trim_silence
+        )
     except Exception as e:
         print(f"Error: ダウンロードに失敗しました: {e}")
         return
@@ -81,6 +89,17 @@ def main() -> None:
         action="store_true",
         help="音量ノーマライズ(loudnorm)を無効にする（既定は有効）",
     )
+    parser.add_argument(
+        "--loudness",
+        type=float,
+        default=core.NORMALIZE_TARGET_I,
+        help=f"ノーマライズの基準値 LUFS（既定: {core.NORMALIZE_TARGET_I:g}）",
+    )
+    parser.add_argument(
+        "--trim-silence",
+        action="store_true",
+        help="末尾の無音区間を削除する（試験的。-50dB 以下を 1 秒残して削除）",
+    )
     args = parser.parse_args()
 
     if bool(args.url) == bool(args.batch_file):
@@ -102,7 +121,13 @@ def main() -> None:
     for i, url in enumerate(urls, 1):
         if total > 1:
             print(f"\n===== [{i}/{total}] =====")
-        process_url(url, args.format, normalize=not args.no_normalize)
+        process_url(
+            url,
+            args.format,
+            normalize=not args.no_normalize,
+            loudness=args.loudness,
+            trim_silence=args.trim_silence,
+        )
 
 
 if __name__ == "__main__":

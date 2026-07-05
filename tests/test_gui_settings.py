@@ -36,6 +36,8 @@ def test_settings_dialog_roundtrip(qtbot, tmp_path):
         auto_write=False,
         expand_playlist=True,
         normalize=False,
+        loudness=-16.5,
+        trim_silence=True,
         theme="dark",
         log_level="DEBUG",
     )
@@ -47,6 +49,8 @@ def test_settings_dialog_roundtrip(qtbot, tmp_path):
         "auto_write": False,
         "expand_playlist": True,
         "normalize": False,
+        "loudness": -16.5,
+        "trim_silence": True,
         "theme": "dark",
         "log_level": "DEBUG",
     }
@@ -62,8 +66,19 @@ def test_settings_dialog_defaults(qtbot):
     assert v["auto_write"] is True
     assert v["expand_playlist"] is False  # 既定は現行どおり動画 1 本のみ
     assert v["normalize"] is True  # 既定で音量ノーマライズ ON
+    assert v["loudness"] == core.NORMALIZE_TARGET_I  # 既定の基準値 -14 LUFS
+    assert v["trim_silence"] is False  # 無音削除は試験的機能なので既定 OFF
     assert v["theme"] == "system"  # 既定は OS テーマに追従
     assert v["log_level"] == "WARNING"  # 既定は警告レベル
+
+
+def test_settings_dialog_loudness_follows_normalize_toggle(qtbot):
+    """基準値スピンはノーマライズ OFF で無効化され、ON に戻すと有効になる。"""
+    dlg = SettingsDialog(normalize=False)
+    qtbot.addWidget(dlg)
+    assert not dlg._loudness_spin.isEnabled()
+    dlg._normalize_check.setChecked(True)
+    assert dlg._loudness_spin.isEnabled()
 
 
 def test_settings_dialog_connection_test(qtbot, monkeypatch):
@@ -88,6 +103,8 @@ def test_apply_settings_updates_window(main_window, tmp_path):
             "auto_write": False,
             "expand_playlist": True,
             "normalize": False,
+            "loudness": -11.0,
+            "trim_silence": True,
         }
     )
     assert win._out_dir == tmp_path
@@ -96,6 +113,8 @@ def test_apply_settings_updates_window(main_window, tmp_path):
     assert win._auto_write.isChecked() is False
     assert win._expand_playlist is True
     assert win._normalize is False
+    assert win._loudness == -11.0
+    assert win._trim_silence is True
 
 
 def test_apply_settings_default_dir_becomes_none(main_window):

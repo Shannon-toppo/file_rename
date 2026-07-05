@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -47,6 +48,8 @@ class SettingsDialog(QDialog):
         auto_write: bool = True,
         expand_playlist: bool = False,
         normalize: bool = True,
+        loudness: float = core.NORMALIZE_TARGET_I,
+        trim_silence: bool = False,
         theme: str = "system",
         log_level: str = "WARNING",
     ):
@@ -101,6 +104,32 @@ class SettingsDialog(QDialog):
             "OFF: 元の音量のまま変換する"
         )
         form.addRow("音量ノーマライズ", self._normalize_check)
+
+        # ノーマライズの基準値（loudnorm の統合ラウドネス I。TP / LRA は固定）
+        self._loudness_spin = QDoubleSpinBox()
+        self._loudness_spin.setRange(-30.0, -5.0)
+        self._loudness_spin.setSingleStep(0.5)
+        self._loudness_spin.setDecimals(1)
+        self._loudness_spin.setSuffix(" LUFS")
+        self._loudness_spin.setValue(loudness)
+        self._loudness_spin.setToolTip(
+            "loudnorm の統合ラウドネス目標 (I)。音楽配信の標準は -14 LUFS。\n"
+            "値を上げるほど音圧が上がり、下げるほど静かになる。"
+        )
+        # ノーマライズ OFF のときは編集不可にする（値自体は保持）
+        self._loudness_spin.setEnabled(self._normalize_check.isChecked())
+        self._normalize_check.toggled.connect(self._loudness_spin.setEnabled)
+        form.addRow("ノーマライズ基準値", self._loudness_spin)
+
+        # 末尾の無音削除（試験的。DL 時の変換にのみ適用）
+        self._trim_check = QCheckBox("末尾の無音区間を削除する（試験的）")
+        self._trim_check.setChecked(trim_silence)
+        self._trim_check.setToolTip(
+            "ffmpeg の silenceremove で末尾の無音を削る。\n"
+            "-50dB 以下だけを無音とみなし、1 秒は残す保守的な設定\n"
+            "（フェードアウトや余韻など音楽本体は削らない）。"
+        )
+        form.addRow("無音削除", self._trim_check)
 
         # テーマ（アプリ全体の配色。既定は OS のテーマに追従）
         self._theme_combo = QComboBox()
@@ -180,6 +209,8 @@ class SettingsDialog(QDialog):
             "auto_write": self._auto_check.isChecked(),
             "expand_playlist": self._expand_check.isChecked(),
             "normalize": self._normalize_check.isChecked(),
+            "loudness": self._loudness_spin.value(),
+            "trim_silence": self._trim_check.isChecked(),
             "theme": self._theme_combo.currentData(),
             "log_level": self._log_level_combo.currentData(),
         }
