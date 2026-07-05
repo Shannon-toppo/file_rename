@@ -37,6 +37,10 @@ SUPPORTED_FORMATS = ("mp3", "wav", "m4a")
 BATCH_SIZE = 5
 # YouTube の翻訳メタデータ(タイトル/チャンネル名)の優先言語
 METADATA_LANG = "ja"
+# 音量ノーマライズ(loudnorm)の ffmpeg 音声フィルタ。EBU R128 相当の
+# ターゲット(統合ラウドネス -14 LUFS / トゥルーピーク -1.5 dBTP / LRA 11)を
+# 単一パスで適用する。download_tracks(normalize=True) で使用。
+NORMALIZE_FILTER = "loudnorm=I=-14:TP=-1.5:LRA=11"
 
 
 class CancelledError(Exception):
@@ -217,6 +221,7 @@ def download_tracks(
     cancel: threading.Event | None = None,
     out_dir: Path | None = None,
     expand_playlist: bool = False,
+    normalize: bool = True,
     logger: logging.Logger | None = None,
 ) -> list[Track]:
     """URL の音声を指定形式でダウンロードし、Track のリストを返す。
@@ -226,6 +231,8 @@ def download_tracks(
     （noplaylist=True）。expand_playlist=True にするとリスト全体を展開する。
     チャンネル名が取得できれば Track.channel に載せる。
     out_dir を指定すると FILES_DIR の代わりにそこへ保存する（GUI の設定用）。
+    normalize=True（既定）だと ffmpeg の loudnorm フィルタで音量を揃える
+    （NORMALIZE_FILTER 参照）。ffmpeg の再エンコード時に適用される。
     logger を渡すと yt-dlp の出力を stdout ではなくその Python ロガーへ流す
     （quiet=True 併用で logging 経由へ完全に切り替える。GUI のログパネル用）。
     None なら現状どおり yt-dlp が直接コンソールへ出力する（CLI 用）。
@@ -275,6 +282,11 @@ def download_tracks(
             }
         ],
     }
+    if normalize:
+        # ffmpeg 音声フィルタとして loudnorm を FFmpegExtractAudio へ渡す。
+        # フラットな list は全 ffmpeg 系ポストプロセッサに適用される（ここでは
+        # 抽出のみ）。二重掛けを避けるため normalize が False のときは付けない。
+        opts["postprocessor_args"] = ["-af", NORMALIZE_FILTER]
     if logger is not None:
         # yt-dlp の出力を logging 経由へ切り替える（quiet=True で stdout を止め、
         # logger へ渡した Python ロガーに info/warning/error/debug を流す）

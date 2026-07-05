@@ -27,11 +27,11 @@ from pathlib import Path
 import core
 
 
-def process_url(url: str, fmt: str) -> None:
+def process_url(url: str, fmt: str, normalize: bool = True) -> None:
     """1 件の URL をダウンロードしてメタデータを書き込む。"""
     print(f"Downloading audio ({fmt}) from: {url}")
     try:
-        tracks = core.download_tracks(url, fmt)
+        tracks = core.download_tracks(url, fmt, normalize=normalize)
     except Exception as e:
         print(f"Error: ダウンロードに失敗しました: {e}")
         return
@@ -76,6 +76,11 @@ def main() -> None:
         default="mp3",
         help="保存する音声形式（既定: mp3）",
     )
+    parser.add_argument(
+        "--no-normalize",
+        action="store_true",
+        help="音量ノーマライズ(loudnorm)を無効にする（既定は有効）",
+    )
     args = parser.parse_args()
 
     if bool(args.url) == bool(args.batch_file):
@@ -97,7 +102,7 @@ def main() -> None:
     for i, url in enumerate(urls, 1):
         if total > 1:
             print(f"\n===== [{i}/{total}] =====")
-        process_url(url, args.format)
+        process_url(url, args.format, normalize=not args.no_normalize)
 
 
 if __name__ == "__main__":

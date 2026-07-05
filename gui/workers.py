@@ -68,6 +68,7 @@ class PipelineWorker(QRunnable):
         batch_size: core.infer_titles へ渡すバッチサイズ（None なら core 既定）。
         out_dir: DL 保存先（None なら core.FILES_DIR）。
         expand_playlist: True なら動画＋リスト混在 URL もリスト全体を展開する。
+        normalize: True（既定）なら DL 時に音量ノーマライズ(loudnorm)を掛ける。
     """
 
     def __init__(
@@ -83,6 +84,7 @@ class PipelineWorker(QRunnable):
         batch_size: int | None = None,
         out_dir: Path | None = None,
         expand_playlist: bool = False,
+        normalize: bool = True,
     ):
         super().__init__()
         self.signals = WorkerSignals()
@@ -97,6 +99,7 @@ class PipelineWorker(QRunnable):
         self._batch_size = batch_size if batch_size is not None else core.BATCH_SIZE
         self._out_dir = out_dir
         self._expand_playlist = expand_playlist
+        self._normalize = normalize
 
     # -- QRunnable のエントリポイント ---------------------------------------
 
@@ -188,6 +191,7 @@ class PipelineWorker(QRunnable):
                     cancel=self._cancel,
                     out_dir=self._out_dir,
                     expand_playlist=self._expand_playlist,
+                    normalize=self._normalize,
                     # yt-dlp の出力をログパネルへ流す（GUI 経由の DL は常に
                     # logging 経由）。ハンドラはワーカースレッドから呼ばれるが
                     # QtLogHandler はシグナル emit のみでスレッド安全（logpanel.py）

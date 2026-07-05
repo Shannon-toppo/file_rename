@@ -46,6 +46,7 @@ class SettingsDialog(QDialog):
         batch_size: int = core.BATCH_SIZE,
         auto_write: bool = True,
         expand_playlist: bool = False,
+        normalize: bool = True,
         theme: str = "system",
         log_level: str = "WARNING",
     ):
@@ -91,6 +92,15 @@ class SettingsDialog(QDialog):
             "ON: 含まれる再生リストの全動画を展開してダウンロード"
         )
         form.addRow("再生リスト", self._expand_check)
+
+        # 音量ノーマライズ（DL 時に loudnorm を掛けて音量を揃える。既定 ON）
+        self._normalize_check = QCheckBox("ダウンロード時に音量をノーマライズする")
+        self._normalize_check.setChecked(normalize)
+        self._normalize_check.setToolTip(
+            "ON: ffmpeg の loudnorm で音量を EBU R128 相当へ揃える（既定）\n"
+            "OFF: 元の音量のまま変換する"
+        )
+        form.addRow("音量ノーマライズ", self._normalize_check)
 
         # テーマ（アプリ全体の配色。既定は OS のテーマに追従）
         self._theme_combo = QComboBox()
@@ -169,6 +179,7 @@ class SettingsDialog(QDialog):
             "batch_size": self._batch_spin.value(),
             "auto_write": self._auto_check.isChecked(),
             "expand_playlist": self._expand_check.isChecked(),
+            "normalize": self._normalize_check.isChecked(),
             "theme": self._theme_combo.currentData(),
             "log_level": self._log_level_combo.currentData(),
         }
