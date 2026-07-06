@@ -34,6 +34,7 @@ from core import CancelledError, LLMClient, Status, Track
 MODE_FULL = "full"  # DL → 推定 → 書き込み（自動フロー）
 MODE_INFER = "infer"  # 選択行の再推定のみ（DL 段をスキップ）
 MODE_WRITE = "write"  # 選択行の書き込みのみ
+MODE_FETCH = "fetch"  # メタデータのみ取得（DL しない。再生リストの内容確認用）
 
 
 class WorkerSignals(QObject):
@@ -56,7 +57,7 @@ class PipelineWorker(QRunnable):
 
     Args:
         tracks: 実行時点の対象 Track のスナップショット。
-        mode: MODE_FULL / MODE_INFER / MODE_WRITE。
+        mode: MODE_FULL / MODE_INFER / MODE_WRITE / MODE_FETCH。
         fmt: DL 形式（MODE_FULL のみ使用）。
         auto_write: True なら推定後に自動で書き込む（MODE_FULL のみ）。
         force: 再推定で manual 行も上書きするか（MODE_INFER で使用）。
@@ -67,7 +68,8 @@ class PipelineWorker(QRunnable):
             縮退し、connection_failed を emit する。
         batch_size: core.infer_titles へ渡すバッチサイズ（None なら core 既定）。
         out_dir: DL 保存先（None なら core.FILES_DIR）。
-        expand_playlist: True なら動画＋リスト混在 URL もリスト全体を展開する。
+        expand_playlist: True なら動画＋リスト混在 URL もリスト全体を展開する
+            （MODE_FETCH の情報取得にも同じ設定が効く）。
         normalize: True（既定）なら DL 時に音量ノーマライズ(loudnorm)を掛ける。
         loudness: ノーマライズの基準値 LUFS（loudnorm の I）。
         trim_silence: True なら DL 時に末尾の無音区間を削除する（試験的）。
@@ -117,6 +119,8 @@ class PipelineWorker(QRunnable):
                 self._run_infer(self._tracks)
             elif self._mode == MODE_WRITE:
                 self._run_write(self._tracks)
+            elif self._mode == MODE_FETCH:
+                self._run_fetch()
         except CancelledError:
             # キャンセルは正常終了として扱う（残行は未処理のまま）
             pass
@@ -213,10 +217,59 @@ class PipelineWorker(QRunnable):
                 self.signals.track_updated.emit(placeholder)
                 continue
 
+            # 情報取得済み行への手動編集（タイトル・アーティスト）は、DL で
+            # 行が実 Track へ差し替わっても失われないよう引き継ぐ（単一動画
+            # のみ。リスト展開はどの行への編集か対応付けられないため対象外）
+            if len(new_tracks) == 1:
+                real = new_tracks[0]
+                if placeholder.manual:
+                    real.guessed_title = placeholder.guessed_title
+                    real.manual = True
+                    real.valid = placeholder.valid
+                    real.status = Status.PENDING
+                if placeholder.artist:
+                    real.artist = placeholder.artist
+
             # プレースホルダ行を実 Track 行（再生リストは複数）へ差し替える
             self.signals.tracks_ready.emit(placeholder, new_tracks)
             ready.extend(new_tracks)
         return ready
+
+    def _run_fetch(self) -> None:
+        """URL 行のメタデータだけを取得し、行を展開する（DL しない）。
+
+        対象は未取得のプレースホルダ行（stem == url）のみ。取得済みの行
+        （stem が動画タイトルに置き換わっている）とローカル行はスキップする
+        ので、再実行しても再取得や手動編集の上書きは起きない。
+        """
+        for placeholder in self._tracks:
+            self._check_cancel()
+            if placeholder.url is None or placeholder.filepath is not None:
+                continue
+            if placeholder.stem != placeholder.url:
+                continue  # 取得済み（展開済み）の行は再取得しない
+
+            placeholder.status = Status.FETCHING
+            placeholder.error = ""
+            self.signals.track_updated.emit(placeholder)
+            try:
+                new_tracks = core.fetch_metadata(
+                    placeholder.url,
+                    cancel=self._cancel,
+                    expand_playlist=self._expand_playlist,
+                    # yt-dlp の出力をログパネルへ流す（DL と同じ経路）
+                    logger=logging.getLogger("yt_dlp"),
+                )
+            except CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - 行単位のエラーは他行を止めない
+                placeholder.status = Status.ERROR
+                placeholder.error = f"情報の取得に失敗しました: {e}"
+                self.signals.track_updated.emit(placeholder)
+                continue
+
+            # プレースホルダ行をメタデータ行（再生リストは複数）へ差し替える
+            self.signals.tracks_ready.emit(placeholder, new_tracks)
 
     def _run_infer(self, tracks: Sequence[Track]) -> None:
         """対象行をまとめて 1 回で推定する（バッチ）。"""

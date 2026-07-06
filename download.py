@@ -60,13 +60,6 @@ def process_url(
     core.write_tags(tracks, on_result=lambda t: print(core.describe_result(t)))
 
 
-def read_urls_from_file(path: str) -> list[str]:
-    """テキストファイルから URL を 1 行ずつ読み込む（空行と # 始まりの行は無視）。"""
-    lines = Path(path).read_text(encoding="utf-8").splitlines()
-    urls = [line.strip() for line in lines]
-    return [u for u in urls if u and not u.startswith("#")]
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="yt-dlp で音声をDLし、メタデータにタイトルを書き込む。"
@@ -107,7 +100,8 @@ def main() -> None:
 
     if args.batch_file:
         try:
-            urls = read_urls_from_file(args.batch_file)
+            # 空行と # 始まりの行を無視する読み込みは core に共通化（GUI と共用）
+            urls = core.read_url_list(Path(args.batch_file))
         except OSError as e:
             print(f"Error: ファイルを読み込めません: {e}")
             sys.exit(1)

@@ -12,7 +12,7 @@ from PySide6.QtCore import QThreadPool
 
 import core
 from core import CoreError, Status, Track
-from gui.workers import MODE_FULL, MODE_INFER, PipelineWorker
+from gui.workers import MODE_FETCH, MODE_FULL, MODE_INFER, PipelineWorker
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +401,93 @@ def test_downloaded_row_not_redownloaded_on_second_run(qtbot, monkeypatch):
     assert called == []  # 再ダウンロードされない
     assert done.status is Status.DONE  # DONE 行は再推定もされない
     assert pending.status is Status.DONE  # PENDING 行は推定→書き込みまで進む
+
+
+def test_fetch_mode_expands_placeholder(qtbot, monkeypatch):
+    """MODE_FETCH は未取得のプレースホルダ行だけをメタデータ行へ差し替える。"""
+    a = Track(stem="A", url="http://v/a", channel="Ch")
+    b = Track(stem="B", url="http://v/b")
+    fetched_urls = []
+
+    def fake_fetch(url, cancel=None, expand_playlist=False, logger=None):
+        fetched_urls.append(url)
+        return [a, b]
+
+    monkeypatch.setattr(core, "fetch_metadata", fake_fetch)
+
+    placeholder = Track(stem="http://list", url="http://list")
+    local = Track(stem="local", filepath="local.mp3")
+    done = Track(stem="C", url="http://v/c")  # stem != url → 取得済み扱い
+    worker = PipelineWorker([placeholder, local, done], mode=MODE_FETCH)
+    ready = []
+    worker.signals.tracks_ready.connect(lambda ph, ts: ready.append((ph, ts)))
+    run_worker(qtbot, worker)
+
+    # ローカル行・取得済み行はスキップされ、プレースホルダだけが展開される
+    assert fetched_urls == ["http://list"]
+    assert len(ready) == 1
+    assert ready[0][0] is placeholder
+    assert ready[0][1] == [a, b]
+    # 展開後の行は QUEUED のまま（そのまま実行すれば DL される）
+    assert a.status is Status.QUEUED
+
+
+def test_fetch_mode_error_isolation(qtbot, monkeypatch):
+    ok = Track(stem="A", url="http://v/a")
+
+    def fake_fetch(url, cancel=None, expand_playlist=False, logger=None):
+        if url == "http://bad":
+            raise RuntimeError("boom")
+        return [ok]
+
+    monkeypatch.setattr(core, "fetch_metadata", fake_fetch)
+    bad = Track(stem="http://bad", url="http://bad")
+    good = Track(stem="http://good", url="http://good")
+    worker = PipelineWorker([bad, good], mode=MODE_FETCH)
+    ready = []
+    worker.signals.tracks_ready.connect(lambda ph, ts: ready.append(ph))
+    run_worker(qtbot, worker)
+
+    assert bad.status is Status.ERROR and "boom" in bad.error
+    assert ready and ready[0] is good  # 失敗行があっても後続行は処理される
+
+
+def test_fetch_mode_passes_expand_playlist(qtbot, monkeypatch):
+    captured = {}
+
+    def fake_fetch(url, cancel=None, expand_playlist=False, logger=None):
+        captured["expand_playlist"] = expand_playlist
+        return [Track(stem="A", url="http://v/a")]
+
+    monkeypatch.setattr(core, "fetch_metadata", fake_fetch)
+    placeholder = Track(stem="http://u", url="http://u")
+    worker = PipelineWorker([placeholder], mode=MODE_FETCH, expand_playlist=True)
+    run_worker(qtbot, worker)
+    assert captured["expand_playlist"] is True
+
+
+def test_download_carries_over_manual_edits(qtbot, monkeypatch):
+    """情報取得済み行への手動編集は、DL 後の実 Track 行へ引き継がれる。"""
+    dl = Track(stem="a", filepath="a.mp3")
+    fake_download_factory(monkeypatch, {"http://v/a": [dl]})
+    infer_calls = fake_infer_factory(monkeypatch)
+    fake_write_factory(monkeypatch)
+
+    fetched = Track(
+        stem="A",
+        url="http://v/a",
+        guessed_title="手動タイトル",
+        manual=True,
+        valid=True,
+        artist="Ch",
+    )
+    worker = PipelineWorker([fetched], mode=MODE_FULL, auto_write=False)
+    run_worker(qtbot, worker)
+
+    assert dl.guessed_title == "手動タイトル" and dl.manual is True
+    assert dl.artist == "Ch"
+    assert dl.status is Status.PENDING
+    assert infer_calls == []  # manual 行は推定対象にならない
 
 
 def test_reinfer_without_force_protects_manual(qtbot, monkeypatch):

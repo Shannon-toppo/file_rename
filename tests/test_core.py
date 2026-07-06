@@ -211,6 +211,7 @@ class FakeYDL:
     info: dict | None = None
     hook_feed: list[dict] = []
     last_opts: dict | None = None  # 直近に渡された yt-dlp オプション（検査用）
+    last_download: bool | None = None  # extract_info の download 引数（検査用）
 
     def __init__(self, opts):
         self.opts = opts
@@ -223,6 +224,7 @@ class FakeYDL:
         return False
 
     def extract_info(self, url, download=True):
+        FakeYDL.last_download = download
         for d in self.hook_feed:
             for hook in self.opts.get("progress_hooks", []):
                 hook(d)
@@ -243,6 +245,7 @@ def fake_ydl(monkeypatch, tmp_path):
     FakeYDL.info = None
     FakeYDL.hook_feed = []
     FakeYDL.last_opts = None
+    FakeYDL.last_download = None
     return FakeYDL
 
 
@@ -449,6 +452,85 @@ def test_download_tracks_no_logger_by_default(fake_ydl, tmp_path):
     core.download_tracks("u", "mp3")
     assert "logger" not in fake_ydl.last_opts
     assert "quiet" not in fake_ydl.last_opts
+
+
+# ---------------------------------------------------------------------------
+# fetch_metadata（DL せずメタデータのみ取得）
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_metadata_playlist_flat(fake_ydl):
+    """再生リストはフラット抽出で 1 エントリ 1 Track（DL しない）。"""
+    fake_ydl.info = {
+        "entries": [
+            {"title": "A", "url": "https://e/a", "channel": "Ch"},
+            None,  # ignoreerrors で失敗した項目
+            {"title": "B", "url": "https://e/b", "uploader": "Up"},
+        ]
+    }
+    tracks = core.fetch_metadata("https://e/list")
+    assert [t.stem for t in tracks] == ["A", "B"]
+    assert [t.url for t in tracks] == ["https://e/a", "https://e/b"]
+    assert tracks[0].channel == "Ch"
+    assert tracks[1].channel == "Up"  # uploader フォールバック
+    # DL していない QUEUED 行（そのまま実行すれば通常どおり DL される）
+    assert all(t.filepath is None and t.status is Status.QUEUED for t in tracks)
+    assert fake_ydl.last_download is False
+    assert fake_ydl.last_opts["extract_flat"] == "in_playlist"
+    assert fake_ydl.last_opts["extractor_args"] == {"youtube": {"lang": ["ja"]}}
+
+
+def test_fetch_metadata_single_video(fake_ydl):
+    """単一動画は完全な info（webpage_url あり）から 1 Track を返す。"""
+    fake_ydl.info = {"title": "Song", "webpage_url": "https://e/x", "channel": "Ch"}
+    tracks = core.fetch_metadata("https://e/x")
+    assert len(tracks) == 1
+    assert tracks[0].stem == "Song"
+    assert tracks[0].url == "https://e/x"
+
+
+def test_fetch_metadata_expand_playlist_option(fake_ydl):
+    """expand_playlist は download_tracks と同じく noplaylist を反転する。"""
+    fake_ydl.info = {"title": "S", "webpage_url": "u"}
+    core.fetch_metadata("u")
+    assert fake_ydl.last_opts["noplaylist"] is True
+    core.fetch_metadata("u", expand_playlist=True)
+    assert fake_ydl.last_opts["noplaylist"] is False
+
+
+def test_fetch_metadata_cancel_and_empty(fake_ydl):
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(CancelledError):
+        core.fetch_metadata("u", cancel=cancel)
+
+    fake_ydl.info = {"entries": [None]}
+    with pytest.raises(CoreError):
+        core.fetch_metadata("u")
+    fake_ydl.info = None
+    with pytest.raises(CoreError):
+        core.fetch_metadata("u")
+
+
+def test_fetch_metadata_logger_injection(fake_ydl):
+    import logging
+
+    fake_ydl.info = {"title": "S", "webpage_url": "u"}
+    logger = logging.getLogger("test_yt_dlp")
+    core.fetch_metadata("u", logger=logger)
+    assert fake_ydl.last_opts["logger"] is logger
+    assert fake_ydl.last_opts["quiet"] is True
+
+
+# ---------------------------------------------------------------------------
+# read_url_list
+# ---------------------------------------------------------------------------
+
+
+def test_read_url_list(tmp_path):
+    f = tmp_path / "urls.txt"
+    f.write_text("http://a\n\n# コメント\n  http://b  \n", encoding="utf-8")
+    assert core.read_url_list(f) == ["http://a", "http://b"]
 
 
 # ---------------------------------------------------------------------------

@@ -68,6 +68,7 @@ class Status(Enum):
     """Track の状態。value は GUI の状態列にそのまま表示する。"""
 
     QUEUED = "キュー"
+    FETCHING = "情報取得中"
     DOWNLOADING = "DL中"
     INFERRING = "推定中"
     PENDING = "確認待ち"
@@ -117,6 +118,16 @@ def list_music_files(directory: Path = FILES_DIR) -> list[Path]:
     for ext in SUPPORTED_EXTS:
         files.extend(directory.glob(f"*{ext}"))
     return sorted(files)
+
+
+def read_url_list(path: Path) -> list[str]:
+    """テキストファイルから URL を 1 行ずつ読み込む（空行と # 始まりの行は無視）。
+
+    CLI（download.py -a）と GUI（リスト読込・.txt ドロップ）で共用する。
+    """
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    urls = [line.strip() for line in lines]
+    return [u for u in urls if u and not u.startswith("#")]
 
 
 def make_client() -> LLMClient:
@@ -352,6 +363,61 @@ def download_tracks(
 
     if not tracks:
         raise CoreError("ダウンロードした音声ファイルが見つかりません。")
+    return tracks
+
+
+def fetch_metadata(
+    url: str,
+    cancel: threading.Event | None = None,
+    expand_playlist: bool = False,
+    logger: logging.Logger | None = None,
+) -> list[Track]:
+    """URL のメタデータ（タイトル・チャンネル）だけを取得し、Track のリストを返す。
+
+    ダウンロードは行わない。再生リストはフラット抽出（extract_flat）で
+    エントリごとに 1 Track を返すため、大きいリストでも各動画の完全な
+    情報取得は走らず軽い（DL 前に内容を確認する用途）。返る Track は
+    filepath=None の QUEUED 行なので、そのまま実行すれば通常どおり DL される。
+    フラット抽出のタイトルは翻訳されないことがあるが、DL 時に stem が
+    日本語タイトルへ置き直されるため（download_tracks 参照）ここでは追わない。
+    expand_playlist / logger の意味は download_tracks と同じ。
+
+    Raises:
+        CancelledError: cancel がセットされた場合。
+        CoreError: 情報を取得できなかった、または有効なエントリが無かった場合。
+    """
+    opts = {
+        "extract_flat": "in_playlist",
+        "noplaylist": not expand_playlist,
+        "ignoreerrors": True,
+        "extractor_args": {"youtube": {"lang": [METADATA_LANG]}},
+    }
+    if logger is not None:
+        opts["logger"] = logger
+        opts["quiet"] = True
+
+    if cancel is not None and cancel.is_set():
+        raise CancelledError("情報取得がキャンセルされました。")
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if cancel is not None and cancel.is_set():
+        raise CancelledError("情報取得がキャンセルされました。")
+    if not info:
+        raise CoreError("情報を取得できませんでした（URL を確認してください）。")
+
+    entries = info["entries"] if "entries" in info else [info]
+    tracks = [
+        Track(
+            stem=entry.get("title") or entry.get("id") or url,
+            # フラット抽出のエントリは webpage_url を持たず url が動画 URL
+            url=entry.get("webpage_url") or entry.get("url") or url,
+            channel=entry.get("channel") or entry.get("uploader"),
+        )
+        for entry in entries
+        if entry
+    ]
+    if not tracks:
+        raise CoreError("有効な動画が見つかりません。")
     return tracks
 
 

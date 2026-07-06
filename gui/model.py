@@ -157,7 +157,7 @@ class TrackTableModel(QAbstractTableModel):
             return _COLOR_DONE
         if track.status is Status.ERROR:
             return _COLOR_ERROR
-        if track.status in (Status.DOWNLOADING, Status.INFERRING):
+        if track.status in (Status.FETCHING, Status.DOWNLOADING, Status.INFERRING):
             return _COLOR_BUSY
         if track.status is Status.PENDING and track.valid is False:
             return _COLOR_WARN

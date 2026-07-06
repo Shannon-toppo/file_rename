@@ -47,7 +47,7 @@ from .logpanel import LogPanel, QtLogHandler, attach_handler, detach_handler
 from .model import COL_ARTIST, COL_STATUS, COL_STEM, COL_TITLE, PERCENT_ROLE, TrackTableModel
 from .player import PreviewPlayer, format_time
 from .settings_dialog import SettingsDialog
-from .workers import MODE_FULL, MODE_INFER, MODE_WRITE, PipelineWorker
+from .workers import MODE_FETCH, MODE_FULL, MODE_INFER, MODE_WRITE, PipelineWorker
 
 
 def apply_color_scheme(name: str) -> None:
@@ -136,11 +136,16 @@ class MainWindow(QMainWindow):
         btn_col = QVBoxLayout()
         add_btn = QPushButton("追加")
         add_btn.clicked.connect(self._on_add_urls)
+        list_btn = QPushButton("リスト読込")
+        list_btn.setToolTip(
+            "URL を 1 行ずつ記入したテキストファイルを読み込む（空行と # 始まりの行は無視）"
+        )
+        list_btn.clicked.connect(self._on_load_list)
         file_btn = QPushButton("ファイル追加")
         file_btn.clicked.connect(self._on_add_files)
         import_btn = QPushButton("files/ 取り込み")
         import_btn.clicked.connect(self._on_import_dir)
-        for b in (add_btn, file_btn, import_btn):
+        for b in (add_btn, list_btn, file_btn, import_btn):
             btn_col.addWidget(b)
         top.addLayout(btn_col)
         root.addLayout(top)
@@ -152,8 +157,15 @@ class MainWindow(QMainWindow):
         self._stop_btn = QPushButton("■ 停止")
         self._stop_btn.clicked.connect(self._on_stop)
         self._stop_btn.setEnabled(False)
+        self._fetch_btn = QPushButton("情報取得")
+        self._fetch_btn.setToolTip(
+            "URL 行のタイトル・チャンネル名だけを取得する（ダウンロードはしない）。\n"
+            "再生リストは動画ごとの行に展開されるので、DL 前に内容を確認できる"
+        )
+        self._fetch_btn.clicked.connect(self._on_fetch_info)
         bar.addWidget(self._run_btn)
         bar.addWidget(self._stop_btn)
+        bar.addWidget(self._fetch_btn)
         bar.addSpacing(16)
         self._fmt_combo = QComboBox()
         self._fmt_combo.addItems(core.SUPPORTED_FORMATS)
@@ -170,7 +182,7 @@ class MainWindow(QMainWindow):
 
         # 上段の追加系ボタンと [設定] の幅を統一する（最長ラベル基準。
         # 縦積みの列は自動で最長幅に揃うが、[設定] は別レイアウトなので明示する）
-        same_width = (add_btn, file_btn, import_btn, settings_btn)
+        same_width = (add_btn, list_btn, file_btn, import_btn, settings_btn)
         width = max(b.sizeHint().width() for b in same_width)
         for b in same_width:
             b.setFixedWidth(width)
@@ -270,10 +282,12 @@ class MainWindow(QMainWindow):
         # 実行中に無効化するボタン群（1 本ルールの担保）
         self._busy_buttons = [
             self._run_btn,
+            self._fetch_btn,
             reinfer_btn,
             write_btn,
             artist_btn,
             add_btn,
+            list_btn,
             file_btn,
             import_btn,
             del_btn,
@@ -319,6 +333,28 @@ class MainWindow(QMainWindow):
         n = self.add_urls(urls)
         self._url_edit.clear()
         self.statusBar().showMessage(f"{n} 件の URL を追加しました")
+
+    def _on_load_list(self) -> None:
+        """URL を 1 行ずつ記入したテキストファイルを読み込んで行追加する。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "URL リストを読み込み", "", "URL リスト (*.txt);;すべてのファイル (*)"
+        )
+        if path:
+            self._add_url_list(Path(path))
+
+    def _add_url_list(self, path: Path) -> int:
+        """URL リストファイルを読み込んで行追加する。追加件数を返す（失敗は 0）。"""
+        try:
+            urls = core.read_url_list(path)
+        except OSError as e:
+            self.statusBar().showMessage(f"URL リストを読み込めません: {e}")
+            return 0
+        if not urls:
+            self.statusBar().showMessage(f"有効な URL がありません: {path.name}")
+            return 0
+        n = self.add_urls(urls)
+        self.statusBar().showMessage(f"{path.name} から {n} 件の URL を追加しました")
+        return n
 
     def _on_add_files(self) -> None:
         pattern = "音声ファイル (" + " ".join(f"*{e}" for e in core.SUPPORTED_EXTS) + ")"
@@ -381,6 +417,21 @@ class MainWindow(QMainWindow):
         tracks = [self._model.track_at(r) for r in rows]
         worker = PipelineWorker(tracks, mode=MODE_WRITE, cancel=self._reset_cancel())
         self._start(worker, "書き込み中...")
+
+    def _on_fetch_info(self) -> None:
+        """URL 行のメタデータだけを取得する（DL なし。再生リストの内容確認用）。"""
+        tracks = self._model.tracks()
+        # 対象は未取得のプレースホルダ行のみ（取得済み・ローカル行は対象外）
+        if not any(t.url is not None and t.filepath is None and t.stem == t.url for t in tracks):
+            self.statusBar().showMessage("情報を取得できる URL 行がありません")
+            return
+        worker = PipelineWorker(
+            tracks,
+            mode=MODE_FETCH,
+            cancel=self._reset_cancel(),
+            expand_playlist=self._expand_playlist,
+        )
+        self._start(worker, "情報取得中...")
 
     def _start(self, worker: PipelineWorker, message: str) -> None:
         if self._running:
@@ -814,12 +865,16 @@ class MainWindow(QMainWindow):
     # -- ドラッグ&ドロップ（_DropTableView から委譲）------------------------
 
     def handle_dropped_paths(self, paths: list[Path]) -> None:
+        """ドロップされた音声ファイルは行追加、.txt は URL リストとして読み込む。"""
         supported = [p for p in paths if p.suffix.lower() in core.SUPPORTED_EXTS]
-        if not supported:
-            self.statusBar().showMessage("対応する音声ファイルがありません")
+        url_lists = [p for p in paths if p.suffix.lower() == ".txt"]
+        if not supported and not url_lists:
+            self.statusBar().showMessage("対応する音声ファイル・URL リスト(.txt)がありません")
             return
-        n = self.add_files(supported)
-        self.statusBar().showMessage(f"ドロップで {n} 件を追加しました")
+        n = self.add_files(supported) if supported else 0
+        n += sum(self._add_url_list(p) for p in url_lists)
+        if n:
+            self.statusBar().showMessage(f"ドロップで {n} 件を追加しました")
 
 
 class _DropTableView(QTableView):

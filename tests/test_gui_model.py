@@ -130,6 +130,13 @@ def test_background_colors():
     assert _bg(model, 1) != _bg(model, 2)
 
 
+def test_fetching_uses_busy_color():
+    """情報取得中（MODE_FETCH）も DL 中と同じ薄青で表示する。"""
+    t = Track(stem="a", status=Status.FETCHING)
+    model = TrackTableModel([t])
+    assert isinstance(_bg(model, 0), QColor)
+
+
 def test_pending_valid_true_no_warn_color():
     ok_pending = Track(stem="a", status=Status.PENDING, valid=True)
     model = TrackTableModel([ok_pending])
@@ -304,8 +311,22 @@ def test_main_window_delete_and_dropped_paths(qtbot, tmp_path):
     qtbot.addWidget(win)
     good = tmp_path / "ok.mp3"
     good.write_bytes(b"\x00")
-    bad = tmp_path / "note.txt"
+    bad = tmp_path / "note.flac"
     bad.write_bytes(b"\x00")
     # 非対応拡張子は無視される
     win.handle_dropped_paths([good, bad])
     assert win._model.rowCount() == 1
+
+
+def test_main_window_dropped_txt_is_url_list(qtbot, tmp_path):
+    """.txt のドロップは URL リストとして読み込まれ、URL 行が追加される。"""
+    from gui.main_window import MainWindow
+
+    win = MainWindow()
+    qtbot.addWidget(win)
+    lst = tmp_path / "urls.txt"
+    lst.write_text("http://a\n# コメント\nhttp://b\n", encoding="utf-8")
+    win.handle_dropped_paths([lst])
+    assert win._model.rowCount() == 2
+    t = win._model.track_at(0)
+    assert t.url == "http://a" and t.status is Status.QUEUED
