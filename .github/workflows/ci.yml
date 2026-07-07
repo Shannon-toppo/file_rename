@@ -9,6 +9,12 @@ on:
     branches: [main]
   pull_request:
 
+# 同じブランチ / PR に新しい push が来たら進行中の実行をキャンセルする
+# （古いコミットの CI を走らせ続けない — ランナー時間の浪費防止）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     strategy:
@@ -16,6 +22,8 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # ハング時の被害を抑える（既定は 6 時間 — 過去にモーダル待ちで丸ごと消費した）
+    timeout-minutes: 15
     steps:
       - name: Checkout file_rename
         uses: actions/checkout@v4

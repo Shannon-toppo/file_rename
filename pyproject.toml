@@ -16,7 +16,13 @@ dev = [
     "pyinstaller>=6.11",
     "pytest>=8",
     "pytest-qt>=4.4",
+    "pytest-timeout>=2.3",
 ]
+
+[tool.pytest.ini_options]
+# ハングしたテストを個別に打ち切る保険（CI の 6 時間ジョブ暴走の再発防止）。
+# スイート全体が通常 1 分未満なので 1 テスト 60 秒は十分に余裕がある。
+timeout = 60
 
 [tool.uv]
 # スクリプト集であってパッケージではない（ビルド・インストールしない）

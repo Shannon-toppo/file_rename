@@ -280,13 +280,17 @@ def test_refresh_track_emits_datachanged():
 
 # ---------------------------------------------------------------------------
 # MainWindow スモーク
+#
+# 必ず restore_settings=False（テストモード）で構築すること。実 QSettings を
+# 汚さないためと、ffmpeg 未検出時の起動モーダルを抑制するため — CI にはモーダル
+# を閉じる者がおらず、既定引数だとジョブが 6 時間タイムアウトまでハングする。
 # ---------------------------------------------------------------------------
 
 
 def test_main_window_add_urls_and_files(qtbot, tmp_path):
     from gui.main_window import MainWindow
 
-    win = MainWindow()
+    win = MainWindow(restore_settings=False)
     qtbot.addWidget(win)
     assert win._model.rowCount() == 0
 
@@ -307,7 +311,7 @@ def test_main_window_add_urls_and_files(qtbot, tmp_path):
 def test_main_window_delete_and_dropped_paths(qtbot, tmp_path):
     from gui.main_window import MainWindow
 
-    win = MainWindow()
+    win = MainWindow(restore_settings=False)
     qtbot.addWidget(win)
     good = tmp_path / "ok.mp3"
     good.write_bytes(b"\x00")
@@ -322,7 +326,7 @@ def test_main_window_dropped_txt_is_url_list(qtbot, tmp_path):
     """.txt のドロップは URL リストとして読み込まれ、URL 行が追加される。"""
     from gui.main_window import MainWindow
 
-    win = MainWindow()
+    win = MainWindow(restore_settings=False)
     qtbot.addWidget(win)
     lst = tmp_path / "urls.txt"
     lst.write_text("http://a\n# コメント\nhttp://b\n", encoding="utf-8")
