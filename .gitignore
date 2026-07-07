@@ -9,6 +9,10 @@ __pycache__/
 .venv/
 venv/
 
+# PyInstaller（file_rename_gui.spec はコミットする）
+build/
+dist/
+
 # 環境変数
 .env
 .DS_Store

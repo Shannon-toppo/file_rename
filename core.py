@@ -3,12 +3,15 @@
 """GUI / CLI 共通のコア処理: ダウンロード → タイトル推定 → タグ書き込み。
 
 このモジュールは print しない。進捗・結果はコールバックと Track の状態で
-呼び出し元(CLI / GUI ワーカー)へ返す。import した時点で ../mv2title/.env を
-環境変数へ読み込む（Config.from_env() が読む前に載せておく必要があるため）。
+呼び出し元(CLI / GUI ワーカー)へ返す。import した時点で接続設定の .env
+（find_env_file 参照。開発時は ../mv2title/.env）を環境変数へ読み込む
+（Config.from_env() が読む前に載せておく必要があるため）。
 新しいスクリプトでも env 設定を重複させず、このモジュールを import すること。
 """
 import logging
 import json
+import os
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -17,7 +20,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from mutagen.id3 import ID3
 from mutagen.id3._frames import TIT2, TPE1
 from mutagen.id3._util import ID3NoHeaderError
@@ -28,10 +31,95 @@ from yt_dlp import YoutubeDL
 
 _ROOT = Path(__file__).parent.parent
 
-# 接続設定は mv2title 側の .env を共用する
-load_dotenv(_ROOT / "mv2title" / ".env")
+# PyInstaller で凍結された exe / .app として動いているか
+_IS_FROZEN = bool(getattr(sys, "frozen", False))
 
-FILES_DIR = Path(__file__).parent / "files"
+# 接続設定の環境変数キー（.env / 設定ダイアログの上書き対象）
+ENV_KEYS = ("BASE_URL", "API_KEY", "MODEL", "SYSTEM_PROMPT")
+
+# .env より優先されるプロセス環境変数（load_dotenv が上書きしない従来挙動を
+# apply_env_overrides でも保つため、.env を読む前にスナップショットする）
+_PROCESS_ENV = {k: os.environ[k] for k in ENV_KEYS if k in os.environ}
+
+
+def app_dir() -> Path:
+    """アプリの基準ディレクトリ（.env や既定の files/ を置く場所）を返す。
+
+    凍結時は実行ファイルのあるフォルダ。macOS の .app バンドル内
+    （Foo.app/Contents/MacOS/exe）で動いている場合は .app を置いたフォルダ
+    （= ユーザーから見た「アプリの隣」）。開発時はこのファイルのフォルダ。
+    """
+    if not _IS_FROZEN:
+        return Path(__file__).parent
+    exe = Path(sys.executable).resolve()
+    if (
+        sys.platform == "darwin"
+        and exe.parent.name == "MacOS"
+        and exe.parent.parent.name == "Contents"
+    ):
+        return exe.parents[3]  # MacOS → Contents → Foo.app → その親
+    return exe.parent
+
+
+def find_env_file() -> Path | None:
+    """接続設定 .env を探す。① app_dir()/.env → ② ../mv2title/.env（開発時）。
+
+    凍結配布では exe（mac は .app）の隣に .env を置く運用。開発時は従来どおり
+    mv2title 側の .env を共用する。見つからなければ None。
+    """
+    candidates = (app_dir() / ".env", _ROOT / "mv2title" / ".env")
+    return next((p for p in candidates if p.is_file()), None)
+
+
+def env_defaults() -> dict[str, str]:
+    """上書き前の既定値（.env / プロセス環境変数由来）を返す（設定画面の表示用）。"""
+    env_file = find_env_file()
+    values = dict(dotenv_values(env_file)) if env_file is not None else {}
+    defaults = {k: v for k, v in values.items() if k in ENV_KEYS and v}
+    defaults.update(_PROCESS_ENV)  # プロセス環境変数は .env より優先（従来挙動）
+    return defaults
+
+
+def apply_env_overrides(overrides: dict[str, str]) -> None:
+    """設定ダイアログの接続設定上書きを os.environ へ反映する（GUI 用）。
+
+    優先度: 上書き値 > プロセス環境変数 > .env。空の上書きはキー自体を
+    既定値へ戻す（既定も無ければ環境変数から外す）ため、設定画面で欄を
+    空にすれば .env の値に復帰する。Config.from_env() 内の load_dotenv は
+    既存の環境変数を上書きしないので、ここで載せた値がそのまま使われる。
+    """
+    defaults = env_defaults()
+    for key in ENV_KEYS:
+        value = overrides.get(key) or defaults.get(key)
+        if value:
+            os.environ[key] = value
+        else:
+            os.environ.pop(key, None)
+
+
+def _augment_path_darwin() -> None:
+    """macOS: Finder 起動のアプリへ Homebrew の PATH を補う。
+
+    Finder から起動した GUI アプリはログインシェルの PATH を継承しないため、
+    brew で入れた ffmpeg（/opt/homebrew/bin, Intel は /usr/local/bin）が
+    見つからない。未含有のときだけ末尾へ追加する（冪等）。
+    """
+    if sys.platform != "darwin":
+        return
+    current = os.environ.get("PATH", "").split(os.pathsep)
+    extra = [p for p in ("/opt/homebrew/bin", "/usr/local/bin") if p not in current]
+    if extra:
+        os.environ["PATH"] = os.pathsep.join([p for p in current if p] + extra)
+
+
+_augment_path_darwin()
+
+# 接続設定は mv2title 側の .env を共用する（凍結時は exe / .app 隣の .env）
+_ENV_FILE = find_env_file()
+if _ENV_FILE is not None:
+    load_dotenv(_ENV_FILE)
+
+FILES_DIR = app_dir() / "files"
 SUPPORTED_EXTS = (".mp3", ".wav", ".m4a")
 SUPPORTED_FORMATS = ("mp3", "wav", "m4a")
 BATCH_SIZE = 5
@@ -131,7 +219,7 @@ def read_url_list(path: Path) -> list[str]:
 
 
 def make_client() -> LLMClient:
-    """mv2title/.env の設定で LLMClient を作る。"""
+    """接続設定（.env / GUI の上書き済み環境変数）で LLMClient を作る。"""
     return LLMClient(Config.from_env())
 
 

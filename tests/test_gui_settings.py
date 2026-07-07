@@ -29,6 +29,12 @@ def main_window(qtbot):
 
 
 def test_settings_dialog_roundtrip(qtbot, tmp_path):
+    llm = {
+        "BASE_URL": "http://ov/v1",
+        "API_KEY": "sk-x",
+        "MODEL": "m",
+        "SYSTEM_PROMPT": "p",
+    }
     dlg = SettingsDialog(
         out_dir=tmp_path,
         fmt="wav",
@@ -40,9 +46,11 @@ def test_settings_dialog_roundtrip(qtbot, tmp_path):
         trim_silence=True,
         theme="dark",
         log_level="DEBUG",
+        llm_overrides=llm,
     )
     qtbot.addWidget(dlg)
     assert dlg.values() == {
+        "llm_overrides": llm,
         "out_dir": tmp_path,
         "fmt": "wav",
         "batch_size": 9,
@@ -70,6 +78,8 @@ def test_settings_dialog_defaults(qtbot):
     assert v["trim_silence"] is False  # 無音削除は試験的機能なので既定 OFF
     assert v["theme"] == "system"  # 既定は OS テーマに追従
     assert v["log_level"] == "WARNING"  # 既定は警告レベル
+    # 接続設定の上書きは既定ですべて空（= .env の値を使う）
+    assert v["llm_overrides"] == {k: "" for k in core.ENV_KEYS}
 
 
 def test_settings_dialog_loudness_follows_normalize_toggle(qtbot):
@@ -124,6 +134,34 @@ def test_apply_settings_default_dir_becomes_none(main_window):
         {"out_dir": Path(core.FILES_DIR), "fmt": "mp3", "batch_size": 5, "auto_write": True}
     )
     assert win._out_dir is None
+
+
+def test_apply_settings_llm_overrides_applied_to_env(main_window, monkeypatch):
+    """llm_overrides は core.apply_env_overrides へ渡され、無ければ既存値を維持する。"""
+    applied = []
+    monkeypatch.setattr(core, "apply_env_overrides", applied.append)
+    win = main_window
+    base = {"out_dir": Path(core.FILES_DIR), "fmt": "mp3", "batch_size": 5, "auto_write": True}
+    win.apply_settings({**base, "llm_overrides": {"BASE_URL": "http://ov/v1"}})
+    assert win._llm_overrides["BASE_URL"] == "http://ov/v1"
+    assert applied == [{k: ("http://ov/v1" if k == "BASE_URL" else "") for k in core.ENV_KEYS}]
+    # llm_overrides キーが無い呼び出し（テスト・旧コード）では上書きを維持し、再適用もしない
+    win.apply_settings(base)
+    assert win._llm_overrides["BASE_URL"] == "http://ov/v1"
+    assert len(applied) == 1
+
+
+def test_connection_test_restores_env(qtbot, monkeypatch):
+    """接続テストはダイアログの値を一時適用し、終了後に環境変数を元へ戻す。"""
+    import os
+
+    monkeypatch.setattr(core, "check_connection", lambda timeout=3.0: (True, "OK"))
+    monkeypatch.setenv("BASE_URL", "http://original/v1")
+    dlg = SettingsDialog(llm_overrides={"BASE_URL": "http://temporary/v1"})
+    qtbot.addWidget(dlg)
+    dlg._on_test_connection()
+    assert dlg._test_result.text().startswith("OK:")
+    assert os.environ["BASE_URL"] == "http://original/v1"
 
 
 # ---------------------------------------------------------------------------
@@ -372,3 +410,30 @@ def test_ffmpeg_warning_on_startup(qtbot, monkeypatch):
     win.close()
     win.deleteLater()
     QApplication.processEvents()
+
+
+def test_confirm_ffmpeg_asks_before_run(main_window, monkeypatch):
+    """_confirm_ffmpeg: ffmpeg ありなら常に True。無ければダイアログで確認し、
+    No なら False（テストモード _settings=None ではダイアログなしで続行）。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    from gui import main_window as mw
+
+    win = main_window
+    monkeypatch.setattr(mw.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    assert win._confirm_ffmpeg() is True
+
+    monkeypatch.setattr(mw.shutil, "which", lambda name: None)
+    assert win._confirm_ffmpeg() is True  # _settings is None → ダイアログなしで続行
+
+    answers = []
+
+    def fake_warning(*args, **kwargs):
+        answers.append(args)
+        return QMessageBox.StandardButton.No
+
+    win._settings = object()  # 非テストモードを擬似（QSettings API は使わない経路）
+    monkeypatch.setattr(mw.QMessageBox, "warning", staticmethod(fake_warning))
+    assert win._confirm_ffmpeg() is False
+    assert len(answers) == 1
+    win._settings = None  # closeEvent の _save_settings が触らないよう戻す
