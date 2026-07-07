@@ -7,6 +7,7 @@
 """
 import logging
 import shutil
+import sys
 import threading
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSlider,
@@ -71,6 +73,13 @@ def _as_bool(value) -> bool:
     return value in (True, "true", "True", 1, "1")
 
 
+def _ffmpeg_install_hint() -> str:
+    """OS 別の ffmpeg インストール案内（警告ダイアログ用）。"""
+    if sys.platform == "darwin":
+        return "Homebrew の場合: brew install ffmpeg"
+    return "winget の場合: winget install Gyan.FFmpeg（インストール後はアプリを再起動）"
+
+
 class MainWindow(QMainWindow):
     """file_rename GUI のメインウィンドウ。"""
 
@@ -96,6 +105,8 @@ class MainWindow(QMainWindow):
         # ログパネルの表示レベル（"DEBUG"/"INFO"/"WARNING"/"ERROR"）。
         # フィルタはハンドラ側 1 箇所で行う（logpanel.attach_handler 参照）
         self._log_level: str = "WARNING"
+        # LLM 接続設定の上書き（キーは core.ENV_KEYS。空文字 = .env の値を使う）
+        self._llm_overrides: dict[str, str] = {}
 
         self._build_ui()
         # 試聴プレーヤ（ノーマライズ・無音削除の結果確認用）。QtMultimedia の
@@ -112,10 +123,23 @@ class MainWindow(QMainWindow):
             apply_color_scheme(self._theme)
         # 復元後のログレベルをハンドラへ反映（restore 無効時は既定 WARNING）
         self._log_handler.setLevel(getattr(logging, self._log_level))
+        # 復元した接続設定の上書きを環境変数へ反映（Config.from_env が読む）
+        if any(self._llm_overrides.values()):
+            core.apply_env_overrides(self._llm_overrides)
         if shutil.which("ffmpeg") is None:
             self.statusBar().showMessage(
                 "警告: ffmpeg が見つかりません。mp3/wav 変換に必要です（PATH を確認してください）"
             )
+            # ステータスバーだけでは見落とすため起動時に明示的に警告する。
+            # テスト（restore_settings=False）ではモーダルを出さない
+            if self._settings is not None:
+                QMessageBox.warning(
+                    self,
+                    "ffmpeg が見つかりません",
+                    "ffmpeg が見つかりません。ダウンロード後の音声変換・ノーマライズ・"
+                    "無音削除に必要です。\n"
+                    f"インストールして PATH を通してください。{_ffmpeg_install_hint()}",
+                )
         else:
             self.statusBar().showMessage("準備完了")
 
@@ -374,10 +398,34 @@ class MainWindow(QMainWindow):
 
     # -- パイプライン起動 ----------------------------------------------------
 
+    def _confirm_ffmpeg(self) -> bool:
+        """DL 実行前の ffmpeg 確認。見つからなければ警告し、続行するか尋ねる。
+
+        変換・ノーマライズは失敗するが DL 自体は動くため、続行の選択肢は残す。
+        テスト（restore_settings=False）ではダイアログを出さず続行する。
+        """
+        if shutil.which("ffmpeg") is not None:
+            return True
+        if self._settings is None:
+            return True
+        ret = QMessageBox.warning(
+            self,
+            "ffmpeg が見つかりません",
+            "ffmpeg が見つからないため、ダウンロード後の音声変換・ノーマライズは"
+            "失敗します。\n"
+            f"{_ffmpeg_install_hint()}\n\nこのまま実行しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return ret == QMessageBox.StandardButton.Yes
+
     def _on_run(self) -> None:
         tracks = self._model.tracks()
         if not tracks:
             self.statusBar().showMessage("処理対象がありません")
+            return
+        if not self._confirm_ffmpeg():
+            self.statusBar().showMessage("ffmpeg 未検出のため実行を中止しました")
             return
         worker = PipelineWorker(
             tracks,
@@ -496,6 +544,7 @@ class MainWindow(QMainWindow):
             trim_silence=self._trim_silence,
             theme=self._theme,
             log_level=self._log_level,
+            llm_overrides=dict(self._llm_overrides),
         )
         if not dlg.exec():
             return
@@ -518,6 +567,11 @@ class MainWindow(QMainWindow):
         # ログパネルの表示レベルをハンドラへ反映（フィルタはハンドラ 1 箇所）
         self._log_level = str(values.get("log_level", "WARNING"))
         self._log_handler.setLevel(getattr(logging, self._log_level))
+        # LLM 接続設定の上書き（キー無し = ダイアログ以外からの呼び出しは維持）
+        llm = values.get("llm_overrides")
+        if llm is not None:
+            self._llm_overrides = {k: str(llm.get(k, "")) for k in core.ENV_KEYS}
+            core.apply_env_overrides(self._llm_overrides)
         self._fmt_combo.setCurrentText(values["fmt"])
         self._auto_write.setChecked(bool(values["auto_write"]))
         if self._settings is not None:
@@ -531,6 +585,11 @@ class MainWindow(QMainWindow):
             self._settings.setValue("options/trim_silence", self._trim_silence)
             self._settings.setValue("options/theme", self._theme)
             self._settings.setValue("options/log_level", self._log_level)
+            # 接続設定の上書き（API キーも QSettings に平文で入る。個人利用前提）
+            for key in core.ENV_KEYS:
+                self._settings.setValue(
+                    f"options/llm_{key.lower()}", self._llm_overrides.get(key, "")
+                )
         self.statusBar().showMessage("設定を保存しました")
 
     # -- 下段操作 ------------------------------------------------------------
@@ -844,6 +903,9 @@ class MainWindow(QMainWindow):
         log_level = s.value("options/log_level")
         if log_level in ("DEBUG", "INFO", "WARNING", "ERROR"):
             self._log_level = log_level
+        self._llm_overrides = {
+            key: str(s.value(f"options/llm_{key.lower()}") or "") for key in core.ENV_KEYS
+        }
 
     def _save_settings(self) -> None:
         s = self._settings

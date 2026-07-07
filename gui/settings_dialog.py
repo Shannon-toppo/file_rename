@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """設定ダイアログ: 保存先フォルダ・既定形式・バッチサイズ・自動書き込み既定値。
 
-接続設定（BASE_URL / MODEL）は ../mv2title/.env が持ち主なので編集させず、
-現在値と .env の場所を読み取り専用で案内する。[接続テスト] は
+接続設定（BASE_URL / API_KEY / MODEL / SYSTEM_PROMPT）は .env（開発時は
+../mv2title/.env、凍結配布時は exe / .app 隣）を既定とし、このダイアログで
+上書きできる（空欄 = .env の値を使う。上書きは QSettings に保存され、
+core.apply_env_overrides で環境変数へ反映される）。[接続テスト] は
 core.check_connection（timeout 3 秒、UI ブロック許容）で疎通を確認する。
 """
+import os
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -18,6 +21,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -52,6 +56,7 @@ class SettingsDialog(QDialog):
         trim_silence: bool = False,
         theme: str = "system",
         log_level: str = "WARNING",
+        llm_overrides: dict | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("設定")
@@ -154,18 +159,44 @@ class SettingsDialog(QDialog):
         form.addRow("ログレベル", self._log_level_combo)
         root.addLayout(form)
 
-        # 接続情報（読み取り専用の案内。編集は ../mv2title/.env で行う）
-        env_path = core._ROOT / "mv2title" / ".env"
-        try:
-            config = core.Config.from_env()
-            base_url, model = config.base_url, config.model
-        except ValueError:
-            base_url, model = "(未設定)", "-"
-        info = QLabel(
-            f"接続先 (BASE_URL): {base_url}\n"
-            f"モデル (MODEL): {model}\n"
-            f"変更する場合は {env_path} を編集してください。"
-        )
+        # 接続設定（.env を既定とし、ここで上書きできる。空欄 = .env の値）
+        llm = dict(llm_overrides or {})
+        defaults = core.env_defaults()
+        env_file = core.find_env_file()
+        llm_form = QFormLayout()
+
+        def _placeholder(key: str, secret: bool = False) -> str:
+            value = defaults.get(key)
+            if not value:
+                return "未設定（.env にもありません）"
+            return ".env の値: " + ("(設定済み)" if secret else value)
+
+        self._base_url_edit = QLineEdit(llm.get("BASE_URL", ""))
+        self._base_url_edit.setPlaceholderText(_placeholder("BASE_URL"))
+        llm_form.addRow("接続先 (BASE_URL)", self._base_url_edit)
+
+        self._api_key_edit = QLineEdit(llm.get("API_KEY", ""))
+        self._api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._api_key_edit.setPlaceholderText(_placeholder("API_KEY", secret=True))
+        llm_form.addRow("API キー (API_KEY)", self._api_key_edit)
+
+        self._model_edit = QLineEdit(llm.get("MODEL", ""))
+        self._model_edit.setPlaceholderText(_placeholder("MODEL"))
+        llm_form.addRow("モデル (MODEL)", self._model_edit)
+
+        self._prompt_edit = QPlainTextEdit(llm.get("SYSTEM_PROMPT", ""))
+        self._prompt_edit.setPlaceholderText(_placeholder("SYSTEM_PROMPT"))
+        self._prompt_edit.setFixedHeight(56)
+        llm_form.addRow("システムプロンプト", self._prompt_edit)
+        root.addLayout(llm_form)
+
+        if env_file is not None:
+            env_note = f"空欄の項目は {env_file} の値を使います。"
+        else:
+            env_note = (
+                f".env が見つかりません（{core.app_dir() / '.env'} に置くか、上の欄に入力してください）。"
+            )
+        info = QLabel(env_note)
         info.setWordWrap(True)
         root.addWidget(info)
 
@@ -194,15 +225,36 @@ class SettingsDialog(QDialog):
             self._dir_edit.setText(path)
 
     def _on_test_connection(self) -> None:
-        # timeout 3 秒までの UI ブロックは許容（設定画面の明示操作のため）
-        ok, msg = core.check_connection()
+        # timeout 3 秒までの UI ブロックは許容（設定画面の明示操作のため）。
+        # ダイアログの上書き値を一時的に環境変数へ載せてテストし、確定前なので
+        # 終わったら元へ戻す（OK せずに閉じても環境を汚さない）。
+        saved = {k: os.environ.get(k) for k in core.ENV_KEYS}
+        try:
+            core.apply_env_overrides(self._llm_values())
+            ok, msg = core.check_connection()
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
         self._test_result.setText(("OK: " if ok else "NG: ") + msg)
 
     # -- 結果 ---------------------------------------------------------------
 
+    def _llm_values(self) -> dict[str, str]:
+        """接続設定の上書き値（空欄は空文字 = 上書きしない）を返す。"""
+        return {
+            "BASE_URL": self._base_url_edit.text().strip(),
+            "API_KEY": self._api_key_edit.text().strip(),
+            "MODEL": self._model_edit.text().strip(),
+            "SYSTEM_PROMPT": self._prompt_edit.toPlainText().strip(),
+        }
+
     def values(self) -> dict:
         """ダイアログの現在値を dict で返す（OK 後に呼ぶ）。"""
         return {
+            "llm_overrides": self._llm_values(),
             "out_dir": Path(self._dir_edit.text().strip() or str(core.FILES_DIR)),
             "fmt": self._fmt_combo.currentText(),
             "batch_size": self._batch_spin.value(),
