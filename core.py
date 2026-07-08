@@ -228,6 +228,9 @@ def check_connection(timeout: float = 3.0) -> tuple[bool, str]:
 
     OpenAI 互換の GET {base_url}/models を短い timeout で叩く。
     LLM の推論を伴わないため、サーバの生死確認としては十分軽い。
+    ステータスコードだけでは判定しない: LM Studio は存在しないパスにも
+    HTTP 200 でエラー JSON を返すため（例: BASE_URL の /v1 抜け）、
+    ボディが /models 応答の形（"data" リスト）であることまで確認する。
 
     Returns:
         (成功可否, 人間向けメッセージ)。例外は投げず、失敗理由を文字列で返す。
@@ -245,11 +248,21 @@ def check_connection(timeout: float = 3.0) -> tuple[bool, str]:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status = getattr(resp, "status", 200)
-            if 200 <= status < 300:
-                return True, f"接続 OK: {config.base_url}"
-            return False, f"エンドポイントがエラーを返しました (HTTP {status})"
+            if not 200 <= status < 300:
+                return False, f"エンドポイントがエラーを返しました (HTTP {status})"
+            body = resp.read(65536)
     except Exception as e:
         return False, f"接続できません ({config.base_url}): {e}"
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return False, (
+            f"応答が OpenAI 互換の /models 形式ではありません ({url})。"
+            "BASE_URL のパス（例: 末尾の /v1）が正しいか確認してください。"
+        )
+    return True, f"接続 OK: {config.base_url}"
 
 
 # ---------------------------------------------------------------------------

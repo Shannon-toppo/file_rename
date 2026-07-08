@@ -343,8 +343,21 @@ class MainWindow(QMainWindow):
         return len(tracks)
 
     def add_files(self, paths: list[Path]) -> int:
-        """ローカルファイル行を追加する。追加件数を返す。"""
-        tracks = [core.track_from_file(p) for p in paths]
+        """ローカルファイル行を追加する。追加件数を返す。
+
+        既にリストへ入っているファイル（filepath が同じ行）はスキップする
+        （[files/ 取り込み] を押すたびに同じ行が増えないように）。
+        """
+        existing = {
+            t.filepath.resolve() for t in self._model.tracks() if t.filepath is not None
+        }
+        tracks = []
+        for p in paths:
+            key = p.resolve()
+            if key in existing:
+                continue
+            existing.add(key)
+            tracks.append(core.track_from_file(p))
         self._model.add_tracks(tracks)
         return len(tracks)
 
@@ -386,7 +399,11 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         n = self.add_files([Path(p) for p in paths])
-        self.statusBar().showMessage(f"{n} 件のファイルを追加しました")
+        skipped = len(paths) - n
+        msg = f"{n} 件のファイルを追加しました"
+        if skipped:
+            msg += f"（追加済み {skipped} 件はスキップ）"
+        self.statusBar().showMessage(msg)
 
     def _on_import_dir(self) -> None:
         files = core.list_music_files()
@@ -394,7 +411,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"{core.FILES_DIR} に音声ファイルがありません")
             return
         n = self.add_files(files)
-        self.statusBar().showMessage(f"files/ から {n} 件を取り込みました")
+        if n:
+            self.statusBar().showMessage(f"files/ から {n} 件を取り込みました")
+        else:
+            self.statusBar().showMessage("files/ のファイルはすべて取り込み済みです")
 
     # -- パイプライン起動 ----------------------------------------------------
 
@@ -937,6 +957,9 @@ class MainWindow(QMainWindow):
         n += sum(self._add_url_list(p) for p in url_lists)
         if n:
             self.statusBar().showMessage(f"ドロップで {n} 件を追加しました")
+        elif supported and not url_lists:
+            # URL リストの失敗時は _add_url_list が理由を表示済みなので上書きしない
+            self.statusBar().showMessage("ドロップされたファイルはすべて追加済みです")
 
 
 class _DropTableView(QTableView):

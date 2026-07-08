@@ -308,6 +308,26 @@ def test_main_window_add_urls_and_files(qtbot, tmp_path):
     assert win._model.track_at(2).filepath == f
 
 
+def test_main_window_add_files_skips_duplicates(qtbot, tmp_path):
+    """同じファイルの再追加はスキップされる（[files/ 取り込み] 連打で行が増えない）。"""
+    from gui.main_window import MainWindow
+
+    win = MainWindow(restore_settings=False)
+    qtbot.addWidget(win)
+    a = tmp_path / "a.mp3"
+    b = tmp_path / "b.mp3"
+    a.write_bytes(b"\x00")
+    b.write_bytes(b"\x00")
+
+    assert win.add_files([a]) == 1
+    # 再取り込み: 既存の a は除外され、新規の b だけ追加される
+    assert win.add_files([a, b]) == 1
+    assert win._model.rowCount() == 2
+    # 同一バッチ内の重複も 1 行にまとまる
+    assert win.add_files([a, a]) == 0
+    assert win._model.rowCount() == 2
+
+
 def test_main_window_delete_and_dropped_paths(qtbot, tmp_path):
     from gui.main_window import MainWindow
 

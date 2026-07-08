@@ -548,18 +548,21 @@ def _fake_config(monkeypatch, base_url="http://127.0.0.1:1234/v1/"):
     return cfg
 
 
-def test_check_connection_success(monkeypatch):
-    _fake_config(monkeypatch)
+def _fake_urlopen(monkeypatch, body: bytes, status: int = 200) -> dict:
+    """urlopen を status/body 固定のフェイクへ差し替え、リクエスト内容を記録する。"""
     seen = {}
 
     class FakeResp:
-        status = 200
-
         def __enter__(self):
             return self
 
         def __exit__(self, *a):
             return False
+
+        def read(self, n=-1):
+            return body
+
+    FakeResp.status = status
 
     def fake_urlopen(req, timeout=0):
         seen["url"] = req.full_url
@@ -567,11 +570,35 @@ def test_check_connection_success(monkeypatch):
         return FakeResp()
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return seen
+
+
+def test_check_connection_success(monkeypatch):
+    _fake_config(monkeypatch)
+    seen = _fake_urlopen(monkeypatch, b'{"object": "list", "data": []}')
     ok, msg = core.check_connection(timeout=1.5)
     assert ok
     # 末尾スラッシュに頑健（//models にならない）で、短い timeout が使われる
     assert seen["url"] == "http://127.0.0.1:1234/v1/models"
     assert seen["timeout"] == 1.5
+
+
+def test_check_connection_error_json_with_200(monkeypatch):
+    # LM Studio は存在しないパス（/v1 抜けなど）にも HTTP 200 でエラー JSON を
+    # 返すため、ステータスだけ見ると偽陽性になる。ボディ検証で NG にする。
+    _fake_config(monkeypatch, base_url="http://127.0.0.1:1234")
+    _fake_urlopen(monkeypatch, b'{"error":"Unexpected endpoint or method. (GET /models)"}')
+    ok, msg = core.check_connection()
+    assert not ok
+    assert "/models" in msg
+
+
+def test_check_connection_non_json_with_200(monkeypatch):
+    # LLM 以外のサーバ（管理画面など）が HTML を 200 で返すケースも NG にする
+    _fake_config(monkeypatch)
+    _fake_urlopen(monkeypatch, b"<html>hello</html>")
+    ok, msg = core.check_connection()
+    assert not ok
 
 
 def test_check_connection_refused(monkeypatch):
