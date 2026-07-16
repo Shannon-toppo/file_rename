@@ -60,6 +60,29 @@ def test_format_column_dash_when_no_file():
     assert model.data(_idx(model, 0, COL_FORMAT), Qt.ItemDataRole.DisplayRole) == "-"
 
 
+def test_error_row_shows_error_in_title_column():
+    """ERROR 行はエラー内容を推定タイトル列に表示する（ホバー不要で読める）。"""
+    t = Track(stem="x", status=Status.ERROR, error="ダウンロードに失敗しました: boom")
+    model = TrackTableModel([t])
+    role = Qt.ItemDataRole.DisplayRole
+    assert model.data(_idx(model, 0, COL_TITLE), role) == "ダウンロードに失敗しました: boom"
+    # 編集時は素の guessed_title のまま（エラー文をエディタに載せない）
+    assert model.data(_idx(model, 0, COL_TITLE), Qt.ItemDataRole.EditRole) == ""
+
+
+def test_reset_error_returns_to_queue_or_pending():
+    """reset_error: タイトル無し→QUEUED、有り→PENDING、ERROR 以外は不変。"""
+    no_title = Track(stem="a", status=Status.ERROR, error="x")
+    with_title = Track(stem="b", guessed_title="t", status=Status.ERROR, error="y")
+    not_error = Track(stem="c", status=Status.DONE)
+    model = TrackTableModel([no_title, with_title, not_error])
+    for row in range(3):
+        model.reset_error(row)
+    assert no_title.status is Status.QUEUED and no_title.error == ""
+    assert with_title.status is Status.PENDING and with_title.error == ""
+    assert not_error.status is Status.DONE
+
+
 # ---------------------------------------------------------------------------
 # 編集可否 / setData
 # ---------------------------------------------------------------------------

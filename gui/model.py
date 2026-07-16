@@ -128,9 +128,13 @@ class TrackTableModel(QAbstractTableModel):
         if col == COL_CHANNEL:
             return track.channel or ""
         if col == COL_TITLE:
-            # 編集時は素の値、表示時は手動行にプレフィックスを付ける
+            # 編集時は素の値、表示時は手動行にプレフィックスを付ける。
+            # エラー行はホバー（ツールチップ）なしで理由が分かるよう、
+            # 空いているこの列へエラー内容をそのまま表示する
             if edit:
                 return track.guessed_title
+            if track.status is Status.ERROR and track.error:
+                return track.error
             if track.manual and track.guessed_title:
                 return _MANUAL_PREFIX + track.guessed_title
             return track.guessed_title
@@ -272,6 +276,21 @@ class TrackTableModel(QAbstractTableModel):
         if t.status is Status.DONE:
             t.status = Status.PENDING
             t.error = ""
+        self._emit_row(row)
+
+    def reset_error(self, row: int) -> None:
+        """ERROR 行を再試行待ちへ戻す（実行は既存の [実行] / 書き込み操作で）。
+
+        推定済みタイトルがあれば PENDING（書き込みからやり直し）、なければ
+        QUEUED（DL / 取得 / 推定からやり直し）に戻す。ERROR 以外の行は触らない。
+        """
+        if not (0 <= row < len(self._tracks)):
+            return
+        t = self._tracks[row]
+        if t.status is not Status.ERROR:
+            return
+        t.status = Status.PENDING if t.guessed_title else Status.QUEUED
+        t.error = ""
         self._emit_row(row)
 
     def clear_title(self, row: int) -> None:

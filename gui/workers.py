@@ -50,6 +50,9 @@ class WorkerSignals(QObject):
     connection_failed = Signal(str)
     # 書き込み実行後の集計 (完了, スキップ, 失敗)。ステータスバー表示用
     write_summary = Signal(int, int, int)
+    # 情報取得 / DL 段の集計 (段名, 成功, 失敗)。失敗行があっても最後の
+    # ステータスバーが「完了」だけになり気付けない問題への対策
+    stage_summary = Signal(str, int, int)
 
 
 class PipelineWorker(QRunnable):
@@ -170,6 +173,8 @@ class PipelineWorker(QRunnable):
             後続の推定対象となる Track のリスト（DL 済み実 Track + ローカル行）。
         """
         ready: list[Track] = []
+        attempted = 0  # DL を試みた行数（スキップ行は集計に含めない）
+        failed = 0
         for placeholder in self._tracks:
             self._check_cancel()
             if placeholder.url is None or placeholder.filepath is not None:
@@ -177,6 +182,7 @@ class PipelineWorker(QRunnable):
                 # 両方を持つ）は DL をスキップ（再実行時の再ダウンロード防止）
                 ready.append(placeholder)
                 continue
+            attempted += 1
 
             placeholder.status = Status.DOWNLOADING
             placeholder.error = ""
@@ -215,6 +221,7 @@ class PipelineWorker(QRunnable):
                 placeholder.status = Status.ERROR
                 placeholder.error = f"ダウンロードに失敗しました: {e}"
                 self.signals.track_updated.emit(placeholder)
+                failed += 1
                 continue
 
             # 情報取得済み行への手動編集（タイトル・アーティスト）は、DL で
@@ -233,6 +240,8 @@ class PipelineWorker(QRunnable):
             # プレースホルダ行を実 Track 行（再生リストは複数）へ差し替える
             self.signals.tracks_ready.emit(placeholder, new_tracks)
             ready.extend(new_tracks)
+        if attempted:
+            self.signals.stage_summary.emit("ダウンロード", attempted - failed, failed)
         return ready
 
     def _run_fetch(self) -> None:
@@ -242,6 +251,8 @@ class PipelineWorker(QRunnable):
         （stem が動画タイトルに置き換わっている）とローカル行はスキップする
         ので、再実行しても再取得や手動編集の上書きは起きない。
         """
+        attempted = 0  # 取得を試みた行数（スキップ行は集計に含めない）
+        failed = 0
         for placeholder in self._tracks:
             self._check_cancel()
             if placeholder.url is None or placeholder.filepath is not None:
@@ -249,6 +260,7 @@ class PipelineWorker(QRunnable):
             if placeholder.stem != placeholder.url:
                 continue  # 取得済み（展開済み）の行は再取得しない
 
+            attempted += 1
             placeholder.status = Status.FETCHING
             placeholder.error = ""
             self.signals.track_updated.emit(placeholder)
@@ -266,10 +278,13 @@ class PipelineWorker(QRunnable):
                 placeholder.status = Status.ERROR
                 placeholder.error = f"情報の取得に失敗しました: {e}"
                 self.signals.track_updated.emit(placeholder)
+                failed += 1
                 continue
 
             # プレースホルダ行をメタデータ行（再生リストは複数）へ差し替える
             self.signals.tracks_ready.emit(placeholder, new_tracks)
+        if attempted:
+            self.signals.stage_summary.emit("情報取得", attempted - failed, failed)
 
     def _run_infer(self, tracks: Sequence[Track]) -> None:
         """対象行をまとめて 1 回で推定する（バッチ）。"""

@@ -263,6 +263,34 @@ def test_context_menu_open_url_enabled_with_url(main_window):
     assert open_url.isEnabled()
 
 
+def test_context_menu_retry_enabled_only_for_error_rows(main_window):
+    win = main_window
+    win._model.add_tracks(
+        [
+            Track(stem="err", url="http://u", status=Status.ERROR, error="x"),
+            Track(stem="ok", url="http://u2"),
+        ]
+    )
+    win._view.selectRow(0)
+    menu = win.build_context_menu()
+    retry = next(a for a in menu.actions() if a.text() == "エラー行を再試行待ちに戻す")
+    assert retry.isEnabled()
+    # ERROR 行が選択に含まれなければ無効
+    win._view.selectRow(1)
+    menu = win.build_context_menu()
+    retry = next(a for a in menu.actions() if a.text() == "エラー行を再試行待ちに戻す")
+    assert not retry.isEnabled()
+
+
+def test_reset_errors_resets_selected_rows(main_window):
+    win = main_window
+    win._model.add_tracks([Track(stem="err", url="http://u", status=Status.ERROR, error="x")])
+    win._view.selectRow(0)
+    win._on_reset_errors()
+    t = win._model.track_at(0)
+    assert t.status is Status.QUEUED and t.error == ""
+
+
 def test_open_urls_calls_desktop_services(main_window, monkeypatch):
     from gui import main_window as mw
 

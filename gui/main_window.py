@@ -522,6 +522,9 @@ class MainWindow(QMainWindow):
         worker.signals.write_summary.connect(
             self._on_write_summary, Qt.ConnectionType.QueuedConnection
         )
+        worker.signals.stage_summary.connect(
+            self._on_stage_summary, Qt.ConnectionType.QueuedConnection
+        )
         worker.signals.finished.connect(self._on_worker_finished, Qt.ConnectionType.QueuedConnection)
         self._set_running(True)
         self.statusBar().showMessage(message)
@@ -543,6 +546,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"書き込み: 完了 {done} 件 / スキップ {skipped} 件 / 失敗 {errors} 件"
         )
+
+    def _on_stage_summary(self, stage: str, done: int, errors: int) -> None:
+        """情報取得 / DL 段の集計を表示する（失敗が「完了」に埋もれないように）。"""
+        self.statusBar().showMessage(f"{stage}: 完了 {done} 件 / 失敗 {errors} 件")
 
     def _on_worker_finished(self) -> None:
         self._set_running(False)
@@ -853,6 +860,8 @@ class MainWindow(QMainWindow):
         write.triggered.connect(self._on_write_selected)
         delete = menu.addAction("行削除")
         delete.triggered.connect(self._on_delete_rows)
+        retry = menu.addAction("エラー行を再試行待ちに戻す")
+        retry.triggered.connect(self._on_reset_errors)
         menu.addSeparator()
         open_url = menu.addAction("URL をブラウザで開く")
         open_url.triggered.connect(self._on_open_urls)
@@ -860,10 +869,27 @@ class MainWindow(QMainWindow):
         # 実行中は破壊的/パイプライン操作を無効化
         for act in (reinfer, write, delete):
             act.setEnabled(bool(rows) and not self._running)
+        # 選択行に ERROR がある場合のみ有効
+        has_error = any(self._model.track_at(r).status is Status.ERROR for r in rows)
+        retry.setEnabled(has_error and not self._running)
         # url を持つ選択行が 1 つでもあれば有効
         has_url = any(self._model.track_at(r).url for r in rows)
         open_url.setEnabled(has_url)
         return menu
+
+    def _on_reset_errors(self) -> None:
+        """選択中のエラー行を再試行待ちへ戻す（再処理は [▶ 実行] などで）。"""
+        if self._running:
+            return
+        rows = [
+            r for r in self._selected_rows() if self._model.track_at(r).status is Status.ERROR
+        ]
+        for row in rows:
+            self._model.reset_error(row)
+        if rows:
+            self.statusBar().showMessage(
+                f"{len(rows)} 行を再試行待ちに戻しました（[▶ 実行] で再処理されます）"
+            )
 
     def _on_open_urls(self) -> None:
         """選択行の url をブラウザで開く。"""
