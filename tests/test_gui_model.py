@@ -365,6 +365,25 @@ def test_main_window_delete_and_dropped_paths(qtbot, tmp_path):
     assert win._model.rowCount() == 1
 
 
+def test_main_window_connection_failed_shows_banner(qtbot):
+    """LLM 未接続の縮退通知でバナーが表示され、次の実行開始で自動的に消える。"""
+    from gui.main_window import MainWindow
+
+    win = MainWindow(restore_settings=False)
+    qtbot.addWidget(win)
+    assert not win._banner.isVisible()
+
+    win.show()  # isVisible は親が可視でないと True にならない
+    win._on_connection_failed("down")
+    assert win._banner.isVisible()
+    assert "down" in win._banner_label.text()
+
+    # 実行開始（_set_running(True)）で自動的に隠れる
+    win._set_running(True)
+    assert not win._banner.isVisible()
+    win._set_running(False)
+
+
 def test_main_window_dropped_txt_is_url_list(qtbot, tmp_path):
     """.txt のドロップは URL リストとして読み込まれ、URL 行が追加される。"""
     from gui.main_window import MainWindow

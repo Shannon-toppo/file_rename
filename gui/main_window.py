@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -210,6 +211,31 @@ class MainWindow(QMainWindow):
         width = max(b.sizeHint().width() for b in same_width)
         for b in same_width:
             b.setFixedWidth(width)
+
+        # LLM 未接続で DL のみの縮退モードへ切り替わったときの警告バナー
+        # （既定は非表示）。ステータスバー 1 行では見落とし、行が キュー の
+        # まま残る理由が分からなくなるため、テーブルの直上に目立つ色で出す。
+        # モーダルにはしない（DL 自体は続くので流れを止めない）
+        self._banner = QFrame()
+        self._banner.setVisible(False)
+        # 黄系背景 + 濃色文字を固定（ダークテーマの白文字で読めなくならないように）
+        self._banner.setStyleSheet(
+            "QFrame { background-color: #faf4c7; border: 1px solid #c8b860;"
+            " border-radius: 4px; }"
+            " QLabel { color: #202020; border: none; }"
+            " QPushButton { color: #202020; background: transparent; border: none; }"
+        )
+        banner_lay = QHBoxLayout(self._banner)
+        banner_lay.setContentsMargins(8, 4, 4, 4)
+        self._banner_label = QLabel("")
+        self._banner_label.setWordWrap(True)
+        banner_close = QPushButton("✕")
+        banner_close.setFixedWidth(24)
+        banner_close.setToolTip("この警告を閉じる")
+        banner_close.clicked.connect(lambda: self._banner.setVisible(False))
+        banner_lay.addWidget(self._banner_label, stretch=1)
+        banner_lay.addWidget(banner_close)
+        root.addWidget(self._banner)
 
         # 中央: テーブル
         self._view = _DropTableView(self)
@@ -536,10 +562,20 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"エラー: {message}")
 
     def _on_connection_failed(self, message: str) -> None:
-        """LLM 未接続 → DL のみの縮退モードへ切り替わったときの通知。"""
+        """LLM 未接続 → DL のみの縮退モードへ切り替わったときの通知。
+
+        ステータスバーは見落としやすいので、テーブル上部のバナーにも出す
+        （次の実行開始時に自動で消える。✕ でも閉じられる）。
+        """
         self.statusBar().showMessage(
             f"LLM エンドポイントに接続できません。DL のみ実行します（{message}）"
         )
+        self._banner_label.setText(
+            "LLM エンドポイントに接続できないため、ダウンロードのみ実行しました。"
+            "行は「キュー」のまま残っています。サーバ起動後（または [設定] の接続設定を"
+            f"確認後）にもう一度 [▶ 実行] すると推定から続きが処理されます。（{message}）"
+        )
+        self._banner.setVisible(True)
 
     def _on_write_summary(self, done: int, skipped: int, errors: int) -> None:
         """書き込み結果の集計をステータスバーに表示（完了が分かりづらい問題の対策）。"""
@@ -727,6 +763,8 @@ class MainWindow(QMainWindow):
         if running:
             # 実行中は対象ファイルが変換で書き換わり得るため試聴を止める
             self._player.stop()
+            # 前回の縮退モード警告は再実行で解消され得るため自動で消す
+            self._banner.setVisible(False)
         for b in self._busy_buttons:
             b.setEnabled(not running)
         self._seek_slider.setEnabled(not running)
