@@ -96,11 +96,12 @@ def test_settings_dialog_connection_test(qtbot, monkeypatch):
     dlg = SettingsDialog()
     qtbot.addWidget(dlg)
     dlg._on_test_connection()
-    assert dlg._test_result.text().startswith("OK:")
+    # 成功時は core の msg（「接続 OK: ...」）をそのまま出す（"OK:" を重ねない）
+    assert dlg._test_result.text() == "接続 OK"
 
     monkeypatch.setattr(core, "check_connection", lambda timeout=3.0: (False, "拒否"))
     dlg._on_test_connection()
-    assert dlg._test_result.text().startswith("NG:")
+    assert dlg._test_result.text() == "NG: 拒否"
 
 
 def test_apply_settings_updates_window(main_window, tmp_path):
@@ -160,7 +161,7 @@ def test_connection_test_restores_env(qtbot, monkeypatch):
     dlg = SettingsDialog(llm_overrides={"BASE_URL": "http://temporary/v1"})
     qtbot.addWidget(dlg)
     dlg._on_test_connection()
-    assert dlg._test_result.text().startswith("OK:")
+    assert dlg._test_result.text() == "OK"
     assert os.environ["BASE_URL"] == "http://original/v1"
 
 

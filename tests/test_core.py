@@ -542,8 +542,8 @@ import urllib.error  # noqa: E402
 import urllib.request  # noqa: E402
 
 
-def _fake_config(monkeypatch, base_url="http://127.0.0.1:1234/v1/"):
-    cfg = types.SimpleNamespace(base_url=base_url, api_key=None)
+def _fake_config(monkeypatch, base_url="http://127.0.0.1:1234/v1/", model="m1"):
+    cfg = types.SimpleNamespace(base_url=base_url, api_key=None, model=model)
     monkeypatch.setattr(core, "Config", types.SimpleNamespace(from_env=lambda: cfg))
     return cfg
 
@@ -581,6 +581,28 @@ def test_check_connection_success(monkeypatch):
     # 末尾スラッシュに頑健（//models にならない）で、短い timeout が使われる
     assert seen["url"] == "http://127.0.0.1:1234/v1/models"
     assert seen["timeout"] == 1.5
+
+
+def test_check_connection_model_in_list_no_warning(monkeypatch):
+    """使用モデルが /models の一覧にあれば注意なしの OK。"""
+    _fake_config(monkeypatch, model="m1")
+    _fake_urlopen(monkeypatch, b'{"data": [{"id": "m1"}, {"id": "m2"}]}')
+    ok, msg = core.check_connection()
+    assert ok
+    assert "注意" not in msg
+
+
+def test_check_connection_warns_on_unknown_model(monkeypatch):
+    """使用モデルが一覧に無ければ OK のままモデル名入りの注意を添える。
+
+    MODEL 未設定のままライブラリ既定値で推論だけ失敗する事故に気付ける
+    ように（LM Studio はエイリアス解決で通ることがあるため NG にはしない）。
+    """
+    _fake_config(monkeypatch, model="gemma-4-e2b-it")
+    _fake_urlopen(monkeypatch, b'{"data": [{"id": "google/gemma-4-e2b"}]}')
+    ok, msg = core.check_connection()
+    assert ok
+    assert "gemma-4-e2b-it" in msg and "ありません" in msg
 
 
 def test_check_connection_error_json_with_200(monkeypatch):

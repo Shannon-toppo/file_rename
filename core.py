@@ -27,6 +27,7 @@ from mutagen.id3._util import ID3NoHeaderError
 from mutagen.mp4 import MP4
 from mutagen.wave import WAVE
 from mv2title import Config, LLMClient, TitleInput, extract_titles
+from mv2title.connect import DEFAULT_MODEL  # noqa: F401 - MODEL 未設定時の実効値（GUI の表示用に re-export）
 from yt_dlp import YoutubeDL
 
 _ROOT = Path(__file__).parent.parent
@@ -261,6 +262,15 @@ def check_connection(timeout: float = 3.0) -> tuple[bool, str]:
         return False, (
             f"応答が OpenAI 互換の /models 形式ではありません ({url})。"
             "BASE_URL のパス（例: 末尾の /v1）が正しいか確認してください。"
+        )
+    # 使用するモデル名がサーバーの一覧に無ければ注意を添える。MODEL 未設定の
+    # まま既定値で推論だけ失敗する事故に気付けるように。LM Studio はエイリアス
+    # 解決で通ることもあるため、NG（接続失敗）にはしない
+    ids = {m.get("id") for m in payload["data"] if isinstance(m, dict)}
+    if ids and config.model not in ids:
+        return True, (
+            f"接続 OK: {config.base_url}（注意: モデル '{config.model}' は"
+            "サーバーのモデル一覧にありません。[設定] の MODEL を確認してください）"
         )
     return True, f"接続 OK: {config.base_url}"
 

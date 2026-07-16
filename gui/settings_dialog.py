@@ -168,6 +168,11 @@ class SettingsDialog(QDialog):
         def _placeholder(key: str, secret: bool = False) -> str:
             value = defaults.get(key)
             if not value:
+                if key == "MODEL":
+                    # ライブラリ側が黙って既定値で推論するため、実効値を明示する
+                    # （「未設定」表示のまま既定モデル名でリクエストが飛ぶと、
+                    # サーバー側のモデル名と合わず推論だけ失敗する事故になる）
+                    return f"未設定（既定値 {core.DEFAULT_MODEL} を使用）"
                 return "未設定（.env にもありません）"
             return ".env の値: " + ("(設定済み)" if secret else value)
 
@@ -238,7 +243,8 @@ class SettingsDialog(QDialog):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
-        self._test_result.setText(("OK: " if ok else "NG: ") + msg)
+        # 成功時の msg は「接続 OK: ...」で始まるため、"OK: " を重ねない
+        self._test_result.setText(msg if ok else "NG: " + msg)
 
     # -- 結果 ---------------------------------------------------------------
 
