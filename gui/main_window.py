@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -165,7 +166,7 @@ class MainWindow(QMainWindow):
         self._url_edit.installEventFilter(self)
         top.addWidget(self._url_edit, stretch=1)
 
-        btn_col = QVBoxLayout()
+        btn_grid = QGridLayout()
         add_btn = QPushButton("追加")
         add_btn.clicked.connect(self._on_add_urls)
         list_btn = QPushButton("リスト読込")
@@ -181,9 +182,11 @@ class MainWindow(QMainWindow):
             "まとめて追加する（追加済みの行は増えない）"
         )
         import_btn.clicked.connect(self._on_import_dir)
-        for b in (add_btn, list_btn, file_btn, import_btn):
-            btn_col.addWidget(b)
-        top.addLayout(btn_col)
+        # 2×2 グリッド（縦 4 段だと URL 欄より背が高くなり、小さいウィンドウで
+        # テーブルの表示領域を圧迫するため）
+        for i, b in enumerate((add_btn, list_btn, file_btn, import_btn)):
+            btn_grid.addWidget(b, i // 2, i % 2)
+        top.addLayout(btn_grid)
         root.addLayout(top)
 
         # ツールバー行: 実行 / 停止 / 形式 / 自動書き込み
@@ -231,7 +234,7 @@ class MainWindow(QMainWindow):
         root.addLayout(bar)
 
         # 上段の追加系ボタンと [設定] の幅を統一する（最長ラベル基準。
-        # 縦積みの列は自動で最長幅に揃うが、[設定] は別レイアウトなので明示する）
+        # グリッドの列幅を揃え、別レイアウトの [設定] も同じ幅にする）
         same_width = (add_btn, list_btn, file_btn, import_btn, settings_btn)
         width = max(b.sizeHint().width() for b in same_width)
         for b in same_width:
