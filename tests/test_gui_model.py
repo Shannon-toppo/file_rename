@@ -60,6 +60,29 @@ def test_format_column_dash_when_no_file():
     assert model.data(_idx(model, 0, COL_FORMAT), Qt.ItemDataRole.DisplayRole) == "-"
 
 
+def test_error_row_shows_error_in_title_column():
+    """ERROR 行はエラー内容を推定タイトル列に表示する（ホバー不要で読める）。"""
+    t = Track(stem="x", status=Status.ERROR, error="ダウンロードに失敗しました: boom")
+    model = TrackTableModel([t])
+    role = Qt.ItemDataRole.DisplayRole
+    assert model.data(_idx(model, 0, COL_TITLE), role) == "ダウンロードに失敗しました: boom"
+    # 編集時は素の guessed_title のまま（エラー文をエディタに載せない）
+    assert model.data(_idx(model, 0, COL_TITLE), Qt.ItemDataRole.EditRole) == ""
+
+
+def test_reset_error_returns_to_queue_or_pending():
+    """reset_error: タイトル無し→QUEUED、有り→PENDING、ERROR 以外は不変。"""
+    no_title = Track(stem="a", status=Status.ERROR, error="x")
+    with_title = Track(stem="b", guessed_title="t", status=Status.ERROR, error="y")
+    not_error = Track(stem="c", status=Status.DONE)
+    model = TrackTableModel([no_title, with_title, not_error])
+    for row in range(3):
+        model.reset_error(row)
+    assert no_title.status is Status.QUEUED and no_title.error == ""
+    assert with_title.status is Status.PENDING and with_title.error == ""
+    assert not_error.status is Status.DONE
+
+
 # ---------------------------------------------------------------------------
 # 編集可否 / setData
 # ---------------------------------------------------------------------------
@@ -340,6 +363,76 @@ def test_main_window_delete_and_dropped_paths(qtbot, tmp_path):
     # 非対応拡張子は無視される
     win.handle_dropped_paths([good, bad])
     assert win._model.rowCount() == 1
+
+
+def test_main_window_ctrl_enter_adds_urls(qtbot):
+    """URL 欄で Ctrl+Enter を押すと [追加] と同じく行が追加される。
+
+    キーイベントを QApplication 経由でディスパッチすると、Qt が修飾キー
+    状態（keyboardModifiers）をグローバルにキャッシュしてテストをまたいで
+    残り、後続テストの selectRow がトグル選択化する。ここではディスパッチを
+    通さず eventFilter を直接呼んで判定ロジックを検証する。
+    """
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    from gui.main_window import MainWindow
+
+    win = MainWindow(restore_settings=False)
+    qtbot.addWidget(win)
+    win._url_edit.setPlainText("http://a\nhttp://b")
+    press = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.ControlModifier
+    )
+    assert win.eventFilter(win._url_edit, press) is True  # 消費される
+    assert win._model.rowCount() == 2
+    assert win._url_edit.toPlainText() == ""  # 追加後はクリアされる
+    # 修飾なしの Enter は改行としてエディタに渡る（消費しない）
+    plain = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier)
+    assert win.eventFilter(win._url_edit, plain) is False
+
+
+def test_main_window_import_dir_uses_out_dir(qtbot, tmp_path):
+    """[保存先から取り込み] は設定の保存先フォルダを対象にする。"""
+    from gui.main_window import MainWindow
+
+    win = MainWindow(restore_settings=False)
+    qtbot.addWidget(win)
+    (tmp_path / "song.mp3").write_bytes(b"\x00")
+    win._out_dir = tmp_path
+    win._on_import_dir()
+    assert win._model.rowCount() == 1
+    assert win._model.track_at(0).filepath == tmp_path / "song.mp3"
+
+
+def test_main_window_empty_hint_paints_without_error(qtbot):
+    """空テーブルの案内文描画（paintEvent）が行の有無どちらでも例外を出さない。"""
+    from gui.main_window import MainWindow
+
+    win = MainWindow(restore_settings=False)
+    qtbot.addWidget(win)
+    assert not win._view.grab().isNull()  # 0 行（ヒント描画パス）
+    win.add_urls(["http://a"])
+    assert not win._view.grab().isNull()  # 1 行（通常描画パス）
+
+
+def test_main_window_connection_failed_shows_banner(qtbot):
+    """LLM 未接続の縮退通知でバナーが表示され、次の実行開始で自動的に消える。"""
+    from gui.main_window import MainWindow
+
+    win = MainWindow(restore_settings=False)
+    qtbot.addWidget(win)
+    assert not win._banner.isVisible()
+
+    win.show()  # isVisible は親が可視でないと True にならない
+    win._on_connection_failed("down")
+    assert win._banner.isVisible()
+    assert "down" in win._banner_label.text()
+
+    # 実行開始（_set_running(True)）で自動的に隠れる
+    win._set_running(True)
+    assert not win._banner.isVisible()
+    win._set_running(False)
 
 
 def test_main_window_dropped_txt_is_url_list(qtbot, tmp_path):

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -61,9 +62,17 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("設定")
         self.setModal(True)
+        # 保存先パスや BASE_URL が途中で切れない程度の最小幅を確保する
+        self.setMinimumWidth(560)
 
+        # 項目が多いので QGroupBox で「ダウンロード」「タイトル推定 (LLM)」
+        # 「表示」の 3 グループに分ける（ウィジェット名・values() は従来のまま）
         root = QVBoxLayout(self)
-        form = QFormLayout()
+        dl_group = QGroupBox("ダウンロード")
+        form = QFormLayout(dl_group)
+        # mac スタイルの既定はフィールドを sizeHint 幅のまま中央寄せするため、
+        # パスや URL の欄が狭く切れる。行いっぱいまで伸ばす
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         # 保存先フォルダ（参照ボタン付き）
         dir_row = QHBoxLayout()
@@ -80,17 +89,6 @@ class SettingsDialog(QDialog):
         if fmt in core.SUPPORTED_FORMATS:
             self._fmt_combo.setCurrentText(fmt)
         form.addRow("既定の音声形式", self._fmt_combo)
-
-        # バッチサイズ（1 回の LLM リクエストに含めるタイトル数）
-        self._batch_spin = QSpinBox()
-        self._batch_spin.setRange(1, 50)
-        self._batch_spin.setValue(batch_size)
-        form.addRow("推定バッチサイズ", self._batch_spin)
-
-        # 自動書き込みの既定値
-        self._auto_check = QCheckBox("起動時に自動書き込みを ON にする")
-        self._auto_check.setChecked(auto_write)
-        form.addRow("自動書き込み", self._auto_check)
 
         # 動画＋リスト混在 URL（watch?v=...&list=...）の扱い
         self._expand_check = QCheckBox("再生リスト付き動画 URL はリスト全体を展開する")
@@ -135,39 +133,35 @@ class SettingsDialog(QDialog):
             "（フェードアウトや余韻など音楽本体は削らない）。"
         )
         form.addRow("無音削除", self._trim_check)
+        root.addWidget(dl_group)
 
-        # テーマ（アプリ全体の配色。既定は OS のテーマに追従）
-        self._theme_combo = QComboBox()
-        for value, label in THEMES:
-            self._theme_combo.addItem(label, value)
-        idx = self._theme_combo.findData(theme)
-        if idx >= 0:
-            self._theme_combo.setCurrentIndex(idx)
-        form.addRow("テーマ", self._theme_combo)
-
-        # ログレベル（[ログ] パネルに表示する最小レベル。既定は警告）
-        self._log_level_combo = QComboBox()
-        for value, label in LOG_LEVELS:
-            self._log_level_combo.addItem(label, value)
-        log_idx = self._log_level_combo.findData(log_level)
-        if log_idx >= 0:
-            self._log_level_combo.setCurrentIndex(log_idx)
-        self._log_level_combo.setToolTip(
-            "ログパネルに表示する最小レベル。\n"
-            "「詳細（すべて）」は yt-dlp の進捗行も流れるため流量が多い。"
-        )
-        form.addRow("ログレベル", self._log_level_combo)
-        root.addLayout(form)
-
-        # 接続設定（.env を既定とし、ここで上書きできる。空欄 = .env の値）
+        # 推定と接続設定（.env を既定とし、ここで上書きできる。空欄 = .env の値）
+        llm_group = QGroupBox("タイトル推定 (LLM)")
         llm = dict(llm_overrides or {})
         defaults = core.env_defaults()
         env_file = core.find_env_file()
-        llm_form = QFormLayout()
+        llm_form = QFormLayout(llm_group)
+        llm_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        # バッチサイズ（1 回の LLM リクエストに含めるタイトル数）
+        self._batch_spin = QSpinBox()
+        self._batch_spin.setRange(1, 50)
+        self._batch_spin.setValue(batch_size)
+        llm_form.addRow("推定バッチサイズ", self._batch_spin)
+
+        # 自動書き込みの既定値
+        self._auto_check = QCheckBox("起動時に自動書き込みを ON にする")
+        self._auto_check.setChecked(auto_write)
+        llm_form.addRow("自動書き込み", self._auto_check)
 
         def _placeholder(key: str, secret: bool = False) -> str:
             value = defaults.get(key)
             if not value:
+                if key == "MODEL":
+                    # ライブラリ側が黙って既定値で推論するため、実効値を明示する
+                    # （「未設定」表示のまま既定モデル名でリクエストが飛ぶと、
+                    # サーバー側のモデル名と合わず推論だけ失敗する事故になる）
+                    return f"未設定（既定値 {core.DEFAULT_MODEL} を使用）"
                 return "未設定（.env にもありません）"
             return ".env の値: " + ("(設定済み)" if secret else value)
 
@@ -188,7 +182,6 @@ class SettingsDialog(QDialog):
         self._prompt_edit.setPlaceholderText(_placeholder("SYSTEM_PROMPT"))
         self._prompt_edit.setFixedHeight(56)
         llm_form.addRow("システムプロンプト", self._prompt_edit)
-        root.addLayout(llm_form)
 
         if env_file is not None:
             env_note = f"空欄の項目は {env_file} の値を使います。"
@@ -198,7 +191,7 @@ class SettingsDialog(QDialog):
             )
         info = QLabel(env_note)
         info.setWordWrap(True)
-        root.addWidget(info)
+        llm_form.addRow(info)
 
         # 接続テスト
         test_row = QHBoxLayout()
@@ -208,7 +201,35 @@ class SettingsDialog(QDialog):
         self._test_result.setWordWrap(True)
         test_row.addWidget(test_btn)
         test_row.addWidget(self._test_result, stretch=1)
-        root.addLayout(test_row)
+        llm_form.addRow(test_row)
+        root.addWidget(llm_group)
+
+        # 表示（アプリ全体の見た目とログ出力）
+        view_group = QGroupBox("表示")
+        view_form = QFormLayout(view_group)
+
+        # テーマ（アプリ全体の配色。既定は OS のテーマに追従）
+        self._theme_combo = QComboBox()
+        for value, label in THEMES:
+            self._theme_combo.addItem(label, value)
+        idx = self._theme_combo.findData(theme)
+        if idx >= 0:
+            self._theme_combo.setCurrentIndex(idx)
+        view_form.addRow("テーマ", self._theme_combo)
+
+        # ログレベル（[ログ] パネルに表示する最小レベル。既定は警告）
+        self._log_level_combo = QComboBox()
+        for value, label in LOG_LEVELS:
+            self._log_level_combo.addItem(label, value)
+        log_idx = self._log_level_combo.findData(log_level)
+        if log_idx >= 0:
+            self._log_level_combo.setCurrentIndex(log_idx)
+        self._log_level_combo.setToolTip(
+            "ログパネルに表示する最小レベル。\n"
+            "「詳細（すべて）」は yt-dlp の進捗行も流れるため流量が多い。"
+        )
+        view_form.addRow("ログレベル", self._log_level_combo)
+        root.addWidget(view_group)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -238,7 +259,8 @@ class SettingsDialog(QDialog):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
-        self._test_result.setText(("OK: " if ok else "NG: ") + msg)
+        # 成功時の msg は「接続 OK: ...」で始まるため、"OK: " を重ねない
+        self._test_result.setText(msg if ok else "NG: " + msg)
 
     # -- 結果 ---------------------------------------------------------------
 

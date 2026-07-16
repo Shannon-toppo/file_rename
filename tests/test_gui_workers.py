@@ -452,6 +452,59 @@ def test_fetch_mode_error_isolation(qtbot, monkeypatch):
     assert ready and ready[0] is good  # 失敗行があっても後続行は処理される
 
 
+def test_fetch_stage_summary_counts_failures(qtbot, monkeypatch):
+    """情報取得の完了/失敗件数が stage_summary で通知される。"""
+    ok = Track(stem="A", url="http://v/a")
+
+    def fake_fetch(url, cancel=None, expand_playlist=False, logger=None):
+        if url == "http://bad":
+            raise RuntimeError("boom")
+        return [ok]
+
+    monkeypatch.setattr(core, "fetch_metadata", fake_fetch)
+    bad = Track(stem="http://bad", url="http://bad")
+    good = Track(stem="http://good", url="http://good")
+    worker = PipelineWorker([bad, good], mode=MODE_FETCH)
+    summaries = []
+    worker.signals.stage_summary.connect(lambda s, d, e: summaries.append((s, d, e)))
+    run_worker(qtbot, worker)
+
+    assert summaries == [("情報取得", 1, 1)]
+
+
+def test_download_stage_summary_counts_failures(qtbot, monkeypatch):
+    """DL の完了/失敗件数が stage_summary で通知される。"""
+    good = Track(stem="g.mp3", filepath="g.mp3")
+    fake_download_factory(
+        monkeypatch,
+        {"http://bad": RuntimeError("dl error"), "http://good": [good]},
+    )
+    fake_infer_factory(monkeypatch)
+    fake_write_factory(monkeypatch)
+
+    bad_ph = Track(stem="http://bad", url="http://bad")
+    good_ph = Track(stem="http://good", url="http://good")
+    worker = PipelineWorker([bad_ph, good_ph], mode=MODE_FULL, auto_write=True)
+    summaries = []
+    worker.signals.stage_summary.connect(lambda s, d, e: summaries.append((s, d, e)))
+    run_worker(qtbot, worker)
+
+    assert summaries == [("ダウンロード", 1, 1)]
+
+
+def test_stage_summary_not_emitted_for_local_only(qtbot, monkeypatch):
+    """DL を試みる行が無ければ集計は出さない（ローカル行のみの実行でノイズを出さない）。"""
+    fake_infer_factory(monkeypatch)
+    fake_write_factory(monkeypatch)
+    local = Track(stem="local", filepath="local.mp3", status=Status.QUEUED)
+    worker = PipelineWorker([local], mode=MODE_FULL, auto_write=True)
+    summaries = []
+    worker.signals.stage_summary.connect(lambda *a: summaries.append(a))
+    run_worker(qtbot, worker)
+
+    assert summaries == []
+
+
 def test_fetch_mode_passes_expand_playlist(qtbot, monkeypatch):
     captured = {}
 

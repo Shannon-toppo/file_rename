@@ -11,13 +11,14 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QItemSelectionModel, QRect, QSettings, Qt, QThreadPool, QUrl
+from PySide6.QtCore import QEvent, QItemSelectionModel, QRect, QSettings, Qt, QThreadPool, QUrl
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
     QDropEvent,
     QGuiApplication,
     QKeySequence,
+    QPainter,
     QUndoStack,
 )
 from PySide6.QtWidgets import (
@@ -25,6 +26,8 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -153,11 +156,17 @@ class MainWindow(QMainWindow):
         # 上段: URL 入力 + 追加系ボタン
         top = QHBoxLayout()
         self._url_edit = QPlainTextEdit()
-        self._url_edit.setPlaceholderText("URL を改行区切りで貼り付け（複数可）")
+        self._url_edit.setPlaceholderText(
+            "URL を改行区切りで貼り付け（複数可、Ctrl+Enter で追加）"
+        )
         self._url_edit.setFixedHeight(64)  # 3 行程度
+        # Ctrl+Enter（mac は ⌘+Enter）で貼り付け→追加が手だけで完結する。
+        # QShortcut はフォーカス経由の発火なので、キーイベントを直接見る
+        # イベントフィルタにする（eventFilter を参照）
+        self._url_edit.installEventFilter(self)
         top.addWidget(self._url_edit, stretch=1)
 
-        btn_col = QVBoxLayout()
+        btn_grid = QGridLayout()
         add_btn = QPushButton("追加")
         add_btn.clicked.connect(self._on_add_urls)
         list_btn = QPushButton("リスト読込")
@@ -167,16 +176,26 @@ class MainWindow(QMainWindow):
         list_btn.clicked.connect(self._on_load_list)
         file_btn = QPushButton("ファイル追加")
         file_btn.clicked.connect(self._on_add_files)
-        import_btn = QPushButton("files/ 取り込み")
+        import_btn = QPushButton("保存先から取り込み")
+        import_btn.setToolTip(
+            "保存先フォルダ（[設定] で変更可。既定は files/）にある音声ファイルを"
+            "まとめて追加する（追加済みの行は増えない）"
+        )
         import_btn.clicked.connect(self._on_import_dir)
-        for b in (add_btn, list_btn, file_btn, import_btn):
-            btn_col.addWidget(b)
-        top.addLayout(btn_col)
+        # 2×2 グリッド（縦 4 段だと URL 欄より背が高くなり、小さいウィンドウで
+        # テーブルの表示領域を圧迫するため）
+        for i, b in enumerate((add_btn, list_btn, file_btn, import_btn)):
+            btn_grid.addWidget(b, i // 2, i % 2)
+        top.addLayout(btn_grid)
         root.addLayout(top)
 
         # ツールバー行: 実行 / 停止 / 形式 / 自動書き込み
         bar = QHBoxLayout()
         self._run_btn = QPushButton("▶ 実行")
+        self._run_btn.setToolTip(
+            "URL 行のダウンロード → タイトル推定 → タグ書き込みまでを一括実行する\n"
+            "（自動書き込み OFF のときは「確認待ち」で止まる）"
+        )
         self._run_btn.clicked.connect(self._on_run)
         self._stop_btn = QPushButton("■ 停止")
         self._stop_btn.clicked.connect(self._on_stop)
@@ -191,12 +210,22 @@ class MainWindow(QMainWindow):
         bar.addWidget(self._stop_btn)
         bar.addWidget(self._fetch_btn)
         bar.addSpacing(16)
+        # 裸のコンボだと何の形式か分からないためラベルを付ける
+        fmt_label = QLabel("DL形式:")
+        bar.addWidget(fmt_label)
         self._fmt_combo = QComboBox()
         self._fmt_combo.addItems(core.SUPPORTED_FORMATS)
         self._fmt_combo.setCurrentText("mp3")
+        self._fmt_combo.setToolTip(
+            "ダウンロード時に変換する音声形式（既にあるローカルファイル行には影響しない）"
+        )
         bar.addWidget(self._fmt_combo)
         self._auto_write = QCheckBox("自動書き込み")
         self._auto_write.setChecked(True)
+        self._auto_write.setToolTip(
+            "ON: 推定したタイトルをそのままタグへ書き込む\n"
+            "OFF: 「確認待ち」で止まり、確認・修正後に [選択行を書き込み] で書き込む"
+        )
         bar.addWidget(self._auto_write)
         bar.addStretch(1)
         settings_btn = QPushButton("設定")
@@ -205,11 +234,36 @@ class MainWindow(QMainWindow):
         root.addLayout(bar)
 
         # 上段の追加系ボタンと [設定] の幅を統一する（最長ラベル基準。
-        # 縦積みの列は自動で最長幅に揃うが、[設定] は別レイアウトなので明示する）
+        # グリッドの列幅を揃え、別レイアウトの [設定] も同じ幅にする）
         same_width = (add_btn, list_btn, file_btn, import_btn, settings_btn)
         width = max(b.sizeHint().width() for b in same_width)
         for b in same_width:
             b.setFixedWidth(width)
+
+        # LLM 未接続で DL のみの縮退モードへ切り替わったときの警告バナー
+        # （既定は非表示）。ステータスバー 1 行では見落とし、行が キュー の
+        # まま残る理由が分からなくなるため、テーブルの直上に目立つ色で出す。
+        # モーダルにはしない（DL 自体は続くので流れを止めない）
+        self._banner = QFrame()
+        self._banner.setVisible(False)
+        # 黄系背景 + 濃色文字を固定（ダークテーマの白文字で読めなくならないように）
+        self._banner.setStyleSheet(
+            "QFrame { background-color: #faf4c7; border: 1px solid #c8b860;"
+            " border-radius: 4px; }"
+            " QLabel { color: #202020; border: none; }"
+            " QPushButton { color: #202020; background: transparent; border: none; }"
+        )
+        banner_lay = QHBoxLayout(self._banner)
+        banner_lay.setContentsMargins(8, 4, 4, 4)
+        self._banner_label = QLabel("")
+        self._banner_label.setWordWrap(True)
+        banner_close = QPushButton("✕")
+        banner_close.setFixedWidth(24)
+        banner_close.setToolTip("この警告を閉じる")
+        banner_close.clicked.connect(lambda: self._banner.setVisible(False))
+        banner_lay.addWidget(self._banner_label, stretch=1)
+        banner_lay.addWidget(banner_close)
+        root.addWidget(self._banner)
 
         # 中央: テーブル
         self._view = _DropTableView(self)
@@ -255,7 +309,9 @@ class MainWindow(QMainWindow):
         )
         self._play_btn.clicked.connect(self._on_preview)
         self._seek_slider = QSlider(Qt.Orientation.Horizontal)
-        self._seek_slider.setRange(0, 0)
+        # range(0,0) だと macOS では溝ごと描画されず「何も無い空白」に見える
+        # ため、待機中も 0-1 のダミー範囲で溝だけ出しておく
+        self._seek_slider.setRange(0, 1)
         self._seek_slider.setToolTip("ドラッグで再生位置を移動")
         self._seek_slider.sliderMoved.connect(self._on_seek)
         self._time_label = QLabel("0:00 / 0:00")
@@ -331,8 +387,34 @@ class MainWindow(QMainWindow):
         # 過去のコマンドは無効（別の行に復元されてしまう）。行削除・差し替え
         # （rowsRemoved）とソート（layoutChanged）でスタックを破棄する。
         # 末尾への行追加(rowsInserted のみ)は既存行がずれないので対象外。
-        self._model.rowsRemoved.connect(lambda *_: self._undo.clear())
-        self._model.layoutChanged.connect(lambda *_: self._undo.clear())
+        self._model.rowsRemoved.connect(lambda *_: self._clear_undo_history())
+        self._model.layoutChanged.connect(lambda *_: self._clear_undo_history())
+
+    def _clear_undo_history(self) -> None:
+        """行の並び・構成の変化で無効になった undo 履歴を破棄する。
+
+        ソートや行削除の直後に黙って Ctrl+Z が効かなくなると不可解なため、
+        履歴があった場合だけステータスバーで知らせる（パイプライン実行中の
+        行差し替えでは進捗表示を上書きしない）。
+        """
+        had_history = self._undo.count() > 0
+        self._undo.clear()
+        if had_history and not self._running:
+            self.statusBar().showMessage(
+                "行の並び・構成が変わったため、編集履歴（元に戻す）をクリアしました"
+            )
+
+    def eventFilter(self, obj, event) -> bool:
+        """URL 欄の Ctrl+Enter（mac は ⌘+Enter）で [追加] を実行する。"""
+        if (
+            obj is self._url_edit
+            and event.type() == QEvent.Type.KeyPress
+            and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            self._on_add_urls()
+            return True
+        return super().eventFilter(obj, event)
 
     # -- 行追加系 ------------------------------------------------------------
 
@@ -406,15 +488,18 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg)
 
     def _on_import_dir(self) -> None:
-        files = core.list_music_files()
+        # 取り込み元は設定の保存先フォルダに合わせる（既定は core.FILES_DIR）。
+        # FILES_DIR 固定だと保存先を変えたときにボタンの対象と食い違う
+        target = self._out_dir or core.FILES_DIR
+        files = core.list_music_files(target)
         if not files:
-            self.statusBar().showMessage(f"{core.FILES_DIR} に音声ファイルがありません")
+            self.statusBar().showMessage(f"{target} に音声ファイルがありません")
             return
         n = self.add_files(files)
         if n:
-            self.statusBar().showMessage(f"files/ から {n} 件を取り込みました")
+            self.statusBar().showMessage(f"{target.name}/ から {n} 件を取り込みました")
         else:
-            self.statusBar().showMessage("files/ のファイルはすべて取り込み済みです")
+            self.statusBar().showMessage(f"{target.name}/ のファイルはすべて取り込み済みです")
 
     # -- パイプライン起動 ----------------------------------------------------
 
@@ -522,6 +607,9 @@ class MainWindow(QMainWindow):
         worker.signals.write_summary.connect(
             self._on_write_summary, Qt.ConnectionType.QueuedConnection
         )
+        worker.signals.stage_summary.connect(
+            self._on_stage_summary, Qt.ConnectionType.QueuedConnection
+        )
         worker.signals.finished.connect(self._on_worker_finished, Qt.ConnectionType.QueuedConnection)
         self._set_running(True)
         self.statusBar().showMessage(message)
@@ -533,16 +621,30 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"エラー: {message}")
 
     def _on_connection_failed(self, message: str) -> None:
-        """LLM 未接続 → DL のみの縮退モードへ切り替わったときの通知。"""
+        """LLM 未接続 → DL のみの縮退モードへ切り替わったときの通知。
+
+        ステータスバーは見落としやすいので、テーブル上部のバナーにも出す
+        （次の実行開始時に自動で消える。✕ でも閉じられる）。
+        """
         self.statusBar().showMessage(
             f"LLM エンドポイントに接続できません。DL のみ実行します（{message}）"
         )
+        self._banner_label.setText(
+            "LLM エンドポイントに接続できないため、ダウンロードのみ実行しました。"
+            "行は「キュー」のまま残っています。サーバ起動後（または [設定] の接続設定を"
+            f"確認後）にもう一度 [▶ 実行] すると推定から続きが処理されます。（{message}）"
+        )
+        self._banner.setVisible(True)
 
     def _on_write_summary(self, done: int, skipped: int, errors: int) -> None:
         """書き込み結果の集計をステータスバーに表示（完了が分かりづらい問題の対策）。"""
         self.statusBar().showMessage(
             f"書き込み: 完了 {done} 件 / スキップ {skipped} 件 / 失敗 {errors} 件"
         )
+
+    def _on_stage_summary(self, stage: str, done: int, errors: int) -> None:
+        """情報取得 / DL 段の集計を表示する（失敗が「完了」に埋もれないように）。"""
+        self.statusBar().showMessage(f"{stage}: 完了 {done} 件 / 失敗 {errors} 件")
 
     def _on_worker_finished(self) -> None:
         self._set_running(False)
@@ -696,9 +798,13 @@ class MainWindow(QMainWindow):
         self._update_time_label(position_ms)
 
     def _on_player_duration(self, duration_ms: int) -> None:
-        """曲の長さが確定したらシークバーの範囲と時間表示を更新する。"""
+        """曲の長さが確定したらシークバーの範囲と時間表示を更新する。
+
+        下限 1 を保つのは、range(0,0) だと macOS でスライダーの溝ごと
+        消えるため（停止時に duration 0 が飛んでくることがある）。
+        """
         self._duration_ms = duration_ms
-        self._seek_slider.setRange(0, max(0, duration_ms))
+        self._seek_slider.setRange(0, max(1, duration_ms))
         self._update_time_label(self._seek_slider.value())
 
     def _update_time_label(self, position_ms: int) -> None:
@@ -720,6 +826,8 @@ class MainWindow(QMainWindow):
         if running:
             # 実行中は対象ファイルが変換で書き換わり得るため試聴を止める
             self._player.stop()
+            # 前回の縮退モード警告は再実行で解消され得るため自動で消す
+            self._banner.setVisible(False)
         for b in self._busy_buttons:
             b.setEnabled(not running)
         self._seek_slider.setEnabled(not running)
@@ -853,6 +961,8 @@ class MainWindow(QMainWindow):
         write.triggered.connect(self._on_write_selected)
         delete = menu.addAction("行削除")
         delete.triggered.connect(self._on_delete_rows)
+        retry = menu.addAction("エラー行を再試行待ちに戻す")
+        retry.triggered.connect(self._on_reset_errors)
         menu.addSeparator()
         open_url = menu.addAction("URL をブラウザで開く")
         open_url.triggered.connect(self._on_open_urls)
@@ -860,10 +970,27 @@ class MainWindow(QMainWindow):
         # 実行中は破壊的/パイプライン操作を無効化
         for act in (reinfer, write, delete):
             act.setEnabled(bool(rows) and not self._running)
+        # 選択行に ERROR がある場合のみ有効
+        has_error = any(self._model.track_at(r).status is Status.ERROR for r in rows)
+        retry.setEnabled(has_error and not self._running)
         # url を持つ選択行が 1 つでもあれば有効
         has_url = any(self._model.track_at(r).url for r in rows)
         open_url.setEnabled(has_url)
         return menu
+
+    def _on_reset_errors(self) -> None:
+        """選択中のエラー行を再試行待ちへ戻す（再処理は [▶ 実行] などで）。"""
+        if self._running:
+            return
+        rows = [
+            r for r in self._selected_rows() if self._model.track_at(r).status is Status.ERROR
+        ]
+        for row in rows:
+            self._model.reset_error(row)
+        if rows:
+            self.statusBar().showMessage(
+                f"{len(rows)} 行を再試行待ちに戻しました（[▶ 実行] で再処理されます）"
+            )
 
     def _on_open_urls(self) -> None:
         """選択行の url をブラウザで開く。"""
@@ -963,12 +1090,36 @@ class MainWindow(QMainWindow):
 
 
 class _DropTableView(QTableView):
-    """対応拡張子のローカルファイルをドロップで行追加できる QTableView。"""
+    """対応拡張子のローカルファイルをドロップで行追加できる QTableView。
+
+    行が 1 つも無いときは、主フローとドロップ対応（見た目からは分からない）
+    の案内文を描画する（paintEvent）。
+    """
+
+    _EMPTY_HINT = (
+        "URL を貼って [追加] → [▶ 実行] でダウンロードとタイトル付けが始まります\n\n"
+        "音声ファイルや URL リスト (.txt) をここへドロップしても追加できます"
+    )
 
     def __init__(self, window: MainWindow):
         super().__init__()
         self._window = window
         self.setAcceptDrops(True)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        model = self.model()
+        if model is not None and model.rowCount() == 0:
+            painter = QPainter(self.viewport())
+            color = self.palette().text().color()
+            color.setAlphaF(0.5)  # 薄字（プレースホルダ相当）
+            painter.setPen(color)
+            painter.drawText(
+                self.viewport().rect(),
+                Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                self._EMPTY_HINT,
+            )
+            painter.end()
 
     def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasUrls():
