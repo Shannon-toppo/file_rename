@@ -263,6 +263,17 @@ def test_context_menu_open_url_enabled_with_url(main_window):
     assert open_url.isEnabled()
 
 
+def test_sort_with_history_notifies_undo_clear(main_window):
+    """編集履歴がある状態でソートすると、履歴破棄がステータスバーへ通知される。"""
+    win = main_window
+    win._model.add_tracks([Track(stem="b"), Track(stem="a")])
+    win.push_edit(0, COL_TITLE, "edited")
+    assert win._undo.count() == 1
+    win._model.sort(COL_STEM)
+    assert win._undo.count() == 0
+    assert "編集履歴" in win.statusBar().currentMessage()
+
+
 def test_context_menu_retry_enabled_only_for_error_rows(main_window):
     win = main_window
     win._model.add_tracks(

@@ -332,11 +332,11 @@ def test_apply_color_scheme_mapping(qtbot, monkeypatch):
 
 
 def test_toolbar_buttons_have_uniform_width(main_window):
-    """追加 / ファイル追加 / files/ 取り込み / 設定 の 4 ボタンは同じ幅。"""
+    """追加 / ファイル追加 / 保存先から取り込み / 設定 の 4 ボタンは同じ幅。"""
     from PySide6.QtWidgets import QPushButton
 
     win = main_window
-    labels = {"追加", "ファイル追加", "files/ 取り込み", "設定"}
+    labels = {"追加", "ファイル追加", "保存先から取り込み", "設定"}
     buttons = [b for b in win.findChildren(QPushButton) if b.text() in labels]
     assert len(buttons) == 4
     widths = {b.width() for b in buttons}

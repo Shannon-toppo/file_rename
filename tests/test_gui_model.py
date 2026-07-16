@@ -365,6 +365,57 @@ def test_main_window_delete_and_dropped_paths(qtbot, tmp_path):
     assert win._model.rowCount() == 1
 
 
+def test_main_window_ctrl_enter_adds_urls(qtbot):
+    """URL 欄で Ctrl+Enter を押すと [追加] と同じく行が追加される。
+
+    キーイベントを QApplication 経由でディスパッチすると、Qt が修飾キー
+    状態（keyboardModifiers）をグローバルにキャッシュしてテストをまたいで
+    残り、後続テストの selectRow がトグル選択化する。ここではディスパッチを
+    通さず eventFilter を直接呼んで判定ロジックを検証する。
+    """
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    from gui.main_window import MainWindow
+
+    win = MainWindow(restore_settings=False)
+    qtbot.addWidget(win)
+    win._url_edit.setPlainText("http://a\nhttp://b")
+    press = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.ControlModifier
+    )
+    assert win.eventFilter(win._url_edit, press) is True  # 消費される
+    assert win._model.rowCount() == 2
+    assert win._url_edit.toPlainText() == ""  # 追加後はクリアされる
+    # 修飾なしの Enter は改行としてエディタに渡る（消費しない）
+    plain = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier)
+    assert win.eventFilter(win._url_edit, plain) is False
+
+
+def test_main_window_import_dir_uses_out_dir(qtbot, tmp_path):
+    """[保存先から取り込み] は設定の保存先フォルダを対象にする。"""
+    from gui.main_window import MainWindow
+
+    win = MainWindow(restore_settings=False)
+    qtbot.addWidget(win)
+    (tmp_path / "song.mp3").write_bytes(b"\x00")
+    win._out_dir = tmp_path
+    win._on_import_dir()
+    assert win._model.rowCount() == 1
+    assert win._model.track_at(0).filepath == tmp_path / "song.mp3"
+
+
+def test_main_window_empty_hint_paints_without_error(qtbot):
+    """空テーブルの案内文描画（paintEvent）が行の有無どちらでも例外を出さない。"""
+    from gui.main_window import MainWindow
+
+    win = MainWindow(restore_settings=False)
+    qtbot.addWidget(win)
+    assert not win._view.grab().isNull()  # 0 行（ヒント描画パス）
+    win.add_urls(["http://a"])
+    assert not win._view.grab().isNull()  # 1 行（通常描画パス）
+
+
 def test_main_window_connection_failed_shows_banner(qtbot):
     """LLM 未接続の縮退通知でバナーが表示され、次の実行開始で自動的に消える。"""
     from gui.main_window import MainWindow

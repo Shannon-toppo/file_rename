@@ -11,13 +11,14 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QItemSelectionModel, QRect, QSettings, Qt, QThreadPool, QUrl
+from PySide6.QtCore import QEvent, QItemSelectionModel, QRect, QSettings, Qt, QThreadPool, QUrl
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
     QDropEvent,
     QGuiApplication,
     QKeySequence,
+    QPainter,
     QUndoStack,
 )
 from PySide6.QtWidgets import (
@@ -154,8 +155,14 @@ class MainWindow(QMainWindow):
         # 上段: URL 入力 + 追加系ボタン
         top = QHBoxLayout()
         self._url_edit = QPlainTextEdit()
-        self._url_edit.setPlaceholderText("URL を改行区切りで貼り付け（複数可）")
+        self._url_edit.setPlaceholderText(
+            "URL を改行区切りで貼り付け（複数可、Ctrl+Enter で追加）"
+        )
         self._url_edit.setFixedHeight(64)  # 3 行程度
+        # Ctrl+Enter（mac は ⌘+Enter）で貼り付け→追加が手だけで完結する。
+        # QShortcut はフォーカス経由の発火なので、キーイベントを直接見る
+        # イベントフィルタにする（eventFilter を参照）
+        self._url_edit.installEventFilter(self)
         top.addWidget(self._url_edit, stretch=1)
 
         btn_col = QVBoxLayout()
@@ -168,7 +175,11 @@ class MainWindow(QMainWindow):
         list_btn.clicked.connect(self._on_load_list)
         file_btn = QPushButton("ファイル追加")
         file_btn.clicked.connect(self._on_add_files)
-        import_btn = QPushButton("files/ 取り込み")
+        import_btn = QPushButton("保存先から取り込み")
+        import_btn.setToolTip(
+            "保存先フォルダ（[設定] で変更可。既定は files/）にある音声ファイルを"
+            "まとめて追加する（追加済みの行は増えない）"
+        )
         import_btn.clicked.connect(self._on_import_dir)
         for b in (add_btn, list_btn, file_btn, import_btn):
             btn_col.addWidget(b)
@@ -178,6 +189,10 @@ class MainWindow(QMainWindow):
         # ツールバー行: 実行 / 停止 / 形式 / 自動書き込み
         bar = QHBoxLayout()
         self._run_btn = QPushButton("▶ 実行")
+        self._run_btn.setToolTip(
+            "URL 行のダウンロード → タイトル推定 → タグ書き込みまでを一括実行する\n"
+            "（自動書き込み OFF のときは「確認待ち」で止まる）"
+        )
         self._run_btn.clicked.connect(self._on_run)
         self._stop_btn = QPushButton("■ 停止")
         self._stop_btn.clicked.connect(self._on_stop)
@@ -192,12 +207,22 @@ class MainWindow(QMainWindow):
         bar.addWidget(self._stop_btn)
         bar.addWidget(self._fetch_btn)
         bar.addSpacing(16)
+        # 裸のコンボだと何の形式か分からないためラベルを付ける
+        fmt_label = QLabel("DL形式:")
+        bar.addWidget(fmt_label)
         self._fmt_combo = QComboBox()
         self._fmt_combo.addItems(core.SUPPORTED_FORMATS)
         self._fmt_combo.setCurrentText("mp3")
+        self._fmt_combo.setToolTip(
+            "ダウンロード時に変換する音声形式（既にあるローカルファイル行には影響しない）"
+        )
         bar.addWidget(self._fmt_combo)
         self._auto_write = QCheckBox("自動書き込み")
         self._auto_write.setChecked(True)
+        self._auto_write.setToolTip(
+            "ON: 推定したタイトルをそのままタグへ書き込む\n"
+            "OFF: 「確認待ち」で止まり、確認・修正後に [選択行を書き込み] で書き込む"
+        )
         bar.addWidget(self._auto_write)
         bar.addStretch(1)
         settings_btn = QPushButton("設定")
@@ -281,7 +306,9 @@ class MainWindow(QMainWindow):
         )
         self._play_btn.clicked.connect(self._on_preview)
         self._seek_slider = QSlider(Qt.Orientation.Horizontal)
-        self._seek_slider.setRange(0, 0)
+        # range(0,0) だと macOS では溝ごと描画されず「何も無い空白」に見える
+        # ため、待機中も 0-1 のダミー範囲で溝だけ出しておく
+        self._seek_slider.setRange(0, 1)
         self._seek_slider.setToolTip("ドラッグで再生位置を移動")
         self._seek_slider.sliderMoved.connect(self._on_seek)
         self._time_label = QLabel("0:00 / 0:00")
@@ -357,8 +384,34 @@ class MainWindow(QMainWindow):
         # 過去のコマンドは無効（別の行に復元されてしまう）。行削除・差し替え
         # （rowsRemoved）とソート（layoutChanged）でスタックを破棄する。
         # 末尾への行追加(rowsInserted のみ)は既存行がずれないので対象外。
-        self._model.rowsRemoved.connect(lambda *_: self._undo.clear())
-        self._model.layoutChanged.connect(lambda *_: self._undo.clear())
+        self._model.rowsRemoved.connect(lambda *_: self._clear_undo_history())
+        self._model.layoutChanged.connect(lambda *_: self._clear_undo_history())
+
+    def _clear_undo_history(self) -> None:
+        """行の並び・構成の変化で無効になった undo 履歴を破棄する。
+
+        ソートや行削除の直後に黙って Ctrl+Z が効かなくなると不可解なため、
+        履歴があった場合だけステータスバーで知らせる（パイプライン実行中の
+        行差し替えでは進捗表示を上書きしない）。
+        """
+        had_history = self._undo.count() > 0
+        self._undo.clear()
+        if had_history and not self._running:
+            self.statusBar().showMessage(
+                "行の並び・構成が変わったため、編集履歴（元に戻す）をクリアしました"
+            )
+
+    def eventFilter(self, obj, event) -> bool:
+        """URL 欄の Ctrl+Enter（mac は ⌘+Enter）で [追加] を実行する。"""
+        if (
+            obj is self._url_edit
+            and event.type() == QEvent.Type.KeyPress
+            and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            self._on_add_urls()
+            return True
+        return super().eventFilter(obj, event)
 
     # -- 行追加系 ------------------------------------------------------------
 
@@ -432,15 +485,18 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg)
 
     def _on_import_dir(self) -> None:
-        files = core.list_music_files()
+        # 取り込み元は設定の保存先フォルダに合わせる（既定は core.FILES_DIR）。
+        # FILES_DIR 固定だと保存先を変えたときにボタンの対象と食い違う
+        target = self._out_dir or core.FILES_DIR
+        files = core.list_music_files(target)
         if not files:
-            self.statusBar().showMessage(f"{core.FILES_DIR} に音声ファイルがありません")
+            self.statusBar().showMessage(f"{target} に音声ファイルがありません")
             return
         n = self.add_files(files)
         if n:
-            self.statusBar().showMessage(f"files/ から {n} 件を取り込みました")
+            self.statusBar().showMessage(f"{target.name}/ から {n} 件を取り込みました")
         else:
-            self.statusBar().showMessage("files/ のファイルはすべて取り込み済みです")
+            self.statusBar().showMessage(f"{target.name}/ のファイルはすべて取り込み済みです")
 
     # -- パイプライン起動 ----------------------------------------------------
 
@@ -739,9 +795,13 @@ class MainWindow(QMainWindow):
         self._update_time_label(position_ms)
 
     def _on_player_duration(self, duration_ms: int) -> None:
-        """曲の長さが確定したらシークバーの範囲と時間表示を更新する。"""
+        """曲の長さが確定したらシークバーの範囲と時間表示を更新する。
+
+        下限 1 を保つのは、range(0,0) だと macOS でスライダーの溝ごと
+        消えるため（停止時に duration 0 が飛んでくることがある）。
+        """
         self._duration_ms = duration_ms
-        self._seek_slider.setRange(0, max(0, duration_ms))
+        self._seek_slider.setRange(0, max(1, duration_ms))
         self._update_time_label(self._seek_slider.value())
 
     def _update_time_label(self, position_ms: int) -> None:
@@ -1027,12 +1087,36 @@ class MainWindow(QMainWindow):
 
 
 class _DropTableView(QTableView):
-    """対応拡張子のローカルファイルをドロップで行追加できる QTableView。"""
+    """対応拡張子のローカルファイルをドロップで行追加できる QTableView。
+
+    行が 1 つも無いときは、主フローとドロップ対応（見た目からは分からない）
+    の案内文を描画する（paintEvent）。
+    """
+
+    _EMPTY_HINT = (
+        "URL を貼って [追加] → [▶ 実行] でダウンロードとタイトル付けが始まります\n\n"
+        "音声ファイルや URL リスト (.txt) をここへドロップしても追加できます"
+    )
 
     def __init__(self, window: MainWindow):
         super().__init__()
         self._window = window
         self.setAcceptDrops(True)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        model = self.model()
+        if model is not None and model.rowCount() == 0:
+            painter = QPainter(self.viewport())
+            color = self.palette().text().color()
+            color.setAlphaF(0.5)  # 薄字（プレースホルダ相当）
+            painter.setPen(color)
+            painter.drawText(
+                self.viewport().rect(),
+                Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                self._EMPTY_HINT,
+            )
+            painter.end()
 
     def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasUrls():
