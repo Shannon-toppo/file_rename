@@ -224,6 +224,21 @@ def make_client() -> LLMClient:
     return LLMClient(Config.from_env())
 
 
+def _model_aliases(model_id: str) -> set[str]:
+    """LM Studio が同一モデルとして解決する表記ゆれを列挙する。
+
+    /models が返す id は publisher 付き（例: "google/gemma-4-e2b"）だが、
+    LM Studio は publisher を省いた "gemma-4-e2b" や量子化サフィックス付きの
+    "...@q4_k_m" でも同じモデルに解決する。素朴な完全一致で比べると、
+    実際には推論できる設定でも「一覧にありません」と誤警告になる。
+    """
+    base = model_id.strip().lower().split("@", 1)[0]
+    aliases = {base}
+    if "/" in base:
+        aliases.add(base.rsplit("/", 1)[1])
+    return {a for a in aliases if a}
+
+
 def check_connection(timeout: float = 3.0) -> tuple[bool, str]:
     """LLM エンドポイントの疎通を確認する（補完呼び出しはしない軽量チェック）。
 
@@ -264,10 +279,14 @@ def check_connection(timeout: float = 3.0) -> tuple[bool, str]:
             "BASE_URL のパス（例: 末尾の /v1）が正しいか確認してください。"
         )
     # 使用するモデル名がサーバーの一覧に無ければ注意を添える。MODEL 未設定の
-    # まま既定値で推論だけ失敗する事故に気付けるように。LM Studio はエイリアス
-    # 解決で通ることもあるため、NG（接続失敗）にはしない
-    ids = {m.get("id") for m in payload["data"] if isinstance(m, dict)}
-    if ids and config.model not in ids:
+    # まま既定値で推論だけ失敗する事故に気付けるように。比較は _model_aliases
+    # 経由（publisher 省略・量子化サフィックスの表記ゆれを吸収）。それでも
+    # LM Studio 側で解決できることはあるため、NG（接続失敗）にはしない
+    ids: set[str] = set()
+    for m in payload["data"]:
+        if isinstance(m, dict) and isinstance(m.get("id"), str):
+            ids |= _model_aliases(m["id"])
+    if ids and not (_model_aliases(config.model or "") & ids):
         return True, (
             f"接続 OK: {config.base_url}（注意: モデル '{config.model}' は"
             "サーバーのモデル一覧にありません。[設定] の MODEL を確認してください）"

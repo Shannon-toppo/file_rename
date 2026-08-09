@@ -592,6 +592,24 @@ def test_check_connection_model_in_list_no_warning(monkeypatch):
     assert "注意" not in msg
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gemma-4-e2b",  # publisher 省略（LM Studio の設定画面はこの表記）
+        "Gemma-4-E2B",  # 大文字小文字の揺れ
+        "google/gemma-4-e2b@q4_k_m",  # 量子化サフィックス付き
+        "google/gemma-4-e2b",  # 完全一致
+    ],
+)
+def test_check_connection_model_alias_no_warning(monkeypatch, model):
+    """publisher 省略などの表記ゆれを一覧と同一視する（誤警告の防止）。"""
+    _fake_config(monkeypatch, model=model)
+    _fake_urlopen(monkeypatch, b'{"data": [{"id": "google/gemma-4-e2b"}]}')
+    ok, msg = core.check_connection()
+    assert ok
+    assert "注意" not in msg
+
+
 def test_check_connection_warns_on_unknown_model(monkeypatch):
     """使用モデルが一覧に無ければ OK のままモデル名入りの注意を添える。
 
