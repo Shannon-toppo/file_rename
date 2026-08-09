@@ -8,12 +8,13 @@ Qt はオフスクリーン（conftest.py で QT_QPA_PLATFORM=offscreen）。
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QCoreApplication, Qt
+from PySide6.QtCore import QCoreApplication, QItemSelectionModel, Qt
 
 from core import Status, Track
 from gui.clipboard import resolve_paste_targets, selection_to_tsv
 from gui.commands import ClearTitleCommand, EditTitleCommand
 from gui.model import (
+    COL_ARTIST,
     COL_CHANNEL,
     COL_STEM,
     COL_TITLE,
@@ -362,3 +363,130 @@ def test_editing_disabled_while_running(main_window):
     assert win._view.editTriggers() == QAbstractItemView.EditTrigger.NoEditTriggers
     win._set_running(False)
     assert win._view.editTriggers() == win._edit_triggers
+
+
+# ---------------------------------------------------------------------------
+# フィルハンドル（Excel 風のドラッグコピー）
+# ---------------------------------------------------------------------------
+
+
+def test_fill_anchor_only_for_editable_columns(main_window):
+    win = main_window
+    win._model.add_tracks([Track(stem="s1"), Track(stem="s2")])
+    # 編集不可列（元タイトル）にいる間はハンドルを出さない
+    win._view.setCurrentIndex(win._model.index(0, COL_STEM))
+    assert win._view.fill_anchor() is None
+    win._view.setCurrentIndex(win._model.index(0, COL_ARTIST))
+    assert win._view.fill_anchor() == (COL_ARTIST, 0, 0)
+
+
+def test_fill_anchor_uses_contiguous_selection(main_window):
+    win = main_window
+    win._model.add_tracks([Track(stem=f"s{i}") for i in range(4)])
+    flags = (
+        QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+    )
+    sel = win._view.selectionModel()
+    # 実際の操作（アーティスト列をクリック → Shift+クリックで範囲選択）と同じく、
+    # 現在セルを列ごと保ったまま複数行を選択した状態にする
+    sel.setCurrentIndex(win._model.index(0, COL_ARTIST), flags)
+    sel.select(win._model.index(1, COL_ARTIST), flags)
+    assert win._view.fill_anchor() == (COL_ARTIST, 0, 1)
+
+
+def test_fill_from_handle_copies_down(main_window):
+    win = main_window
+    win._model.add_tracks([Track(stem=f"s{i}") for i in range(4)])
+    win._model.set_artist(0, "アーティストA")
+    n = win.fill_from_handle(COL_ARTIST, 0, 0, 3)
+    assert n == 3
+    assert [win._model.track_at(r).artist for r in range(4)] == ["アーティストA"] * 4
+    # macro なので 1 回の undo でまとめて戻る
+    win._undo.undo()
+    assert [win._model.track_at(r).artist for r in range(1, 4)] == ["", "", ""]
+
+
+def test_fill_from_handle_repeats_pattern(main_window):
+    win = main_window
+    win._model.add_tracks([Track(stem=f"s{i}") for i in range(5)])
+    win._model.set_artist(0, "A")
+    win._model.set_artist(1, "B")
+    win.fill_from_handle(COL_ARTIST, 0, 1, 4)
+    assert [win._model.track_at(r).artist for r in range(5)] == ["A", "B", "A", "B", "A"]
+
+
+def test_fill_from_handle_upward(main_window):
+    win = main_window
+    win._model.add_tracks([Track(stem=f"s{i}") for i in range(4)])
+    win._model.set_artist(3, "Z")
+    n = win.fill_from_handle(COL_ARTIST, 3, 3, 0)
+    assert n == 3
+    assert [win._model.track_at(r).artist for r in range(4)] == ["Z"] * 4
+
+
+def test_fill_from_handle_title_column_marks_manual(main_window):
+    win = main_window
+    win._model.add_tracks([Track(stem="s1"), Track(stem="s2")])
+    win._model.set_title(0, "曲名")
+    win.fill_from_handle(COL_TITLE, 0, 0, 1)
+    t = win._model.track_at(1)
+    assert t.guessed_title == "曲名"
+    assert t.manual is True
+
+
+def test_fill_from_handle_noop_inside_source(main_window):
+    win = main_window
+    win._model.add_tracks([Track(stem="s1"), Track(stem="s2")])
+    win._model.set_artist(0, "A")
+    assert win.fill_from_handle(COL_ARTIST, 0, 0, 0) == 0
+    assert win._model.track_at(1).artist == ""
+
+
+def test_fill_from_handle_blocked_while_running(main_window):
+    win = main_window
+    win._model.add_tracks([Track(stem="s1"), Track(stem="s2")])
+    win._model.set_artist(0, "A")
+    win._set_running(True)
+    assert win.fill_from_handle(COL_ARTIST, 0, 0, 1) == 0
+    win._set_running(False)
+
+
+# ---------------------------------------------------------------------------
+# 行追加後の全選択
+# ---------------------------------------------------------------------------
+
+
+def test_add_urls_selects_all_rows(main_window):
+    win = main_window
+    win.add_urls(["http://a", "http://b"])
+    assert win._selected_rows() == [0, 1]
+    # 追加のたびに全行が選択状態に戻る
+    win.add_urls(["http://c"])
+    assert win._selected_rows() == [0, 1, 2]
+
+
+def test_fill_handle_hidden_while_running(main_window):
+    win = main_window
+    win._model.add_tracks([Track(stem="s1"), Track(stem="s2")])
+    win._view.setCurrentIndex(win._model.index(0, COL_ARTIST))
+    assert win._view.fill_anchor() is not None
+    win._set_running(True)
+    assert win._view.fill_anchor() is None
+    win._set_running(False)
+    assert win._view.fill_anchor() is not None
+
+
+def test_fill_handle_drag_fills_range(main_window, qtbot):
+    """ハンドルを掴んで下へドラッグ → 離すまでの一連の操作で値がコピーされる。"""
+    win = main_window
+    win._model.add_tracks([Track(stem=f"s{i}") for i in range(3)])
+    win._model.set_artist(0, "A")
+    win._view.setCurrentIndex(win._model.index(0, COL_ARTIST))
+    view = win._view
+    handle = view.fill_handle_rect()
+    assert handle is not None
+    target = view.visualRect(win._model.index(2, COL_ARTIST)).center()
+    qtbot.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=handle.center())
+    qtbot.mouseMove(view.viewport(), pos=target)
+    qtbot.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, pos=target)
+    assert [win._model.track_at(r).artist for r in range(3)] == ["A", "A", "A"]

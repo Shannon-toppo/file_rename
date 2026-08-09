@@ -21,6 +21,12 @@ COL_FORMAT = 5  # 形式（拡張子）
 _HEADERS = ("元タイトル", "チャンネル", "推定タイトル", "アーティスト", "状態", "形式")
 # 編集可能な列（クリップボード貼り付け・デリゲートで共用）
 EDITABLE_COLUMNS = (COL_TITLE, COL_ARTIST)
+# 列ヘッダのツールチップ（編集可能列だけ。フィルハンドルの操作案内を兼ねる）
+_FILL_TIP = "セル右下の■を上下にドラッグすると、その範囲へ値をコピーできます（Excel と同じ）"
+_HEADER_TIPS = {
+    COL_TITLE: f"推定タイトル（ダブルクリックで編集）。{_FILL_TIP}",
+    COL_ARTIST: f"アーティスト（推定はしない。ダブルクリックで編集）。{_FILL_TIP}",
+}
 # 値は書き換えないが、読み取り専用エディタを開いて本文の部分選択・コピーを許す列。
 # EDITABLE_COLUMNS とは別扱い（貼り付け対象にはしない）。
 COPYABLE_COLUMNS = (COL_STEM,)
@@ -69,6 +75,9 @@ class TrackTableModel(QAbstractTableModel):
         return len(_HEADERS)
 
     def headerData(self, section: int, orientation, role: int = Qt.ItemDataRole.DisplayRole):
+        if role == Qt.ItemDataRole.ToolTipRole and orientation == Qt.Orientation.Horizontal:
+            # フィルハンドルは見た目だけでは気づきにくいので、ヘッダで案内する
+            return _HEADER_TIPS.get(section)
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         if orientation == Qt.Orientation.Horizontal:

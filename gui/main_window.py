@@ -19,6 +19,8 @@ from PySide6.QtGui import (
     QGuiApplication,
     QKeySequence,
     QPainter,
+    QPalette,
+    QPen,
     QUndoStack,
 )
 from PySide6.QtWidgets import (
@@ -49,10 +51,30 @@ from core import Status, Track
 from .clipboard import resolve_paste_targets, selection_to_tsv
 from .commands import ClearTitleCommand, EditArtistCommand, EditTitleCommand
 from .logpanel import LogPanel, QtLogHandler, attach_handler, detach_handler
-from .model import COL_ARTIST, COL_STATUS, COL_STEM, COL_TITLE, PERCENT_ROLE, TrackTableModel
+from .model import (
+    COL_ARTIST,
+    COL_STATUS,
+    COL_STEM,
+    COL_TITLE,
+    EDITABLE_COLUMNS,
+    PERCENT_ROLE,
+    TrackTableModel,
+)
 from .player import PreviewPlayer, format_time
 from .settings_dialog import SettingsDialog
 from .workers import MODE_FETCH, MODE_FULL, MODE_INFER, MODE_WRITE, PipelineWorker
+
+
+# 選択行のハイライト色。テーマ既定の色は淡く、特に非アクティブ時（フォーカスが
+# 他ウィジェットにあるとき）は色付き行の上でほとんど見えないため固定する
+_SELECTION_BG = QColor(47, 111, 208)  # 濃い青
+_SELECTION_TEXT = QColor(255, 255, 255)
+# フィルハンドル（選択セル右下の小さな四角）の見た目。白地 + 濃紺の枠にする
+# ことで、選択行（濃い青）の上でも未選択行（白/淡色）の上でも見える
+_FILL_HANDLE_PX = 9
+_FILL_HANDLE_BG = QColor(255, 255, 255)
+_FILL_HANDLE_BORDER = QColor(20, 60, 120)
+_FILL_PREVIEW_PEN = QColor(47, 111, 208)
 
 
 def apply_color_scheme(name: str) -> None:
@@ -270,6 +292,17 @@ class MainWindow(QMainWindow):
         self._view.setModel(self._model)
         self._view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        # 選択行を分かりやすくする: ハイライト色を明示し、非アクティブ状態
+        # （ボタンを押した直後などフォーカスがテーブル外にあるとき）でも
+        # 同じ色で塗る。既定の Inactive パレットは淡いグレーで、状態色
+        # （緑/黄/赤）の行に重なるとほぼ判別できないため。
+        pal = self._view.palette()
+        for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+            pal.setColor(group, QPalette.ColorRole.Highlight, _SELECTION_BG)
+            pal.setColor(group, QPalette.ColorRole.HighlightedText, _SELECTION_TEXT)
+        self._view.setPalette(pal)
+        # 行番号（縦ヘッダ）側も選択行を強調する（行単位の選択を目で追いやすく）
+        self._view.verticalHeader().setHighlightSections(True)
         self._view.horizontalHeader().setStretchLastSection(True)
         self._view.setColumnWidth(COL_STEM, 240)
         self._view.setColumnWidth(COL_TITLE, 200)
@@ -419,9 +452,13 @@ class MainWindow(QMainWindow):
     # -- 行追加系 ------------------------------------------------------------
 
     def add_urls(self, urls: list[str]) -> int:
-        """URL ごとにプレースホルダ行を追加する。追加件数を返す。"""
+        """URL ごとにプレースホルダ行を追加する。追加件数を返す。
+
+        追加後は全行を選択状態にする（select_all_rows 参照）。
+        """
         tracks = [Track(stem=u, url=u, status=Status.QUEUED) for u in urls]
         self._model.add_tracks(tracks)
+        self.select_all_rows()
         return len(tracks)
 
     def add_files(self, paths: list[Path]) -> int:
@@ -441,7 +478,19 @@ class MainWindow(QMainWindow):
             existing.add(key)
             tracks.append(core.track_from_file(p))
         self._model.add_tracks(tracks)
+        self.select_all_rows()
         return len(tracks)
+
+    def select_all_rows(self) -> None:
+        """全行を選択状態にする（行追加後の既定状態）。
+
+        追加直後は選択が空で、[選択行を書き込み] などが「行が選択されて
+        いません」で空振りする。追加した行をすぐ操作対象にできるよう、
+        行を足したら全選択に戻す。
+        """
+        if self._model.rowCount() == 0:
+            return
+        self._view.selectAll()
 
     def _on_add_urls(self) -> None:
         text = self._url_edit.toPlainText()
@@ -839,6 +888,8 @@ class MainWindow(QMainWindow):
         self._view.setEditTriggers(
             self._edit_triggers if not running else QAbstractItemView.EditTrigger.NoEditTriggers
         )
+        # フィルハンドル（ドラッグコピー）も同じ理由で実行中は隠す
+        self._view.set_fill_enabled(not running)
 
     def _on_stop(self) -> None:
         self._cancel.set()
@@ -891,6 +942,48 @@ class MainWindow(QMainWindow):
             self._undo.push(EditArtistCommand(self._model, row, value))
         else:
             self._undo.push(EditTitleCommand(self._model, row, value))
+
+    def fill_from_handle(self, col: int, top: int, bottom: int, target_row: int) -> int:
+        """フィルハンドルのドラッグ結果を適用する。反映セル数を返す。
+
+        Excel と同じく、元セル（top..bottom 行）の値をドラッグ先の行へ
+        繰り返しコピーする（元が複数行ならパターンとして循環）。上方向へ
+        ドラッグした場合は下から順に対応させる。反映は Edit 系コマンドの
+        macro なので 1 回の undo で全部戻る。
+        """
+        if self._running or col not in EDITABLE_COLUMNS:
+            return 0
+        row_count = self._model.rowCount()
+        if row_count == 0:
+            return 0
+        target = max(0, min(target_row, row_count - 1))
+        source = [
+            str(self._model.data(self._model.index(r, col), Qt.ItemDataRole.EditRole) or "")
+            for r in range(top, bottom + 1)
+        ]
+        if target > bottom:  # 下方向: 元の並びのまま繰り返す
+            edits = [
+                (bottom + 1 + i, source[i % len(source)]) for i in range(target - bottom)
+            ]
+        elif target < top:  # 上方向: 元の末尾から逆順に対応させる
+            edits = [
+                (top - 1 - i, source[-1 - (i % len(source))]) for i in range(top - target)
+            ]
+        else:
+            return 0  # 元の範囲内で離した = 変更なし
+
+        self._undo.beginMacro("フィルコピー")
+        for row, value in edits:
+            self.push_edit(row, col, value)
+        self._undo.endMacro()
+        # Excel 同様、元セル + コピー先を選択状態にして続けて操作できるようにする。
+        # setCurrentIndex は選択をクリアするので、先に現在セルを移してから選択する
+        filled = [row for row, _ in edits]
+        current_row = max(filled) if target > bottom else min(filled)
+        self._view.setCurrentIndex(self._model.index(current_row, col))
+        self._select_rows(sorted(set(range(top, bottom + 1)) | set(filled)))
+        self.statusBar().showMessage(f"{len(edits)} 行にコピーしました")
+        return len(edits)
 
     def _on_fill_artists(self) -> None:
         """選択行（未選択なら全行）のアーティスト欄にチャンネル名をコピーする。
@@ -1094,6 +1187,11 @@ class _DropTableView(QTableView):
 
     行が 1 つも無いときは、主フローとドロップ対応（見た目からは分からない）
     の案内文を描画する（paintEvent）。
+
+    加えて Excel 風のフィルハンドルを持つ: 編集可能列（推定タイトル /
+    アーティスト）のセルにいるとき、選択範囲の右下に小さな四角を描き、
+    それを上下へドラッグすると元の値がその範囲へコピーされる
+    （実際の反映は MainWindow.fill_from_handle が undo コマンド経由で行う）。
     """
 
     _EMPTY_HINT = (
@@ -1105,6 +1203,79 @@ class _DropTableView(QTableView):
         super().__init__()
         self._window = window
         self.setAcceptDrops(True)
+        # ハンドル上でカーソル形状を変えるため、ボタン非押下の移動も受け取る
+        self.setMouseTracking(True)
+        # フィルハンドルのドラッグ状態: (列, 上端行, 下端行) と現在のドラッグ先行
+        self._fill_source: tuple[int, int, int] | None = None
+        self._fill_target: int | None = None
+        # パイプライン実行中は編集を止めるので、ハンドルも隠す（_set_running）
+        self._fill_enabled = True
+
+    def set_fill_enabled(self, enabled: bool) -> None:
+        """フィルハンドルの表示・操作可否を切り替える。"""
+        self._fill_enabled = enabled
+        if not enabled:
+            self._fill_source = None
+            self._fill_target = None
+        self.viewport().update()
+
+    def setModel(self, model) -> None:
+        super().setModel(model)
+        sel = self.selectionModel()
+        if sel is not None:
+            # ハンドルの位置は現在セル・選択範囲に追従するので、変化したら再描画
+            sel.currentChanged.connect(lambda *_: self.viewport().update())
+            sel.selectionChanged.connect(lambda *_: self.viewport().update())
+
+    # -- フィルハンドル ------------------------------------------------------
+
+    def fill_anchor(self) -> tuple[int, int, int] | None:
+        """フィルハンドルの基準 (列, 上端行, 下端行) を返す（対象外なら None）。
+
+        現在セルが編集可能列にあるときだけ有効。選択行が現在行を含む連続
+        範囲ならその範囲全体、そうでなければ現在行 1 行を元セルとする。
+        """
+        index = self.currentIndex()
+        model = self.model()
+        if not self._fill_enabled:
+            return None
+        if model is None or not index.isValid() or index.column() not in EDITABLE_COLUMNS:
+            return None
+        sel = self.selectionModel()
+        rows = sorted({i.row() for i in sel.selectedRows()}) if sel is not None else []
+        # 飛び飛びの選択は「どこからどこまで」が曖昧なので現在行だけを元にする
+        if rows and index.row() in rows and rows == list(range(rows[0], rows[-1] + 1)):
+            return index.column(), rows[0], rows[-1]
+        return index.column(), index.row(), index.row()
+
+    def fill_handle_rect(self) -> QRect | None:
+        """フィルハンドル（右下の四角）の矩形。表示できないときは None。"""
+        anchor = self.fill_anchor()
+        if anchor is None:
+            return None
+        col, _, bottom = anchor
+        rect = self.visualRect(self.model().index(bottom, col))
+        if rect.isEmpty():
+            return None  # スクロールで画面外
+        size = _FILL_HANDLE_PX
+        return QRect(rect.right() - size + 1, rect.bottom() - size + 1, size, size)
+
+    def _row_at(self, y: int) -> int:
+        """ビューポート座標 y の行番号。
+
+        ビューポートの外まで引いた場合は「表示中の端の 1 行先」を返す。
+        いきなり最終行まで飛ばさず、スクロール（mouseMoveEvent の scrollTo）
+        と合わせて 1 行ずつ伸ばすため。
+        """
+        row = self.rowAt(y)
+        if row >= 0:
+            return row
+        last = self.model().rowCount() - 1
+        if y < 0:  # 上へはみ出した
+            top = self.rowAt(0)
+            return max(0, top - 1) if top >= 0 else 0
+        bottom = self.rowAt(self.viewport().rect().bottom())
+        return last if bottom < 0 else min(bottom + 1, last)
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
@@ -1120,6 +1291,76 @@ class _DropTableView(QTableView):
                 self._EMPTY_HINT,
             )
             painter.end()
+            return
+        self._paint_fill_handle()
+
+    def _paint_fill_handle(self) -> None:
+        handle = self.fill_handle_rect()
+        if handle is None:
+            return
+        painter = QPainter(self.viewport())
+        # ドラッグ中はコピー先の範囲を枠線で示す（どこまで入るかの予告）
+        if self._fill_source is not None and self._fill_target is not None:
+            col, top, bottom = self._fill_source
+            first = min(top, self._fill_target)
+            last = max(bottom, self._fill_target)
+            area = self.visualRect(self.model().index(first, col)).united(
+                self.visualRect(self.model().index(last, col))
+            )
+            pen = QPen(_FILL_PREVIEW_PEN)
+            pen.setWidth(2)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(area.adjusted(1, 1, -1, -1))
+        painter.setPen(_FILL_HANDLE_BORDER)
+        painter.setBrush(_FILL_HANDLE_BG)
+        painter.drawRect(handle)
+        painter.end()
+
+    def mousePressEvent(self, event) -> None:
+        handle = self.fill_handle_rect()
+        pos = event.position().toPoint()
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and handle is not None
+            # 小さな四角なので当たり判定は少し広げる
+            and handle.adjusted(-2, -2, 2, 2).contains(pos)
+        ):
+            self._fill_source = self.fill_anchor()
+            self._fill_target = self._fill_source[2] if self._fill_source else None
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        pos = event.position().toPoint()
+        if self._fill_source is None:
+            # ハンドルの上ではカーソルを十字にして掴めることを示す
+            handle = self.fill_handle_rect()
+            if handle is not None and handle.adjusted(-2, -2, 2, 2).contains(pos):
+                self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                self.viewport().unsetCursor()
+            super().mouseMoveEvent(event)
+            return
+        self._fill_target = self._row_at(pos.y())
+        # ビューポート外までドラッグしたときに追従スクロールする
+        self.scrollTo(self.model().index(self._fill_target, self._fill_source[0]))
+        self.viewport().update()
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._fill_source is None:
+            super().mouseReleaseEvent(event)
+            return
+        col, top, bottom = self._fill_source
+        target = self._fill_target
+        self._fill_source = None
+        self._fill_target = None
+        self.viewport().update()
+        event.accept()
+        if target is not None:
+            self._window.fill_from_handle(col, top, bottom, target)
 
     def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasUrls():
