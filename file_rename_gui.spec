@@ -6,14 +6,25 @@
  利用者が PATH に用意する。CLAUDE.md の「パッケージング」参照）
 """
 import sys
+from pathlib import Path
+
+import PySide6
 
 APP_NAME = "FileRenameGUI"
+
+# Qt 標準文言の日本語カタログ（テキスト欄の右クリックメニュー等）。
+# PyInstaller の PySide6 フックは translations を丸ごとは持ってこないため、
+# 使う 1 ファイルだけ明示的に同梱する（gui/i18n.py が読み込む）
+_qt_translations = Path(PySide6.__file__).resolve().parent / "Qt" / "translations"
+_datas = [
+    (str(_qt_translations / "qtbase_ja.qm"), "PySide6/Qt/translations")
+] if (_qt_translations / "qtbase_ja.qm").exists() else []
 
 a = Analysis(
     ["run_gui.py"],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=_datas,
     # QtMultimedia（試聴機能）は gui/player.py で遅延 import されるため明示する。
     # yt-dlp は自前の PyInstaller フックを同梱しており追加指定は不要
     hiddenimports=["PySide6.QtMultimedia"],
