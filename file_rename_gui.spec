@@ -12,9 +12,10 @@ import PySide6
 
 APP_NAME = "FileRenameGUI"
 
-# Qt 標準文言の日本語カタログ（テキスト欄の右クリックメニュー等）。
-# PyInstaller の PySide6 フックは translations を丸ごとは持ってこないため、
-# 使う 1 ファイルだけ明示的に同梱する（gui/i18n.py が読み込む）
+# Qt 標準文言の日本語カタログ（テキスト欄の右クリックメニュー等。gui/i18n.py が読む）。
+# 実測では PySide6 のフックが translations 一式を収集するので普段は冗長だが、
+# 収集されないと右クリックメニューが英語に戻る＝GUI の日本語化が黙って壊れるため、
+# 使う 1 ファイルだけ明示しておく（同じ配置先なのでバンドルは二重にならない）
 _qt_translations = Path(PySide6.__file__).resolve().parent / "Qt" / "translations"
 _datas = [
     (str(_qt_translations / "qtbase_ja.qm"), "PySide6/Qt/translations")
