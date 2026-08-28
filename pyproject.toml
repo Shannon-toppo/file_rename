@@ -8,7 +8,9 @@ dependencies = [
     "mv2title",
     "pyside6>=6.7",
     "python-dotenv>=1.0",
-    "yt-dlp>=2025.1.26",
+    # 配布 exe には同梱しない（実行時に取得する。ytdlp_runtime 参照）。ここでの
+    # 指定は開発時のフォールバックと、PyInstaller に依存を解析させるためのもの
+    "yt-dlp>=2026.8.19",
 ]
 
 [dependency-groups]

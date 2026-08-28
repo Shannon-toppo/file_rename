@@ -10,6 +10,7 @@ core.check_connection（timeout 3 秒、UI ブロック許容）で疎通を確�
 import os
 from pathlib import Path
 
+from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -29,8 +30,10 @@ from PySide6.QtWidgets import (
 )
 
 import core
+import ytdlp_runtime
 
 from .logpanel import LOG_LEVELS
+from .workers import YtdlpWorker
 
 # テーマの選択肢（内部値, 表示ラベル）。既定はシステム追従
 THEMES = (
@@ -135,6 +138,8 @@ class SettingsDialog(QDialog):
         form.addRow("無音削除", self._trim_check)
         root.addWidget(dl_group)
 
+        root.addWidget(self._build_ytdlp_group())
+
         # 推定と接続設定（.env を既定とし、ここで上書きできる。空欄 = .env の値）
         llm_group = QGroupBox("タイトル推定 (LLM)")
         llm = dict(llm_overrides or {})
@@ -237,6 +242,64 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+    # -- yt-dlp -------------------------------------------------------------
+
+    def _build_ytdlp_group(self) -> QGroupBox:
+        """yt-dlp のバージョン表示と更新操作のグループを作る。
+
+        yt-dlp は exe に同梱せず実行時に取得する（ytdlp_runtime 参照）ため、
+        利用者が版を確認して更新できる口をここに置く。取得は通信を伴うので
+        ワーカースレッドへ逃がし、実行中はボタンを無効化する。
+        """
+        group = QGroupBox("yt-dlp（ダウンロード実行部）")
+        form = QFormLayout(group)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        self._ytdlp_version_label = QLabel("")
+        form.addRow("バージョン", self._ytdlp_version_label)
+
+        row = QHBoxLayout()
+        self._ytdlp_check_btn = QPushButton("更新を確認")
+        self._ytdlp_check_btn.clicked.connect(lambda: self._start_ytdlp_job(check_only=True))
+        self._ytdlp_update_btn = QPushButton("更新")
+        self._ytdlp_update_btn.clicked.connect(lambda: self._start_ytdlp_job(check_only=False))
+        self._ytdlp_status = QLabel("")
+        self._ytdlp_status.setWordWrap(True)
+        row.addWidget(self._ytdlp_check_btn)
+        row.addWidget(self._ytdlp_update_btn)
+        row.addWidget(self._ytdlp_status, stretch=1)
+        form.addRow(row)
+
+        note = QLabel(
+            "YouTube の仕様変更でダウンロードが失敗するようになったら、ここから更新してください"
+            f"（保存先: {ytdlp_runtime.runtime_root()}）。"
+        )
+        note.setWordWrap(True)
+        form.addRow(note)
+
+        self._refresh_ytdlp_version()
+        return group
+
+    def _refresh_ytdlp_version(self) -> None:
+        version = ytdlp_runtime.installed_version()
+        self._ytdlp_version_label.setText(version or "未取得（[更新] で取得します）")
+
+    def _start_ytdlp_job(self, check_only: bool) -> None:
+        self._ytdlp_check_btn.setEnabled(False)
+        self._ytdlp_update_btn.setEnabled(False)
+        worker = YtdlpWorker(check_only=check_only)
+        worker.signals.status.connect(self._ytdlp_status.setText)
+        worker.signals.done.connect(self._on_ytdlp_done)
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_ytdlp_done(self, ok: bool, message: str, needs_restart: bool) -> None:
+        if needs_restart:
+            message += "（反映にはアプリの再起動が必要です）"
+        self._ytdlp_status.setText(message if ok else "NG: " + message)
+        self._refresh_ytdlp_version()
+        self._ytdlp_check_btn.setEnabled(True)
+        self._ytdlp_update_btn.setEnabled(True)
 
     # -- スロット ------------------------------------------------------------
 
