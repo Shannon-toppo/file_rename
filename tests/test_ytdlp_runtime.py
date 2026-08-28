@@ -4,6 +4,7 @@
 wheel の取得は urlopen を差し替えて、その場で組んだ zip を返させる。
 """
 import io
+import json
 import zipfile
 
 import pytest
@@ -12,23 +13,55 @@ import core
 import ytdlp_runtime
 
 
-def _wheel_bytes(version: str) -> bytes:
-    """yt-dlp の wheel を模した zip を作る（yt_dlp/version.py だけ入っていれば足りる）。"""
+def _wheel_bytes(version: str, ejs: str | None = "0.8.0") -> bytes:
+    """yt-dlp の wheel を模した zip を作る（yt_dlp/version.py だけ入っていれば足りる）。
+
+    METADATA には本物と同じ形の EJS のピンを入れる（required_ejs_version が読む）。
+    """
+    metadata = "Name: yt-dlp\n"
+    if ejs is not None:
+        metadata += f"Requires-Dist: yt-dlp-ejs=={ejs}; extra == 'default'\n"
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("yt_dlp/__init__.py", "")
         archive.writestr("yt_dlp/version.py", f"__version__ = {version!r}\n")
-        archive.writestr(f"yt_dlp-{version}.dist-info/METADATA", "Name: yt-dlp\n")
+        archive.writestr(f"yt_dlp-{version}.dist-info/METADATA", metadata)
     return buffer.getvalue()
 
 
-def _extract(root, version: str, reported: str | None = None) -> None:
+def _ejs_wheel_bytes(version: str, package: str = "yt_dlp_ejs") -> bytes:
+    """yt-dlp-ejs の wheel を模した zip を作る。"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(f"{package}/__init__.py", "from ._version import version\n")
+        archive.writestr(f"{package}/_version.py", f"__version__ = version = {version!r}\n")
+    return buffer.getvalue()
+
+
+def _extract(root, version: str, reported: str | None = None, ejs: str | None = "0.8.0") -> None:
     """<root>/<version>/ に展開済みツリーを直接作る（取得を経ずに用意する）。"""
     package = root / version / "yt_dlp"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
     (package / "version.py").write_text(
         f"__version__ = {(reported or version)!r}\n", encoding="utf-8"
+    )
+    if ejs is not None:
+        info = root / version / f"yt_dlp-{version}.dist-info"
+        info.mkdir(parents=True)
+        (info / "METADATA").write_text(
+            f"Name: yt-dlp\nRequires-Dist: yt-dlp-ejs=={ejs}; extra == 'default'\n",
+            encoding="utf-8",
+        )
+
+
+def _extract_ejs(root, version: str, ytdlp_version: str) -> None:
+    """展開済み yt-dlp の隣に EJS を直接置く。"""
+    package = root / ytdlp_version / "yt_dlp_ejs"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("from ._version import version\n", encoding="utf-8")
+    (package / "_version.py").write_text(
+        f"__version__ = version = {version!r}\n", encoding="utf-8"
     )
 
 
@@ -216,3 +249,99 @@ def test_ensure_ytdlp_wraps_unavailable_as_core_error(monkeypatch):
     monkeypatch.setattr(ytdlp_runtime, "load", missing)
     with pytest.raises(core.CoreError):
         core.ensure_ytdlp()
+
+
+# ---------------------------------------------------------------------------
+# EJS（yt-dlp-ejs）
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_ejs_download(monkeypatch):
+    """PyPI のメタデータ問い合わせと wheel 取得を URL で振り分けて差し替える。"""
+
+    def install(wheel: bytes | Exception, *, url: str = "https://example.invalid/ejs.whl"):
+        def fake_urlopen(request_url, timeout=None):
+            if "pypi.org" in request_url:
+                body = {"urls": [{"packagetype": "bdist_wheel", "url": url}]}
+                return io.BytesIO(json.dumps(body).encode())
+            if isinstance(wheel, Exception):
+                raise wheel
+            return io.BytesIO(wheel)
+
+        monkeypatch.setattr(ytdlp_runtime.urllib.request, "urlopen", fake_urlopen)
+
+    return install
+
+
+def test_required_ejs_version_reads_metadata_pin(runtime):
+    """取得する版は yt-dlp の METADATA のピンで決める（最新を勝手に入れない）。
+
+    版がずれると yt-dlp 側のハッシュ照合で弾かれ、EJS が無いのと同じになる。
+    """
+    _extract(runtime, "2026.8.19", ejs="0.8.0")
+    assert ytdlp_runtime.required_ejs_version(runtime / "2026.8.19") == "0.8.0"
+
+
+def test_required_ejs_version_is_none_without_pin(runtime):
+    _extract(runtime, "2026.8.19", ejs=None)
+    assert ytdlp_runtime.required_ejs_version(runtime / "2026.8.19") is None
+
+
+def test_ejs_version_reads_installed_tree(runtime):
+    _extract(runtime, "2026.8.19")
+    assert ytdlp_runtime.ejs_version() is None
+    _extract_ejs(runtime, "0.8.0", "2026.8.19")
+    assert ytdlp_runtime.ejs_version() == "0.8.0"
+
+
+def test_install_ejs_extracts_next_to_ytdlp(runtime, fake_ejs_download):
+    """EJS は yt-dlp と同じディレクトリへ置く（sys.path 1 本・世代ごと一緒に消える）。"""
+    _extract(runtime, "2026.8.19", ejs="0.8.0")
+    fake_ejs_download(_ejs_wheel_bytes("0.8.0"))
+    assert ytdlp_runtime.install_ejs(runtime / "2026.8.19") == "0.8.0"
+    assert ytdlp_runtime.ejs_version() == "0.8.0"
+    assert not list(runtime.glob(".staging-ejs-*"))
+
+
+def test_install_ejs_is_a_noop_when_version_matches(runtime, fake_ejs_download):
+    _extract(runtime, "2026.8.19", ejs="0.8.0")
+    _extract_ejs(runtime, "0.8.0", "2026.8.19")
+    fake_ejs_download(AssertionError("通信してはいけない"))
+    assert ytdlp_runtime.install_ejs(runtime / "2026.8.19") == "0.8.0"
+
+
+def test_install_ejs_replaces_mismatched_version(runtime, fake_ejs_download):
+    """本体の更新でピンが変わったら、古い EJS を入れ替える。"""
+    _extract(runtime, "2026.8.19", ejs="0.9.0")
+    _extract_ejs(runtime, "0.8.0", "2026.8.19")
+    fake_ejs_download(_ejs_wheel_bytes("0.9.0"))
+    assert ytdlp_runtime.install_ejs(runtime / "2026.8.19") == "0.9.0"
+    assert ytdlp_runtime.ejs_version() == "0.9.0"
+
+
+def test_failed_install_ejs_keeps_existing(runtime, fake_ejs_download):
+    """取得に失敗しても、今使えている EJS を消してしまわない。"""
+    _extract(runtime, "2026.8.19", ejs="0.9.0")
+    _extract_ejs(runtime, "0.8.0", "2026.8.19")
+    fake_ejs_download(OSError("network down"))
+    with pytest.raises(ytdlp_runtime.YtdlpUnavailable):
+        ytdlp_runtime.install_ejs(runtime / "2026.8.19")
+    assert ytdlp_runtime.ejs_version() == "0.8.0"
+    assert not list(runtime.glob(".staging-ejs-*"))
+    assert not list(runtime.glob(".old-ejs-*"))
+
+
+def test_install_ejs_raises_without_pin(runtime, fake_ejs_download):
+    _extract(runtime, "2026.8.19", ejs=None)
+    fake_ejs_download(AssertionError("通信してはいけない"))
+    with pytest.raises(ytdlp_runtime.YtdlpUnavailable):
+        ytdlp_runtime.install_ejs(runtime / "2026.8.19")
+
+
+def test_install_ejs_rejects_archive_without_package(runtime, fake_ejs_download):
+    _extract(runtime, "2026.8.19", ejs="0.8.0")
+    fake_ejs_download(_ejs_wheel_bytes("0.8.0", package="something_else"))
+    with pytest.raises(ytdlp_runtime.YtdlpUnavailable):
+        ytdlp_runtime.install_ejs(runtime / "2026.8.19")
+    assert not list(runtime.glob(".staging-ejs-*"))

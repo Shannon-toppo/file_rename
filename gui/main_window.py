@@ -623,30 +623,54 @@ class MainWindow(QMainWindow):
     # -- yt-dlp --------------------------------------------------------------
 
     def _check_ytdlp(self) -> None:
-        """起動時に yt-dlp の有無を確認し、未取得なら取得を促す。
+        """起動時に yt-dlp と EJS の有無を確認し、欠けていれば取得を促す。
 
         yt-dlp は exe に同梱していない（ytdlp_runtime 参照）。ffmpeg と違い
         これが無いとダウンロード自体ができないため、警告ではなく取得の可否を
-        尋ねる。テスト（restore_settings=False）ではモーダルを出さない。
+        尋ねる。EJS（yt-dlp-ejs）は欠けてもダウンロードは動くが、YouTube の
+        署名・n チャレンジが解けず速度と取得できる形式が落ちる。どちらも
+        [はい] 一発で直るので同じ導線に乗せる（ダイアログは 1 つだけ）。
+        テスト（restore_settings=False）ではモーダルを出さない。
         """
-        if ytdlp_runtime.is_available():
-            return
-        self.statusBar().showMessage("yt-dlp が未取得です（[設定] から取得できます）")
-        if self._settings is None:
-            return
-        message = """ダウンロードの実行部（yt-dlp）がまだ取得されていません。
+        if not ytdlp_runtime.is_available():
+            title = "yt-dlp を取得しますか？"
+            message = """ダウンロードの実行部（yt-dlp）がまだ取得されていません。
 取得しないとダウンロードは実行できません。
 
 今すぐ取得しますか？（数 MB のダウンロードが発生します）"""
+            self.statusBar().showMessage("yt-dlp が未取得です（[設定] から取得できます）")
+        elif self._ejs_missing():
+            title = "EJS を取得しますか？"
+            message = """YouTube の制限を解除するスクリプト（EJS）が未取得です。
+このままでもダウンロードはできますが、速度が大幅に落ち、取得できない形式が出ます。
+
+今すぐ取得しますか？（1 MB 未満のダウンロードです）"""
+            self.statusBar().showMessage("EJS が未取得です（[設定] の [更新] で取得できます）")
+        else:
+            return
+        if self._settings is None:
+            return
         ret = QMessageBox.question(
             self,
-            "yt-dlp を取得しますか？",
+            title,
             message,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
         if ret == QMessageBox.StandardButton.Yes:
             self._start_ytdlp_fetch()
+
+    def _ejs_missing(self) -> bool:
+        """展開済み yt-dlp に、対応版の EJS が伴っていないか。
+
+        開発環境（venv の yt-dlp を使う＝展開済みが無い）や、yt-dlp が版を
+        要求していない場合は「欠けていない」とみなす（取得のしようがない）。
+        """
+        target = ytdlp_runtime.installed_dir()
+        if target is None:
+            return False
+        wanted = ytdlp_runtime.required_ejs_version(target)
+        return wanted is not None and ytdlp_runtime.ejs_version(target) != wanted
 
     def _start_ytdlp_fetch(self) -> None:
         """yt-dlp の取得をワーカーで走らせ、経過をステータスバーへ出す。"""

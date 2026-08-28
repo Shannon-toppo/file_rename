@@ -25,11 +25,21 @@ App Translocation 対策 — quarantine 付きの .app は読み取り専用の
 
 wheel は `py3-none-any`（純 Python・必須依存ゼロ）なので、pip を使わず
 urllib と zipfile だけで展開でき、Windows / macOS で同じファイルが使える。
+
+EJS（yt-dlp-ejs）
+=================
+YouTube の署名・n チャレンジを解く JavaScript は yt-dlp 本体には入っておらず、
+`yt-dlp-ejs` パッケージか、実行時の遠隔取得（--remote-components ejs:github /
+ejs:npm）で供給する。ここでは前者を採り、yt-dlp と同じバージョンディレクトリへ
+一緒に展開する（install_ejs）。ダウンロードのたびに GitHub / npm を叩かずに
+済み、版は yt-dlp の METADATA のピンで決まり、スクリプトは yt-dlp 自身が
+ハッシュ照合する。
 """
 import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import urllib.request
@@ -38,6 +48,14 @@ from pathlib import Path
 
 APP_NAME = "FileRenameGUI"
 PYPI_JSON = "https://pypi.org/pypi/yt-dlp/json"
+# yt-dlp-ejs（EJS）: YouTube の署名・n チャレンジを解く JavaScript 一式。
+# 無いと yt-dlp は GitHub / npm から都度取りに行こうとし（--remote-components）、
+# それも無ければ解けずに速度が落ちたり一部の形式が落ちたりする。
+# パッケージとして置いてあれば最優先で使われ、yt-dlp が持つハッシュ一覧で
+# 検証される（実行のたびに外部から取ってこない）。版は yt-dlp 側が
+# `Requires-Dist: yt-dlp-ejs==X` で厳密に固定しているのでそれに従う。
+EJS_PACKAGE = "yt_dlp_ejs"
+EJS_PYPI_JSON = "https://pypi.org/pypi/yt-dlp-ejs/{version}/json"
 # 取得・展開のタイムアウト（秒）。wheel は 3MB 程度
 _META_TIMEOUT = 30.0
 _WHEEL_TIMEOUT = 180.0
@@ -133,20 +151,66 @@ def installed_version() -> str | None:
 
 def _read_version(extracted: Path) -> str | None:
     """展開済みツリーの yt_dlp/version.py から __version__ を読む。"""
-    source = extracted / "yt_dlp" / "version.py"
+    return _module_version(extracted / "yt_dlp" / "version.py", "__version__")
+
+
+def _module_version(source: Path, *names: str) -> str | None:
+    """バージョン定数だけのモジュールを exec して、最初に見つかった名前を返す。
+
+    import せずに読むのは、まだ sys.path に載っていないパッケージを解決
+    できないため。読めない・構造が変わったときは None（表示不能で済ませる）。
+    """
     try:
         text = source.read_text(encoding="utf-8")
     except OSError:
         return None
-    # version.py は自動生成の定数だけなので exec して読む（import すると
-    # まだ sys.path に載っていないパッケージを解決できない）
     namespace: dict = {}
     try:
         exec(compile(text, str(source), "exec"), namespace)  # noqa: S102
     except Exception:  # noqa: BLE001 - 構造が変わっても表示不能で済ませる
         return None
-    version = namespace.get("__version__")
-    return version if isinstance(version, str) else None
+    for name in names:
+        value = namespace.get(name)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+# ---------------------------------------------------------------------------
+# EJS（yt-dlp-ejs）
+# ---------------------------------------------------------------------------
+
+
+def ejs_version(extracted: Path | None = None) -> str | None:
+    """展開済み yt-dlp-ejs のバージョン。無ければ None。
+
+    Args:
+        extracted: 見に行くディレクトリ。省略時は使用中の yt-dlp と同じ場所。
+    """
+    path = extracted if extracted is not None else installed_dir()
+    if path is None:
+        return None
+    # setuptools-scm 生成の _version.py（__version__ と version の両方を持つ）
+    return _module_version(path / EJS_PACKAGE / "_version.py", "__version__", "version")
+
+
+def required_ejs_version(extracted: Path) -> str | None:
+    """展開済み yt-dlp が要求する yt-dlp-ejs のバージョン。判別できなければ None。
+
+    yt-dlp の wheel の METADATA には `Requires-Dist: yt-dlp-ejs==0.8.0` の形で
+    完全固定のピンが入っている。スクリプト側でも版が合わないと弾かれる
+    （yt-dlp が同梱のハッシュ一覧と突き合わせる）ので、勝手に最新を入れず
+    ここを唯一の基準にする。
+    """
+    for metadata in sorted(extracted.glob("yt_dlp-*.dist-info/METADATA")):
+        try:
+            text = metadata.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        found = re.search(r"^Requires-Dist:\s*yt[-_]dlp[-_]ejs\s*==\s*([^\s;]+)", text, re.M)
+        if found:
+            return found.group(1)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +270,69 @@ def install(version: str, url: str) -> Path:
 
     prune()
     return target
+
+
+def install_ejs(target: Path) -> str:
+    """target（展開済み yt-dlp）の隣へ、対応する yt-dlp-ejs を展開して版を返す。
+
+    yt-dlp と同じディレクトリに置くので sys.path のエントリは 1 つのままで済み、
+    prune() で世代ごと一緒に消える（版の組み合わせがずれない）。
+    取得する版は required_ejs_version()（yt-dlp の METADATA のピン）に従う。
+
+    既に同じ版が入っていれば何もしない。差し替えは新しいツリーを staging へ
+    展開してから入れ替えるので、失敗しても既存の EJS は残る。
+
+    Raises:
+        YtdlpUnavailable: 版を判別できない、取得・展開に失敗した場合。
+    """
+    version = required_ejs_version(target)
+    if version is None:
+        raise YtdlpUnavailable(
+            "yt-dlp が要求する yt-dlp-ejs の版を判別できませんでした（METADATA が読めません）。"
+        )
+    if ejs_version(target) == version:
+        return version  # 既に対応版が入っている
+
+    url = _ejs_wheel_url(version)
+    staging = target.parent / f".staging-ejs-{os.getpid()}-{version}"
+    package = target / EJS_PACKAGE
+    retired = target.parent / f".old-ejs-{os.getpid()}-{version}"
+    try:
+        shutil.rmtree(staging, ignore_errors=True)
+        with urllib.request.urlopen(url, timeout=_WHEEL_TIMEOUT) as resp:
+            raw = resp.read()
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            archive.extractall(staging)
+        if not (staging / EJS_PACKAGE / "__init__.py").is_file():
+            raise YtdlpUnavailable(f"wheel に {EJS_PACKAGE} パッケージが含まれていません。")
+        # 旧版を退避 → 新版を配置 → 退避を削除（入れ替え中に消えている時間を作らない）
+        if package.is_dir():
+            package.rename(retired)
+        (staging / EJS_PACKAGE).rename(package)
+    except YtdlpUnavailable:
+        raise
+    except Exception as e:  # noqa: BLE001 - 通信・IO をまとめて扱う
+        if not package.is_dir() and retired.is_dir():
+            retired.rename(package)  # 入れ替えに失敗したら旧版へ戻す
+        raise YtdlpUnavailable(f"yt-dlp-ejs の取得に失敗しました: {e}") from e
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(retired, ignore_errors=True)
+    return version
+
+
+def _ejs_wheel_url(version: str) -> str:
+    """指定バージョンの yt-dlp-ejs wheel の URL を PyPI から引く。"""
+    try:
+        with urllib.request.urlopen(
+            EJS_PYPI_JSON.format(version=version), timeout=_META_TIMEOUT
+        ) as resp:
+            data = json.load(resp)
+        return next(f["url"] for f in data["urls"] if f["packagetype"] == "bdist_wheel")
+    except Exception as e:  # noqa: BLE001 - 通信・構造変更をまとめて扱う
+        raise YtdlpUnavailable(
+            f"yt-dlp-ejs {version} の情報を取得できませんでした: {e}"
+        ) from e
 
 
 def prune(keep: int = _KEEP_GENERATIONS) -> None:

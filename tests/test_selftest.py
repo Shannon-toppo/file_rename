@@ -20,6 +20,7 @@ def stub_env(monkeypatch, tmp_path):
     monkeypatch.setattr(ytdlp_runtime, "installed_dir", lambda: tmp_path / "2026.8.19")
     monkeypatch.setattr(ytdlp_runtime, "runtime_root", lambda: tmp_path)
     monkeypatch.setattr(ytdlp_runtime, "latest_release", lambda: ("2026.8.19", "https://x/y.whl"))
+    monkeypatch.setattr(ytdlp_runtime, "install_ejs", lambda target: "0.8.0")
     monkeypatch.setattr(core, "ensure_ytdlp", lambda: None)
     return monkeypatch
 
@@ -65,6 +66,7 @@ def test_selftest_update_installs_when_missing(stub_env, capsys, tmp_path):
     )
     selftest.run_selftest(["--selftest", "--update"])
     assert calls == [("2026.8.19", "https://x/y.whl")]
+    assert "EJS 取得" in capsys.readouterr().out
 
 
 def test_selftest_update_skips_when_current(stub_env, capsys):
@@ -72,6 +74,25 @@ def test_selftest_update_skips_when_current(stub_env, capsys):
     stub_env.setattr(ytdlp_runtime, "install", lambda v, u: pytest.fail("取得してはいけない"))
     selftest.run_selftest(["--selftest", "--update"])
     assert "最新です" in capsys.readouterr().out
+
+
+def test_selftest_update_fetches_ejs_even_when_ytdlp_is_current(stub_env, capsys):
+    """本体が最新でも EJS が欠けていれば取りに行く（あとから足せる導線）。"""
+    calls = []
+    stub_env.setattr(ytdlp_runtime, "install", lambda v, u: pytest.fail("取得してはいけない"))
+    stub_env.setattr(ytdlp_runtime, "install_ejs", lambda target: calls.append(target) or "0.8.0")
+    assert selftest.run_selftest(["--selftest", "--update"]) == 0
+    assert calls  # EJS だけの取得は走る
+    assert "OK（0.8.0）" in capsys.readouterr().out
+
+
+def test_selftest_reports_failed_ejs_fetch(stub_env, capsys):
+    def boom(target):
+        raise ytdlp_runtime.YtdlpUnavailable("PyPI へ接続できません")
+
+    stub_env.setattr(ytdlp_runtime, "install_ejs", boom)
+    assert selftest.run_selftest(["--selftest", "--update"]) == 1
+    assert "PyPI へ接続できません" in capsys.readouterr().out
 
 
 def test_selftest_skips_url_checks_when_basics_fail(stub_env, capsys):

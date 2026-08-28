@@ -494,3 +494,74 @@ def test_confirm_deno_asks_before_run(main_window, monkeypatch):
     assert win._confirm_deno() is False
     assert len(answers) == 1
     win._settings = None  # closeEvent の _save_settings が触らないよう戻す
+
+
+
+# ---------------------------------------------------------------------------
+# EJS（yt-dlp-ejs）
+# ---------------------------------------------------------------------------
+
+
+def test_settings_shows_ejs_version(qtbot, monkeypatch, tmp_path):
+    """[設定] のバージョン欄は本体と EJS を並べて出す。"""
+    import ytdlp_runtime
+    from gui.settings_dialog import SettingsDialog
+
+    monkeypatch.setattr(ytdlp_runtime, "installed_version", lambda: "2026.08.19")
+    monkeypatch.setattr(ytdlp_runtime, "installed_dir", lambda: tmp_path)
+    monkeypatch.setattr(ytdlp_runtime, "ejs_version", lambda d=None: "0.8.0")
+    dialog = SettingsDialog()
+    qtbot.addWidget(dialog)
+    assert dialog._ytdlp_version_label.text() == "2026.08.19 ／ EJS 0.8.0"
+
+
+def test_settings_flags_missing_ejs(qtbot, monkeypatch, tmp_path):
+    """EJS が欠けていても DL は動くぶん気付きにくいので、版の欄で明示する。"""
+    import ytdlp_runtime
+    from gui.settings_dialog import SettingsDialog
+
+    monkeypatch.setattr(ytdlp_runtime, "installed_version", lambda: "2026.08.19")
+    monkeypatch.setattr(ytdlp_runtime, "installed_dir", lambda: tmp_path)
+    monkeypatch.setattr(ytdlp_runtime, "ejs_version", lambda d=None: None)
+    dialog = SettingsDialog()
+    qtbot.addWidget(dialog)
+    text = dialog._ytdlp_version_label.text()
+    assert "2026.08.19" in text and "EJS 未取得" in text
+
+
+def test_ejs_missing_compares_against_required_pin(main_window, monkeypatch, tmp_path):
+    """版がずれた EJS は yt-dlp に弾かれるので「欠けている」と同じ扱いにする。"""
+    import ytdlp_runtime
+
+    win = main_window
+    monkeypatch.setattr(ytdlp_runtime, "installed_dir", lambda: tmp_path)
+    monkeypatch.setattr(ytdlp_runtime, "required_ejs_version", lambda d: "0.8.0")
+
+    monkeypatch.setattr(ytdlp_runtime, "ejs_version", lambda d=None: "0.8.0")
+    assert win._ejs_missing() is False
+    monkeypatch.setattr(ytdlp_runtime, "ejs_version", lambda d=None: "0.7.0")
+    assert win._ejs_missing() is True
+    monkeypatch.setattr(ytdlp_runtime, "ejs_version", lambda d=None: None)
+    assert win._ejs_missing() is True
+
+    # 開発環境（展開済みが無く venv の yt-dlp を使う）は取得のしようがない
+    monkeypatch.setattr(ytdlp_runtime, "installed_dir", lambda: None)
+    assert win._ejs_missing() is False
+
+
+def test_startup_reports_missing_ejs(qtbot, monkeypatch, tmp_path):
+    """起動時、本体はあるが EJS が無い場合はステータスバーで知らせる。"""
+    import ytdlp_runtime
+    from gui import main_window as mw
+
+    monkeypatch.setattr(mw.shutil, "which", lambda name: "/usr/bin/x")
+    monkeypatch.setattr(ytdlp_runtime, "is_available", lambda: True)
+    monkeypatch.setattr(ytdlp_runtime, "installed_dir", lambda: tmp_path)
+    monkeypatch.setattr(ytdlp_runtime, "required_ejs_version", lambda d: "0.8.0")
+    monkeypatch.setattr(ytdlp_runtime, "ejs_version", lambda d=None: None)
+    win = mw.MainWindow(restore_settings=False)
+    qtbot.addWidget(win)
+    assert "EJS" in win.statusBar().currentMessage()
+    win.close()
+    win.deleteLater()
+    QApplication.processEvents()

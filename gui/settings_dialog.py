@@ -257,6 +257,7 @@ class SettingsDialog(QDialog):
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         self._ytdlp_version_label = QLabel("")
+        self._ytdlp_version_label.setWordWrap(True)
         form.addRow("バージョン", self._ytdlp_version_label)
 
         row = QHBoxLayout()
@@ -274,6 +275,7 @@ class SettingsDialog(QDialog):
         note = QLabel(
             "YouTube の仕様変更でダウンロードが失敗するようになったら、ここから更新してください"
             f"（保存先: {ytdlp_runtime.runtime_root()}）。"
+            "\nEJS は YouTube の制限を解除するスクリプトで、本体と対になる版を一緒に取得します。"
         )
         note.setWordWrap(True)
         form.addRow(note)
@@ -282,8 +284,24 @@ class SettingsDialog(QDialog):
         return group
 
     def _refresh_ytdlp_version(self) -> None:
+        """本体と EJS の版を 1 行で出す。
+
+        EJS（yt-dlp-ejs）は YouTube の署名・n チャレンジを解くスクリプトで、
+        欠けていてもダウンロード自体は動くぶん気付きにくい。版と一緒に
+        常に見えるようにして、[更新] を押せば直ることが分かるようにする。
+        """
         version = ytdlp_runtime.installed_version()
-        self._ytdlp_version_label.setText(version or "未取得（[更新] で取得します）")
+        if version is None:
+            self._ytdlp_version_label.setText("未取得（[更新] で取得します）")
+            return
+        installed_dir = ytdlp_runtime.installed_dir()
+        ejs = ytdlp_runtime.ejs_version(installed_dir)
+        if ejs is None:
+            self._ytdlp_version_label.setText(
+                f"{version} ／ EJS 未取得（YouTube の制限解除に必要。[更新] で取得します）"
+            )
+        else:
+            self._ytdlp_version_label.setText(f"{version} ／ EJS {ejs}")
 
     def _start_ytdlp_job(self, check_only: bool) -> None:
         self._ytdlp_check_btn.setEnabled(False)

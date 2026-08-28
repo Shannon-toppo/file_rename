@@ -19,7 +19,8 @@ URL を渡すと、ダウンロードはせずにメタデータ取得（core.fe
 試す。`--download` も付けると一時フォルダへ実際に 1 曲落として消す
 （yt-dlp → deno → ffmpeg の連携まで通っているかの確認）。
 
-`--update` は GUI の [設定] → yt-dlp と同じ取得・更新を端末から行う。
+`--update` は GUI の [設定] → yt-dlp と同じ取得・更新（本体 + EJS）を
+端末から行う。
 GUI が出せない状況（起動できない・ダイアログが見えない）での復旧手段。
 """
 import platform
@@ -72,6 +73,23 @@ def _check_ytdlp() -> bool:
     return True
 
 
+def _check_ejs() -> bool:
+    """yt-dlp から EJS が見えているかを、実際の import で確かめる。
+
+    YouTube の署名・n チャレンジを解くスクリプト。無いと yt-dlp は実行の
+    たびに GitHub / npm を取りに行こうとし（既定では禁止）、解けないまま
+    速度が落ちる。ロード済みの yt-dlp が見る経路そのもので判定したいので、
+    ディレクトリではなく import できるかを見る（開発環境の venv でも同じ）。
+    """
+    try:
+        import yt_dlp_ejs
+    except ImportError:
+        _line("EJS", "未取得（--update で取得できます。YouTube の制限解除に必要）")
+        return False
+    _line("EJS", f"{yt_dlp_ejs.version}（ロード成功）")
+    return True
+
+
 def _update_ytdlp() -> bool:
     """未取得なら取得、古ければ更新する（GUI の [設定] → yt-dlp と同じ）。"""
     current = ytdlp_runtime.installed_version()
@@ -81,12 +99,25 @@ def _update_ytdlp() -> bool:
             current
         ) >= ytdlp_runtime.parse_version(latest):
             _line("yt-dlp 取得", f"最新です（{current}）")
-            return True
+            return _update_ejs(ytdlp_runtime.installed_dir())
         path = ytdlp_runtime.install(latest, url)
     except ytdlp_runtime.YtdlpUnavailable as e:
         _line("yt-dlp 取得", f"NG: {e}")
         return False
     _line("yt-dlp 取得", f"OK（{latest} を {path} へ展開）")
+    return _update_ejs(path)
+
+
+def _update_ejs(target) -> bool:
+    """yt-dlp に対応する EJS（yt-dlp-ejs）を用意する。"""
+    if target is None:
+        target = ytdlp_runtime.installed_dir()
+    try:
+        version = ytdlp_runtime.install_ejs(target)
+    except ytdlp_runtime.YtdlpUnavailable as e:
+        _line("EJS 取得", f"NG: {e}")
+        return False
+    _line("EJS 取得", f"OK（{version}）")
     return True
 
 
@@ -160,7 +191,10 @@ def run_selftest(argv: list[str]) -> int:
     results = []
     if "--update" in argv:
         results.append(_update_ytdlp())
-    results += [_check_tools(), _check_ytdlp(), _check_pypi()]
+    results += [_check_tools(), _check_ytdlp()]
+    if results[-1]:  # yt-dlp をロードできて初めて EJS の有無を見られる
+        results.append(_check_ejs())
+    results.append(_check_pypi())
     if urls and all(results):
         results.append(_check_url(urls[0]))
         if "--download" in argv:

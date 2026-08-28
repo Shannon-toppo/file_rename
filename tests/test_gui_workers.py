@@ -553,3 +553,79 @@ def test_reinfer_without_force_protects_manual(qtbot, monkeypatch):
     # ワーカーの対象選定で manual 行が除外され、infer は呼ばれない
     assert calls == []
     assert manual.guessed_title == "keep"
+
+
+
+# ---------------------------------------------------------------------------
+# YtdlpWorker（本体 + EJS の取得・更新）
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ytdlp_stub(monkeypatch, tmp_path):
+    """通信するところを全部差し替える（本体は最新・EJS は取得できる状態）。"""
+    import ytdlp_runtime
+
+    monkeypatch.setattr(core, "YoutubeDL", None)  # まだロードしていない状態
+    monkeypatch.setattr(ytdlp_runtime, "installed_version", lambda: "2026.08.19")
+    monkeypatch.setattr(ytdlp_runtime, "installed_dir", lambda: tmp_path)
+    monkeypatch.setattr(ytdlp_runtime, "latest_release", lambda: ("2026.8.19", "https://x/y.whl"))
+    monkeypatch.setattr(ytdlp_runtime, "required_ejs_version", lambda d: "0.8.0")
+    monkeypatch.setattr(ytdlp_runtime, "ejs_version", lambda d=None: "0.8.0")
+    monkeypatch.setattr(ytdlp_runtime, "install_ejs", lambda target: "0.8.0")
+    monkeypatch.setattr(
+        ytdlp_runtime, "install", lambda v, u: pytest.fail("本体は最新なので取得しない")
+    )
+    return monkeypatch
+
+
+def run_ytdlp_worker(check_only: bool = False):
+    """YtdlpWorker を同期実行し、done シグナルの引数を返す。"""
+    from gui.workers import YtdlpWorker
+
+    worker = YtdlpWorker(check_only=check_only)
+    received = []
+    worker.signals.done.connect(lambda ok, message, restart: received.append((ok, message, restart)))
+    worker.run()
+    return received[-1]
+
+
+def test_ytdlp_worker_reports_ejs_alongside_version(ytdlp_stub):
+    """本体が最新でも EJS を確認し、結果を 1 行にまとめて返す。"""
+    ok, message, restart = run_ytdlp_worker()
+    assert ok is True
+    assert message == "最新です（2026.08.19）／ EJS 0.8.0"
+    assert restart is False  # まだ yt_dlp を import していないので再起動は不要
+
+
+def test_ytdlp_worker_needs_restart_after_load(ytdlp_stub):
+    """ロード済みなら再起動が要る（yt_dlp は import 時に EJS の有無を見るため）。"""
+    ytdlp_stub.setattr(core, "YoutubeDL", object())
+    _, _, restart = run_ytdlp_worker()
+    assert restart is True
+
+
+def test_ytdlp_worker_survives_ejs_failure(ytdlp_stub):
+    """EJS の取得に失敗しても更新自体は成功扱い（EJS 無しでも DL はできる）。"""
+    import ytdlp_runtime
+
+    def boom(target):
+        raise ytdlp_runtime.YtdlpUnavailable("PyPI へ接続できません")
+
+    ytdlp_stub.setattr(ytdlp_runtime, "install_ejs", boom)
+    ok, message, _ = run_ytdlp_worker()
+    assert ok is True
+    assert "EJS の取得に失敗" in message and "PyPI へ接続できません" in message
+
+
+def test_ytdlp_worker_check_only_flags_missing_ejs(ytdlp_stub):
+    """[更新を確認] は本体が最新でも EJS の欠落を見逃さない。"""
+    import ytdlp_runtime
+
+    ytdlp_stub.setattr(ytdlp_runtime, "ejs_version", lambda d=None: None)
+    ytdlp_stub.setattr(
+        ytdlp_runtime, "install_ejs", lambda target: pytest.fail("確認だけで取得しない")
+    )
+    ok, message, _ = run_ytdlp_worker(check_only=True)
+    assert ok is True
+    assert "EJS 0.8.0 が未取得" in message
