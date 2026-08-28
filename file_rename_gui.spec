@@ -42,14 +42,32 @@ a = Analysis(
 # なるため、yt-dlp だけが必要とする標準ライブラリ（optparse など）まで exe から
 # 落ちて、外部の yt-dlp を読み込んだ時点で ModuleNotFoundError になる。
 # 解析は通常どおり行わせ、収集結果から yt_dlp.* だけを抜く。
+#
+# yt_dlp_ejs（EJS）も同じ理由で抜く。加えて、こちらは同梱すると害がある:
+# PYZ は sys.path より先に解決されるため、焼き込んだ古い EJS が実行時に展開した
+# 対応版を隠してしまい、yt-dlp に「版が違う」と弾かれる。本体と対で
+# ユーザー領域へ置く（ytdlp_runtime.install_ejs）。
+_EXTERNAL_PACKAGES = ("yt_dlp", "yt_dlp_ejs")
+
+
+def _is_external(name):
+    # a.pure はドット区切りのモジュール名、a.datas はパス（yt_dlp_ejs/yt/... の形で
+    # .js などが入る）。両方の綴りを見ないとデータだけが残る
+    prefixes = [f"{p}{sep}" for p in _EXTERNAL_PACKAGES for sep in (".", "/", "\\")]
+    return name in _EXTERNAL_PACKAGES or name.startswith(tuple(prefixes))
+
+
 def _strip_ytdlp(toc):
-    return [e for e in toc if not (e[0] == "yt_dlp" or e[0].startswith("yt_dlp."))]
+    return [e for e in toc if not _is_external(e[0])]
 
 
-_before = len(a.pure)
+_before = len(a.pure), len(a.datas)
 a.pure = _strip_ytdlp(a.pure)
 a.datas = _strip_ytdlp(a.datas)
-print(f"[spec] yt_dlp を PYZ から除外: {_before - len(a.pure)} モジュール")
+print(
+    f"[spec] yt_dlp / yt_dlp_ejs を除外: {_before[0] - len(a.pure)} モジュール"
+    f" / {_before[1] - len(a.datas)} データ"
+)
 
 pyz = PYZ(a.pure)
 

@@ -11,6 +11,11 @@ dependencies = [
     # 配布 exe には同梱しない（実行時に取得する。ytdlp_runtime 参照）。ここでの
     # 指定は開発時のフォールバックと、PyInstaller に依存を解析させるためのもの
     "yt-dlp>=2026.8.19",
+    # YouTube の署名・n チャレンジを解く JS。これが無いと yt-dlp は実行のたびに
+    # GitHub / npm を取りに行こうとし、既定では禁止されているので解けずに
+    # 速度が落ちる。配布版は yt-dlp と対で実行時に取得する（install_ejs）ので、
+    # ここも同梱用ではなく開発時のフォールバック
+    "yt-dlp-ejs",
 ]
 
 [dependency-groups]

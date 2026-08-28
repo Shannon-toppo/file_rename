@@ -100,17 +100,25 @@ def apply_env_overrides(overrides: dict[str, str]) -> None:
             os.environ.pop(key, None)
 
 
+# macOS で Finder 起動のアプリに補う PATH。brew（Apple Silicon / Intel）と、
+# deno 公式インストーラの既定の置き場所（~/.deno/bin）。deno は yt-dlp が
+# 使う JS ランタイムで、無いと DL 速度が 1/10 以下になる。
+_DARWIN_EXTRA_PATHS = ("/opt/homebrew/bin", "/usr/local/bin", "~/.deno/bin")
+
+
 def _augment_path_darwin() -> None:
-    """macOS: Finder 起動のアプリへ Homebrew の PATH を補う。
+    """macOS: Finder 起動のアプリへ Homebrew / deno の PATH を補う。
 
     Finder から起動した GUI アプリはログインシェルの PATH を継承しないため、
-    brew で入れた ffmpeg（/opt/homebrew/bin, Intel は /usr/local/bin）が
-    見つからない。未含有のときだけ末尾へ追加する（冪等）。
+    brew で入れた ffmpeg や deno が見つからない。未含有のときだけ末尾へ
+    追加する（冪等）。実在しないディレクトリが混ざっても PATH 解決では
+    単に無視されるため、存在確認はしない。
     """
     if sys.platform != "darwin":
         return
     current = os.environ.get("PATH", "").split(os.pathsep)
-    extra = [p for p in ("/opt/homebrew/bin", "/usr/local/bin") if p not in current]
+    expanded = [os.path.expanduser(p) for p in _DARWIN_EXTRA_PATHS]
+    extra = [p for p in expanded if p not in current]
     if extra:
         os.environ["PATH"] = os.pathsep.join([p for p in current if p] + extra)
 

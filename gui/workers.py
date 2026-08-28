@@ -335,6 +335,10 @@ class YtdlpWorker(QRunnable):
     シグナルだけを emit する）。ネットワーク待ちで UI を固めないための分離で、
     通信は ytdlp_runtime 側が担う。
 
+    本体と一緒に EJS（yt-dlp-ejs）も揃える。YouTube の署名・n チャレンジを
+    解くスクリプトで、無いと yt-dlp が実行のたびに GitHub / npm を叩きに行く
+    （既定では禁止されているので解けずに速度が落ちる）。
+
     Args:
         check_only: True なら最新版の有無を確認するだけで取得しない。
     """
@@ -361,23 +365,49 @@ class YtdlpWorker(QRunnable):
         latest, _ = ytdlp_runtime.latest_release()
         if current is None:
             self.signals.done.emit(True, f"未取得です（最新版 {latest}）", False)
-        elif ytdlp_runtime.parse_version(current) >= ytdlp_runtime.parse_version(latest):
-            self.signals.done.emit(True, f"最新です（{current}）", False)
-        else:
+            return
+        if ytdlp_runtime.parse_version(current) < ytdlp_runtime.parse_version(latest):
             self.signals.done.emit(True, f"更新があります: {current} → {latest}", False)
+            return
+        # 本体が最新でも EJS が欠けていると YouTube の制限が解除できない
+        installed_dir = ytdlp_runtime.installed_dir()
+        wanted = ytdlp_runtime.required_ejs_version(installed_dir) if installed_dir else None
+        if wanted is not None and ytdlp_runtime.ejs_version(installed_dir) != wanted:
+            self.signals.done.emit(True, f"最新です（{current}）／ EJS {wanted} が未取得です", False)
+        else:
+            self.signals.done.emit(True, f"最新です（{current}）", False)
 
     def _update(self) -> None:
         self.signals.status.emit("最新版を確認しています...")
         current = ytdlp_runtime.installed_version()
         latest, url = ytdlp_runtime.latest_release()
-        if current is not None and ytdlp_runtime.parse_version(current) >= ytdlp_runtime.parse_version(latest):
-            self.signals.done.emit(True, f"最新です（{current}）", False)
-            return
-        self.signals.status.emit(f"yt-dlp {latest} を取得しています...")
-        ytdlp_runtime.install(latest, url)
-        if current is None:
-            # 初回取得はこのセッションからそのまま使える（まだ import していない）
-            self.signals.done.emit(True, f"yt-dlp {latest} を取得しました", False)
+        if current is None or ytdlp_runtime.parse_version(current) < ytdlp_runtime.parse_version(latest):
+            self.signals.status.emit(f"yt-dlp {latest} を取得しています...")
+            target = ytdlp_runtime.install(latest, url)
+            message = (
+                f"yt-dlp {latest} を取得しました" if current is None
+                else f"yt-dlp {latest} に更新しました"
+            )
         else:
-            # 既に旧版を import 済みのため、差し替えの反映には再起動が要る
-            self.signals.done.emit(True, f"yt-dlp {latest} に更新しました", True)
+            target = ytdlp_runtime.installed_dir()
+            message = f"最新です（{current}）"
+        message += self._ensure_ejs(target)
+        # 既にロード済みなら、差し替え（本体・EJS とも）の反映には再起動が要る。
+        # yt_dlp は import 時に EJS の有無を見るため、あとから入れても効かない。
+        self.signals.done.emit(True, message, core.YoutubeDL is not None)
+
+    def _ensure_ejs(self, target) -> str:
+        """EJS（yt-dlp-ejs）を yt-dlp に合わせて用意し、結果の一文を返す。
+
+        失敗しても更新自体は成功扱いにする（EJS が無くてもダウンロードは
+        できて、速度と一部の形式が落ちるだけ。ここで全体を失敗にすると
+        本体の更新まで無かったことになってしまう）。
+        """
+        if target is None:
+            return ""
+        try:
+            self.signals.status.emit("EJS（チャレンジ解決スクリプト）を確認しています...")
+            version = ytdlp_runtime.install_ejs(target)
+        except ytdlp_runtime.YtdlpUnavailable as e:
+            return f"／ EJS の取得に失敗: {e}"
+        return f"／ EJS {version}"
