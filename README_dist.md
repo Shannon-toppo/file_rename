@@ -23,7 +23,7 @@ YouTube などの URL から音声をダウンロードし、LLM で曲名を推
 YouTube 側の制限で速度が 10 分の 1 以下になります。
 
 - **Windows**: `winget install DenoLand.Deno`
-- **macOS**: `brew install deno`
+- **macOS**: `brew install deno`（[公式インストーラ](https://deno.land) の `~/.deno/bin` でも認識します）
 
 ## 3. LLM の接続設定
 
@@ -52,3 +52,21 @@ YouTube 側の制限で速度が 10 分の 1 以下になります。
 
 - YouTube 側の仕様変更でダウンロードが失敗するようになった場合は、[設定] → yt-dlp の [更新] を実行してください（アプリ本体の入れ替えは不要です。更新後は再起動してください）
 - Windows Defender 等が誤検知した場合は、フォルダごと除外に登録してください
+
+## うまく動かないとき（診断モード）
+
+端末から `--selftest` を付けて起動すると、ffmpeg / deno の在り処、yt-dlp の版、
+通信の可否をまとめて表示します（GUI は出ません）。
+
+- **macOS**（ターミナル）:
+
+      /path/to/FileRenameGUI.app/Contents/MacOS/FileRenameGUI --selftest
+
+- **Windows**（コマンドプロンプト。画面には出ないのでファイルへ書き出します）:
+
+      FileRenameGUI.exe --selftest > selftest.txt
+
+オプション:
+
+- `--update` — yt-dlp を取得・更新する（[設定] の [更新] と同じ。GUI が開けないときの手段）
+- `--download <URL>` — 実際に 1 曲だけ落として消し、変換まで通るか確かめる

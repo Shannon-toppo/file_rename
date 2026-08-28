@@ -16,3 +16,5 @@ ditto -c -k --keepParent dist/FileRenameGUI.app dist/FileRenameGUI-mac.zip
 
 echo "done: dist/FileRenameGUI.app / dist/FileRenameGUI-mac.zip"
 echo "受け取り側の初回起動: 右クリック→開く（または xattr -cr FileRenameGUI.app）"
+# 凍結ビルドは console=False で何も出ないため、動作確認は診断モードで行う
+echo "動作確認: dist/FileRenameGUI.app/Contents/MacOS/FileRenameGUI --selftest"

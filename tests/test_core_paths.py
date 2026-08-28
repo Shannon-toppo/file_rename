@@ -137,6 +137,21 @@ def test_augment_path_darwin_adds_brew_paths_once(monkeypatch):
     assert parts[0] == "/usr/bin"  # 既存 PATH を先頭に保つ
 
 
+def test_augment_path_darwin_adds_deno_dir_expanded(monkeypatch, tmp_path):
+    """deno 公式インストーラの ~/.deno/bin を、~ を展開して足す。
+
+    brew ではなく公式インストーラで入れた deno は Finder 起動時に PATH へ
+    載らず、n チャレンジが解けないまま速度だけが落ちる（原因が見えにくい）。
+    """
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PATH", "/usr/bin")
+    core._augment_path_darwin()
+    parts = os.environ["PATH"].split(os.pathsep)
+    assert str(tmp_path / ".deno" / "bin") in parts
+    assert "~/.deno/bin" not in parts
+
+
 def test_augment_path_darwin_noop_on_other_platforms(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setenv("PATH", "/usr/bin")

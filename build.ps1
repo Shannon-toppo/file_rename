@@ -11,3 +11,5 @@ Copy-Item .env.example dist/FileRenameGUI/
 Copy-Item README_dist.md dist/FileRenameGUI/
 
 Write-Host "done: dist/FileRenameGUI/ （zip に固めて配布してください）"
+# GUI サブシステムの exe は端末に出力できないため、診断はファイルへリダイレクトする
+Write-Host "動作確認: dist/FileRenameGUI/FileRenameGUI.exe --selftest > selftest.txt"
