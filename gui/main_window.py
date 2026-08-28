@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
 )
 
 import core
+import ytdlp_runtime
 from core import Status, Track
 
 from .clipboard import resolve_paste_targets, selection_to_tsv
@@ -62,7 +63,14 @@ from .model import (
 )
 from .player import PreviewPlayer, format_time
 from .settings_dialog import SettingsDialog
-from .workers import MODE_FETCH, MODE_FULL, MODE_INFER, MODE_WRITE, PipelineWorker
+from .workers import (
+    MODE_FETCH,
+    MODE_FULL,
+    MODE_INFER,
+    MODE_WRITE,
+    PipelineWorker,
+    YtdlpWorker,
+)
 
 
 # 選択行のハイライト色。テーマ既定の色は淡く、特に非アクティブ時（フォーカスが
@@ -96,6 +104,13 @@ def apply_color_scheme(name: str) -> None:
 def _as_bool(value) -> bool:
     """QSettings の値を bool へ正規化する（bool が文字列で返ることがあるため）。"""
     return value in (True, "true", "True", 1, "1")
+
+
+def _deno_install_hint() -> str:
+    """OS 別の deno インストール案内（警告ダイアログ用）。"""
+    if sys.platform == "darwin":
+        return "Homebrew の場合: brew install deno"
+    return "winget の場合: winget install DenoLand.Deno（インストール後はアプリを再起動）"
 
 
 def _ffmpeg_install_hint() -> str:
@@ -151,22 +166,8 @@ class MainWindow(QMainWindow):
         # 復元した接続設定の上書きを環境変数へ反映（Config.from_env が読む）
         if any(self._llm_overrides.values()):
             core.apply_env_overrides(self._llm_overrides)
-        if shutil.which("ffmpeg") is None:
-            self.statusBar().showMessage(
-                "警告: ffmpeg が見つかりません。mp3/wav 変換に必要です（PATH を確認してください）"
-            )
-            # ステータスバーだけでは見落とすため起動時に明示的に警告する。
-            # テスト（restore_settings=False）ではモーダルを出さない
-            if self._settings is not None:
-                QMessageBox.warning(
-                    self,
-                    "ffmpeg が見つかりません",
-                    "ffmpeg が見つかりません。ダウンロード後の音声変換・ノーマライズ・"
-                    "無音削除に必要です。\n"
-                    f"インストールして PATH を通してください。{_ffmpeg_install_hint()}",
-                )
-        else:
-            self.statusBar().showMessage("準備完了")
+        self._check_external_tools()
+        self._check_ytdlp()
 
     # -- UI 構築 -------------------------------------------------------------
 
@@ -550,6 +551,115 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage(f"{target.name}/ のファイルはすべて取り込み済みです")
 
+    # -- 外部ツール ----------------------------------------------------------
+
+    def _check_external_tools(self) -> None:
+        """起動時に ffmpeg / deno の有無を確認する。
+
+        どちらも同梱していない（PATH 上の実体を使う）。ステータスバーには
+        まとめて 1 行で出し、見落とし防止のモーダルは不足しているものごとに
+        出す。テスト（restore_settings=False）ではモーダルを出さない。
+        """
+        ffmpeg_missing = shutil.which("ffmpeg") is None
+        # yt-dlp が既定で有効にする JS ランタイムは deno だけ（node が PATH に
+        # あっても --js-runtimes 指定なしでは使われない）ので deno だけを見る
+        deno_missing = shutil.which("deno") is None
+
+        notes = []
+        if ffmpeg_missing:
+            notes.append("ffmpeg が見つかりません。mp3/wav 変換に必要です")
+        if deno_missing:
+            notes.append("deno が見つかりません。ダウンロード速度が大幅に低下します")
+        if notes:
+            self.statusBar().showMessage(
+                "警告: " + " / ".join(notes) + "（PATH を確認してください）"
+            )
+        else:
+            self.statusBar().showMessage("準備完了")
+
+        if self._settings is None:
+            return
+        if ffmpeg_missing:
+            QMessageBox.warning(
+                self,
+                "ffmpeg が見つかりません",
+                "ffmpeg が見つかりません。ダウンロード後の音声変換・ノーマライズ・"
+                "無音削除に必要です。"
+                f"\nインストールして PATH を通してください。{_ffmpeg_install_hint()}",
+            )
+        if deno_missing:
+            QMessageBox.warning(
+                self,
+                "deno が見つかりません",
+                "deno が見つかりません。YouTube のダウンロードで使う JavaScript "
+                "ランタイムです。無くてもダウンロードはできますが、YouTube 側の"
+                "制限が解除できず速度が大幅に落ちます（実測で 10 分の 1 以下）。"
+                f"\nインストールして PATH を通してください。{_deno_install_hint()}",
+            )
+
+    def _confirm_deno(self) -> bool:
+        """DL 実行前の deno 確認。見つからなければ警告し、続行するか尋ねる。
+
+        ffmpeg と違いダウンロード自体は成功する（遅くなるだけ）ため、既定の
+        選択肢は [はい] にしてある。テスト（restore_settings=False）では
+        ダイアログを出さず続行する。
+        """
+        if shutil.which("deno") is not None:
+            return True
+        if self._settings is None:
+            return True
+        ret = QMessageBox.warning(
+            self,
+            "deno が見つかりません",
+            "deno が見つからないため、ダウンロード速度が大幅に低下します"
+            "（実測で 10 分の 1 以下）。"
+            f"\n{_deno_install_hint()}"
+            "\n\nこのまま実行しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        return ret == QMessageBox.StandardButton.Yes
+
+    # -- yt-dlp --------------------------------------------------------------
+
+    def _check_ytdlp(self) -> None:
+        """起動時に yt-dlp の有無を確認し、未取得なら取得を促す。
+
+        yt-dlp は exe に同梱していない（ytdlp_runtime 参照）。ffmpeg と違い
+        これが無いとダウンロード自体ができないため、警告ではなく取得の可否を
+        尋ねる。テスト（restore_settings=False）ではモーダルを出さない。
+        """
+        if ytdlp_runtime.is_available():
+            return
+        self.statusBar().showMessage("yt-dlp が未取得です（[設定] から取得できます）")
+        if self._settings is None:
+            return
+        message = """ダウンロードの実行部（yt-dlp）がまだ取得されていません。
+取得しないとダウンロードは実行できません。
+
+今すぐ取得しますか？（数 MB のダウンロードが発生します）"""
+        ret = QMessageBox.question(
+            self,
+            "yt-dlp を取得しますか？",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if ret == QMessageBox.StandardButton.Yes:
+            self._start_ytdlp_fetch()
+
+    def _start_ytdlp_fetch(self) -> None:
+        """yt-dlp の取得をワーカーで走らせ、経過をステータスバーへ出す。"""
+        worker = YtdlpWorker(check_only=False)
+        worker.signals.status.connect(self.statusBar().showMessage)
+        worker.signals.done.connect(self._on_ytdlp_fetch_done)
+        self._pool.start(worker)
+
+    def _on_ytdlp_fetch_done(self, ok: bool, message: str, needs_restart: bool) -> None:
+        self.statusBar().showMessage(message if ok else "yt-dlp の取得に失敗: " + message)
+        if not ok and self._settings is not None:
+            QMessageBox.warning(self, "yt-dlp を取得できませんでした", message)
+
     # -- パイプライン起動 ----------------------------------------------------
 
     def _confirm_ffmpeg(self) -> bool:
@@ -578,8 +688,14 @@ class MainWindow(QMainWindow):
         if not tracks:
             self.statusBar().showMessage("処理対象がありません")
             return
+        if not ytdlp_runtime.is_available():
+            self.statusBar().showMessage("yt-dlp が未取得のため実行できません（[設定] から取得してください）")
+            return
         if not self._confirm_ffmpeg():
             self.statusBar().showMessage("ffmpeg 未検出のため実行を中止しました")
+            return
+        if not self._confirm_deno():
+            self.statusBar().showMessage("deno 未検出のため実行を中止しました")
             return
         worker = PipelineWorker(
             tracks,

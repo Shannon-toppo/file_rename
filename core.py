@@ -28,7 +28,9 @@ from mutagen.mp4 import MP4
 from mutagen.wave import WAVE
 from mv2title import Config, LLMClient, TitleInput, extract_titles
 from mv2title.connect import DEFAULT_MODEL  # noqa: F401 - MODEL 未設定時の実効値（GUI の表示用に re-export）
-from yt_dlp import YoutubeDL
+
+import ytdlp_runtime
+from ytdlp_runtime import YtdlpUnavailable  # noqa: F401 - 呼び出し元の except 用に re-export
 
 _ROOT = Path(__file__).parent.parent
 
@@ -302,6 +304,34 @@ def check_connection(timeout: float = 3.0) -> tuple[bool, str]:
 # 進捗コールバック。単一動画では番号・全体数は None。
 DownloadProgress = Callable[[str, float, "int | None", "int | None"], None]
 
+# yt-dlp は exe に同梱しない（YouTube の仕様変更で数か月ごとに使えなくなるため、
+# 実体はユーザー領域に置いて GUI から更新する。ytdlp_runtime 参照）。
+# import は sys.path を整えたあとでないと解決できないので ensure_ytdlp() で遅延させる。
+# テストが monkeypatch.setattr(core, "YoutubeDL", FakeYDL) で差し替えられるよう、
+# モジュール属性として持つ（非 None なら ensure_ytdlp() は素通りする）。
+YoutubeDL = None
+
+
+def ensure_ytdlp() -> None:
+    """yt-dlp をロードして core.YoutubeDL に載せる（済んでいれば何もしない）。
+
+    差し替え済み（テストのフェイク）なら sys.path にも import にも触れない。
+
+    Raises:
+        CoreError: yt-dlp が未取得で、ロードできなかった場合。
+    """
+    global YoutubeDL
+    if YoutubeDL is not None:
+        return
+    try:
+        ytdlp_runtime.load()
+        from yt_dlp import YoutubeDL as _YoutubeDL
+    except YtdlpUnavailable as e:
+        raise CoreError(str(e)) from e
+    except ImportError as e:  # load() が通ったのに import できないのは壊れた展開
+        raise CoreError(f"yt-dlp を読み込めませんでした: {e}") from e
+    YoutubeDL = _YoutubeDL
+
 
 def _fetch_localized_title(
     video_id: str, lang: str = METADATA_LANG, timeout: float = 5.0
@@ -401,6 +431,7 @@ def download_tracks(
     """
     if fmt not in SUPPORTED_FORMATS:
         raise ValueError(f"unsupported format: {fmt}")
+    ensure_ytdlp()
     dest = out_dir if out_dir is not None else FILES_DIR
     dest.mkdir(parents=True, exist_ok=True)
     outtmpl = str(dest / "%(title)s [%(id)s].%(ext)s")
@@ -516,6 +547,7 @@ def fetch_metadata(
         CancelledError: cancel がセットされた場合。
         CoreError: 情報を取得できなかった、または有効なエントリが無かった場合。
     """
+    ensure_ytdlp()
     opts = {
         "extract_flat": "in_playlist",
         "noplaylist": not expand_playlist,

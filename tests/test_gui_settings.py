@@ -438,3 +438,59 @@ def test_confirm_ffmpeg_asks_before_run(main_window, monkeypatch):
     assert win._confirm_ffmpeg() is False
     assert len(answers) == 1
     win._settings = None  # closeEvent の _save_settings が触らないよう戻す
+
+
+def test_deno_warning_on_startup(qtbot, monkeypatch):
+    """deno 未検出も ffmpeg と同じく起動時に警告する（無いと DL 速度が落ちる）。"""
+    from gui import main_window as mw
+
+    monkeypatch.setattr(mw.shutil, "which", lambda name: None if name == "deno" else "/usr/bin/x")
+    win = mw.MainWindow(restore_settings=False)
+    qtbot.addWidget(win)
+    message = win.statusBar().currentMessage()
+    assert "deno" in message
+    assert "ffmpeg" not in message  # 見つかっている方は載せない
+    win.close()
+    win.deleteLater()
+    QApplication.processEvents()
+
+
+def test_startup_warning_lists_both_missing_tools(qtbot, monkeypatch):
+    """両方欠けていても片方に潰されない（1 行にまとめて出す）。"""
+    from gui import main_window as mw
+
+    monkeypatch.setattr(mw.shutil, "which", lambda name: None)
+    win = mw.MainWindow(restore_settings=False)
+    qtbot.addWidget(win)
+    message = win.statusBar().currentMessage()
+    assert "ffmpeg" in message and "deno" in message
+    win.close()
+    win.deleteLater()
+    QApplication.processEvents()
+
+
+def test_confirm_deno_asks_before_run(main_window, monkeypatch):
+    """_confirm_deno: deno ありなら常に True。無ければダイアログで確認し、
+    No なら False（テストモード _settings=None ではダイアログなしで続行）。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    from gui import main_window as mw
+
+    win = main_window
+    monkeypatch.setattr(mw.shutil, "which", lambda name: "/usr/bin/deno")
+    assert win._confirm_deno() is True
+
+    monkeypatch.setattr(mw.shutil, "which", lambda name: None)
+    assert win._confirm_deno() is True  # _settings is None → ダイアログなしで続行
+
+    answers = []
+
+    def fake_warning(*args, **kwargs):
+        answers.append(args)
+        return QMessageBox.StandardButton.No
+
+    win._settings = object()  # 非テストモードを擬似（QSettings API は使わない経路）
+    monkeypatch.setattr(mw.QMessageBox, "warning", staticmethod(fake_warning))
+    assert win._confirm_deno() is False
+    assert len(answers) == 1
+    win._settings = None  # closeEvent の _save_settings が触らないよう戻す

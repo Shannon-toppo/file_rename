@@ -28,6 +28,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QRunnable, Signal
 
 import core
+import ytdlp_runtime
 from core import CancelledError, LLMClient, Status, Track
 
 # パイプラインの実行モード
@@ -316,3 +317,67 @@ class PipelineWorker(QRunnable):
         errors = sum(1 for t in tracks if t.status is Status.ERROR)
         skipped = len(tracks) - done - errors
         self.signals.write_summary.emit(done, skipped, errors)
+
+
+class YtdlpSignals(QObject):
+    """YtdlpWorker → メインスレッドのシグナル定義。"""
+
+    # 進行中の説明（「最新版を確認しています...」など）
+    status = Signal(str)
+    # 終了。(成功したか, 表示メッセージ, 再起動が必要か)
+    done = Signal(bool, str, bool)
+
+
+class YtdlpWorker(QRunnable):
+    """yt-dlp の取得・更新をバックグラウンドで行う（QRunnable）。
+
+    PipelineWorker と同じスレッド境界の規約に従う（ウィジェットに触らず
+    シグナルだけを emit する）。ネットワーク待ちで UI を固めないための分離で、
+    通信は ytdlp_runtime 側が担う。
+
+    Args:
+        check_only: True なら最新版の有無を確認するだけで取得しない。
+    """
+
+    def __init__(self, check_only: bool = False):
+        super().__init__()
+        self.signals = YtdlpSignals()
+        self._check_only = check_only
+
+    def run(self) -> None:
+        try:
+            if self._check_only:
+                self._check()
+            else:
+                self._update()
+        except ytdlp_runtime.YtdlpUnavailable as e:
+            self.signals.done.emit(False, str(e), False)
+        except Exception as e:  # noqa: BLE001 - 全例外を UI へ通知する
+            self.signals.done.emit(False, f"予期しないエラー: {e}", False)
+
+    def _check(self) -> None:
+        self.signals.status.emit("最新版を確認しています...")
+        current = ytdlp_runtime.installed_version()
+        latest, _ = ytdlp_runtime.latest_release()
+        if current is None:
+            self.signals.done.emit(True, f"未取得です（最新版 {latest}）", False)
+        elif ytdlp_runtime.parse_version(current) >= ytdlp_runtime.parse_version(latest):
+            self.signals.done.emit(True, f"最新です（{current}）", False)
+        else:
+            self.signals.done.emit(True, f"更新があります: {current} → {latest}", False)
+
+    def _update(self) -> None:
+        self.signals.status.emit("最新版を確認しています...")
+        current = ytdlp_runtime.installed_version()
+        latest, url = ytdlp_runtime.latest_release()
+        if current is not None and ytdlp_runtime.parse_version(current) >= ytdlp_runtime.parse_version(latest):
+            self.signals.done.emit(True, f"最新です（{current}）", False)
+            return
+        self.signals.status.emit(f"yt-dlp {latest} を取得しています...")
+        ytdlp_runtime.install(latest, url)
+        if current is None:
+            # 初回取得はこのセッションからそのまま使える（まだ import していない）
+            self.signals.done.emit(True, f"yt-dlp {latest} を取得しました", False)
+        else:
+            # 既に旧版を import 済みのため、差し替えの反映には再起動が要る
+            self.signals.done.emit(True, f"yt-dlp {latest} に更新しました", True)
