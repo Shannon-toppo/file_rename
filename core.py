@@ -134,6 +134,11 @@ FILES_DIR = app_dir() / "files"
 SUPPORTED_EXTS = (".mp3", ".wav", ".m4a")
 SUPPORTED_FORMATS = ("mp3", "wav", "m4a")
 BATCH_SIZE = 5
+# URL 行を同時に何本ダウンロードするか（GUI の設定で変更可）。yt-dlp は
+# 1 回の呼び出しの中では「受信 → ffmpeg 変換 → 次」を直列に回すので、行を
+# またいで並べないと変換中は回線が空く。増やしすぎると YouTube 側の制限
+# （429）を踏みやすく帯域も分割されるため、控えめな既定にしている。
+MAX_DOWNLOADS = 2
 # YouTube の翻訳メタデータ(タイトル/チャンネル名)の優先言語
 METADATA_LANG = "ja"
 # 音量ノーマライズ(loudnorm)の既定パラメータ。EBU R128 相当のターゲットを
@@ -169,6 +174,7 @@ class Status(Enum):
     QUEUED = "キュー"
     FETCHING = "情報取得中"
     DOWNLOADING = "DL中"
+    CONVERTING = "変換中"  # 受信後の ffmpeg 変換（ノーマライズ / 無音切り詰め含む）
     INFERRING = "推定中"
     PENDING = "確認待ち"
     WRITING = "書き込み中"
@@ -312,12 +318,20 @@ def check_connection(timeout: float = 3.0) -> tuple[bool, str]:
 # 進捗コールバック。単一動画では番号・全体数は None。
 DownloadProgress = Callable[[str, float, "int | None", "int | None"], None]
 
+# 受信完了後の段（ffmpeg 変換・タイトル取得）へ移ったことを知らせるコールバック。
+# 進捗率が取れない段なので、状態そのもの（Status）を渡して表示を切り替えさせる。
+DownloadStage = Callable[["Status"], None]
+
 # yt-dlp は exe に同梱しない（YouTube の仕様変更で数か月ごとに使えなくなるため、
 # 実体はユーザー領域に置いて GUI から更新する。ytdlp_runtime 参照）。
 # import は sys.path を整えたあとでないと解決できないので ensure_ytdlp() で遅延させる。
 # テストが monkeypatch.setattr(core, "YoutubeDL", FakeYDL) で差し替えられるよう、
 # モジュール属性として持つ（非 None なら ensure_ytdlp() は素通りする）。
 YoutubeDL = None
+
+# ensure_ytdlp() の初回ロードを直列化する（並列ダウンロード時に複数スレッドが
+# 同時に sys.path 操作と import を行うのを防ぐ）。
+_YTDLP_LOCK = threading.Lock()
 
 
 def ensure_ytdlp() -> None:
@@ -331,14 +345,17 @@ def ensure_ytdlp() -> None:
     global YoutubeDL
     if YoutubeDL is not None:
         return
-    try:
-        ytdlp_runtime.load()
-        from yt_dlp import YoutubeDL as _YoutubeDL
-    except YtdlpUnavailable as e:
-        raise CoreError(str(e)) from e
-    except ImportError as e:  # load() が通ったのに import できないのは壊れた展開
-        raise CoreError(f"yt-dlp を読み込めませんでした: {e}") from e
-    YoutubeDL = _YoutubeDL
+    with _YTDLP_LOCK:
+        if YoutubeDL is not None:
+            return  # 待っている間に別スレッドがロードし終えていた
+        try:
+            ytdlp_runtime.load()
+            from yt_dlp import YoutubeDL as _YoutubeDL
+        except YtdlpUnavailable as e:
+            raise CoreError(str(e)) from e
+        except ImportError as e:  # load() が通ったのに import できないのは壊れた展開
+            raise CoreError(f"yt-dlp を読み込めませんでした: {e}") from e
+        YoutubeDL = _YoutubeDL
 
 
 def _fetch_localized_title(
@@ -410,6 +427,7 @@ def download_tracks(
     url: str,
     fmt: str = "mp3",
     on_progress: DownloadProgress | None = None,
+    on_stage: DownloadStage | None = None,
     cancel: threading.Event | None = None,
     out_dir: Path | None = None,
     expand_playlist: bool = False,
@@ -429,6 +447,11 @@ def download_tracks(
     （基準値は loudness で変更可。loudnorm_filter 参照）。trim_silence=True だと
     末尾の無音区間を削除する（試験的。TRIM_SILENCE_FILTER 参照）。どちらも
     ffmpeg の再エンコード時に適用される。
+    on_stage は受信完了後の段（Status.CONVERTING = ffmpeg 変換、
+    Status.FETCHING = 日本語タイトル取得）へ移ったときに呼ばれる。on_progress は
+    バイト受信中しか呼ばれないため、これが無いと変換とタイトル取得の間ずっと
+    進捗が最後の % のまま止まって見える（変換はノーマライズ・無音切り詰めを
+    含む全編の再エンコードで、無音切り詰め ON なら areverse の分だけさらに重い）。
     logger を渡すと yt-dlp の出力を stdout ではなくその Python ロガーへ流す
     （quiet=True 併用で logging 経由へ完全に切り替える。GUI のログパネル用）。
     None なら現状どおり yt-dlp が直接コンソールへ出力する（CLI 用）。
@@ -461,12 +484,21 @@ def download_tracks(
                     info.get("n_entries"),
                 )
 
+    def pp_hook(d: dict) -> None:
+        # 受信が終わってポストプロセッサ（音声抽出 = ffmpeg 変換、ファイル移動）
+        # に入ったことを通知する。ここでは進捗率が取れないので状態だけ。
+        # 進捗フック(hook)と違い例外は投げない — 変換中に中断するとファイルが
+        # 中途半端に残るため、キャンセルは現在のファイルを書き終えてから効かせる。
+        if on_stage is not None and d.get("status") == "started":
+            on_stage(Status.CONVERTING)
+
     opts = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
         "noplaylist": not expand_playlist,
         "ignoreerrors": True,  # 一部の動画が失敗してもリスト全体を止めない
         "progress_hooks": [hook],
+        "postprocessor_hooks": [pp_hook],
         # YouTube は既定で英語のメタデータを返すため、投稿者が英訳を用意して
         # いる動画では英語のタイトル/チャンネル名になってしまう。翻訳メタデータ
         # の優先言語を日本語に指定する（日本語版が無ければ原語のまま）。
@@ -508,6 +540,10 @@ def download_tracks(
 
         # 再生リストなら entries を、単一動画ならそれ自身を対象にする
         entries = info["entries"] if "entries" in info else [info]
+        if on_stage is not None:
+            # 以降は動画ごとに watch 画面へ問い合わせる（1 本あたり最大 5 秒）。
+            # ここも進捗が出ないので、変換とは別の段として見せる。
+            on_stage(Status.FETCHING)
         for entry in entries:
             if not entry:
                 # ignoreerrors により失敗した項目は None になる

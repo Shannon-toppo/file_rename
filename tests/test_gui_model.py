@@ -140,14 +140,16 @@ def test_background_colors():
     warn = Track(stem="c", status=Status.PENDING, valid=False)
     busy_dl = Track(stem="d", status=Status.DOWNLOADING)
     busy_inf = Track(stem="e", status=Status.INFERRING)
+    busy_conv = Track(stem="g", status=Status.CONVERTING)
     plain = Track(stem="f", status=Status.QUEUED)
-    model = TrackTableModel([done, error, warn, busy_dl, busy_inf, plain])
+    model = TrackTableModel([done, error, warn, busy_dl, busy_inf, busy_conv, plain])
     assert isinstance(_bg(model, 0), QColor)  # DONE 薄緑
     assert isinstance(_bg(model, 1), QColor)  # ERROR 薄赤
     assert isinstance(_bg(model, 2), QColor)  # 要確認 薄黄
     assert isinstance(_bg(model, 3), QColor)  # DL 薄青
     assert isinstance(_bg(model, 4), QColor)  # 推定 薄青
-    assert _bg(model, 5) is None  # QUEUED は無色
+    assert isinstance(_bg(model, 5), QColor)  # 変換 薄青
+    assert _bg(model, 6) is None  # QUEUED は無色
     # 色が状態ごとに区別されていること
     assert _bg(model, 0) != _bg(model, 1)
     assert _bg(model, 1) != _bg(model, 2)
@@ -197,6 +199,25 @@ def test_status_shows_playlist_position():
     model = TrackTableModel([t])
     model.set_percent(t, 30.0, label="2/5")
     assert model.data(_idx(model, 0, COL_STATUS), Qt.ItemDataRole.DisplayRole) == "DL中 2/5 30%"
+
+
+def test_status_converting_keeps_playlist_position_without_percent():
+    """変換中は進捗率が取れないので「変換中 2/5」と番号だけ残す。
+
+    受信後の ffmpeg 変換（ノーマライズ・無音切り詰め）は進捗が出ないため、
+    ここで DL の % を出し続けると「100% のまま止まった」ように見える。
+    """
+    t = Track(stem="a", status=Status.DOWNLOADING)
+    model = TrackTableModel([t])
+    model.set_percent(t, 100.0, label="2/5")
+    t.status = Status.CONVERTING
+    assert model.data(_idx(model, 0, COL_STATUS), Qt.ItemDataRole.DisplayRole) == "変換中 2/5"
+
+    single = Track(stem="b", status=Status.DOWNLOADING)
+    model2 = TrackTableModel([single])
+    model2.set_percent(single, 100.0)
+    single.status = Status.CONVERTING
+    assert model2.data(_idx(model2, 0, COL_STATUS), Qt.ItemDataRole.DisplayRole) == "変換中"
 
 
 def test_artist_column_editable_and_setdata():

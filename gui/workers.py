@@ -19,7 +19,11 @@
    されることが保証される（ワーカーとスロットは同じ Track を同時に触らない）。
 5. キャンセルは threading.Event。停止ボタンで set() し、core.download_tracks
    に渡す。推定・書き込みは段の境目で is_set() を確認して CancelledError。
-6. MODE_FULL では DL 段と推定段を並走させる（_InferStage）。ワーカースレッド
+6. MODE_FULL の DL 段は URL 行を max_downloads 本まで並列に走らせる
+   （_download_all のプール）。yt-dlp は 1 呼び出しの中では受信と ffmpeg 変換を
+   直列に回すため、行をまたがないと変換中は回線が空く。行ごとに触る Track は
+   別物で、後続段への受け渡し（publish）だけロックで直列化する。
+7. MODE_FULL では DL 段と推定段を並走させる（_InferStage）。ワーカースレッド
    の内側にもう 1 本だけスレッドを持ち、DL で溜まった行をバッチ単位で推定
    （＋自動書き込み）へ流す。並走するのはこの 2 本だけで、推定側は
    max_workers=1 なので LLM への同時リクエストは常に 1 本。シグナルは
@@ -79,6 +83,7 @@ class PipelineWorker(QRunnable):
             False でも MODE_FULL 冒頭の接続チェックに失敗すると自動で
             縮退し、connection_failed を emit する。
         batch_size: core.infer_titles へ渡すバッチサイズ（None なら core 既定）。
+        max_downloads: URL 行を同時に DL する本数（None なら core.MAX_DOWNLOADS）。
         out_dir: DL 保存先（None なら core.FILES_DIR）。
         expand_playlist: True なら動画＋リスト混在 URL もリスト全体を展開する
             （MODE_FETCH の情報取得にも同じ設定が効く）。
@@ -98,6 +103,7 @@ class PipelineWorker(QRunnable):
         cancel: threading.Event | None = None,
         skip_infer: bool = False,
         batch_size: int | None = None,
+        max_downloads: int | None = None,
         out_dir: Path | None = None,
         expand_playlist: bool = False,
         normalize: bool = True,
@@ -115,6 +121,9 @@ class PipelineWorker(QRunnable):
         self._cancel = cancel or threading.Event()
         self._skip_infer = skip_infer
         self._batch_size = batch_size if batch_size is not None else core.BATCH_SIZE
+        self._max_downloads = (
+            max_downloads if max_downloads is not None else core.MAX_DOWNLOADS
+        )
         self._out_dir = out_dir
         self._expand_playlist = expand_playlist
         self._normalize = normalize
@@ -190,90 +199,136 @@ class PipelineWorker(QRunnable):
     ) -> list[Track]:
         """URL 行を DL して実 Track 行へ差し替える。ローカル行はそのまま返す。
 
+        URL 行は **max_downloads 本まで並列**に走らせる。yt-dlp は 1 回の
+        呼び出しの中では「受信 → ffmpeg 変換 → 次の動画」を直列に回し、
+        後処理を裏へ回すオプションが無い（並列オプションは 1 本の動画を
+        分割取得する --concurrent-fragments だけ）。行をまたいで並べないと、
+        変換（全編の再エンコード。無音削除 ON ならさらに重い）の間ずっと
+        回線が空いたままになる。
+        テーブルの並びは崩れない — `model.replace_track` はプレースホルダを
+        同一性で探してその位置に差し替えるので、完了順が前後しても行は動かない。
+        なお 1 行が再生リスト URL の場合、その中身は yt-dlp 内で直列のまま
+        （並列化したいなら先に [情報取得] で 1 動画 1 行へ展開する）。
+
         Args:
             on_ready: 1 行ぶんの DL が終わるたびに、後続段へ渡せるように
                 なった Track のリストで呼ばれる（推定との並走用）。tracks_ready
                 を emit した**後**に呼ぶので、UI 側は必ず行の差し替えを先に
-                受け取る。None なら戻り値にまとめるだけ。
+                受け取る。複数の DL スレッドから呼ばれるが、publish() の
+                ロックで直列化してから渡す。None なら戻り値にまとめるだけ。
 
         Returns:
             後続の推定対象となる Track のリスト（DL 済み実 Track + ローカル行）。
         """
+        self._check_cancel()
         ready: list[Track] = []
-        attempted = 0  # DL を試みた行数（スキップ行は集計に含めない）
-        failed = 0
+        targets: list[Track] = []
+        lock = threading.Lock()
+
+        def publish(tracks: list[Track]) -> None:
+            # ready への追記と後続段への受け渡しを直列化する（_InferStage の
+            # バッファは単一スレッドからの呼び出しを前提にしている）
+            with lock:
+                ready.extend(tracks)
+                if on_ready is not None:
+                    on_ready(list(tracks))
+
         for placeholder in self._tracks:
-            self._check_cancel()
             if placeholder.url is None or placeholder.filepath is not None:
                 # ローカルファイル行と DL 済みの実 Track 行（url と filepath の
                 # 両方を持つ）は DL をスキップ（再実行時の再ダウンロード防止）
-                ready.append(placeholder)
-                if on_ready is not None:
-                    on_ready([placeholder])
-                continue
-            attempted += 1
+                publish([placeholder])
+            else:
+                targets.append(placeholder)
 
-            placeholder.status = Status.DOWNLOADING
-            placeholder.error = ""
-            self.signals.track_updated.emit(placeholder)
-
-            def on_progress(
-                _name: str,
-                pct: float,
-                index: int | None = None,
-                total: int | None = None,
-                _ph: Track = placeholder,
-            ) -> None:
-                # 再生リストなら「何番目/全体数」ラベルを添える
-                label = f"{index}/{total}" if index and total else ""
-                self.signals.progress.emit(_ph, pct, label)
-
-            try:
-                new_tracks = core.download_tracks(
-                    placeholder.url,
-                    self._fmt,
-                    on_progress=on_progress,
-                    cancel=self._cancel,
-                    out_dir=self._out_dir,
-                    expand_playlist=self._expand_playlist,
-                    normalize=self._normalize,
-                    loudness=self._loudness,
-                    trim_silence=self._trim_silence,
-                    # yt-dlp の出力をログパネルへ流す（GUI 経由の DL は常に
-                    # logging 経由）。ハンドラはワーカースレッドから呼ばれるが
-                    # QtLogHandler はシグナル emit のみでスレッド安全（logpanel.py）
-                    logger=logging.getLogger("yt_dlp"),
-                )
-            except CancelledError:
-                raise
-            except Exception as e:  # noqa: BLE001 - 行単位のエラーは他行を止めない
-                placeholder.status = Status.ERROR
-                placeholder.error = f"ダウンロードに失敗しました: {e}"
-                self.signals.track_updated.emit(placeholder)
-                failed += 1
-                continue
-
-            # 情報取得済み行への手動編集（タイトル・アーティスト）は、DL で
-            # 行が実 Track へ差し替わっても失われないよう引き継ぐ（単一動画
-            # のみ。リスト展開はどの行への編集か対応付けられないため対象外）
-            if len(new_tracks) == 1:
-                real = new_tracks[0]
-                if placeholder.manual:
-                    real.guessed_title = placeholder.guessed_title
-                    real.manual = True
-                    real.valid = placeholder.valid
-                    real.status = Status.PENDING
-                if placeholder.artist:
-                    real.artist = placeholder.artist
-
-            # プレースホルダ行を実 Track 行（再生リストは複数）へ差し替える
-            self.signals.tracks_ready.emit(placeholder, new_tracks)
-            ready.extend(new_tracks)
-            if on_ready is not None:
-                on_ready(list(new_tracks))
-        if attempted:
-            self.signals.stage_summary.emit("ダウンロード", attempted - failed, failed)
+        if targets:
+            workers = max(1, min(self._max_downloads, len(targets)))
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dl") as pool:
+                # 行単位の成否は _download_one が返す（例外は中で吸収する）
+                results = list(pool.map(lambda ph: self._download_one(ph, publish), targets))
+            attempted = sum(1 for r in results if r is not None)
+            failed = sum(1 for r in results if r is False)
+            if attempted:
+                self.signals.stage_summary.emit("ダウンロード", attempted - failed, failed)
         return ready
+
+    def _download_one(
+        self, placeholder: Track, publish: Callable[[list[Track]], None]
+    ) -> bool | None:
+        """URL 行を 1 つ DL する（DL スレッド上で動く）。
+
+        Returns:
+            True = 成功 / False = 失敗（行を ERROR にした）/
+            None = キャンセルで実施しなかった（集計に数えない）。
+            他行を止めないため、例外はここで吸収して戻り値へ落とす。
+        """
+        if self._cancel.is_set():
+            return None
+        placeholder.status = Status.DOWNLOADING
+        placeholder.error = ""
+        self.signals.track_updated.emit(placeholder)
+
+        def on_progress(
+            _name: str,
+            pct: float,
+            index: int | None = None,
+            total: int | None = None,
+            _ph: Track = placeholder,
+        ) -> None:
+            # 再生リストなら「何番目/全体数」ラベルを添える
+            label = f"{index}/{total}" if index and total else ""
+            self.signals.progress.emit(_ph, pct, label)
+
+        def on_stage(status: Status, _ph: Track = placeholder) -> None:
+            # 受信完了後の段（変換・タイトル取得）は進捗率が出ないので、
+            # 状態列を差し替えて「100% のまま固まった」ように見せない
+            _ph.status = status
+            self.signals.track_updated.emit(_ph)
+
+        try:
+            new_tracks = core.download_tracks(
+                placeholder.url,
+                self._fmt,
+                on_progress=on_progress,
+                on_stage=on_stage,
+                cancel=self._cancel,
+                out_dir=self._out_dir,
+                expand_playlist=self._expand_playlist,
+                normalize=self._normalize,
+                loudness=self._loudness,
+                trim_silence=self._trim_silence,
+                # yt-dlp の出力をログパネルへ流す（GUI 経由の DL は常に
+                # logging 経由）。ハンドラはワーカースレッドから呼ばれるが
+                # QtLogHandler はシグナル emit のみでスレッド安全（logpanel.py）
+                logger=logging.getLogger("yt_dlp"),
+            )
+        except CancelledError:
+            # 並列実行なので他行へ例外を伝播させない。全行が片付いたあと、
+            # _run_full / 縮退モードの _check_cancel でまとめて中断する。
+            return None
+        except Exception as e:  # noqa: BLE001 - 行単位のエラーは他行を止めない
+            placeholder.status = Status.ERROR
+            placeholder.error = f"ダウンロードに失敗しました: {e}"
+            self.signals.track_updated.emit(placeholder)
+            return False
+
+        # 情報取得済み行への手動編集（タイトル・アーティスト）は、DL で
+        # 行が実 Track へ差し替わっても失われないよう引き継ぐ（単一動画
+        # のみ。リスト展開はどの行への編集か対応付けられないため対象外）
+        if len(new_tracks) == 1:
+            real = new_tracks[0]
+            if placeholder.manual:
+                real.guessed_title = placeholder.guessed_title
+                real.manual = True
+                real.valid = placeholder.valid
+                real.status = Status.PENDING
+            if placeholder.artist:
+                real.artist = placeholder.artist
+
+        # プレースホルダ行を実 Track 行（再生リストは複数）へ差し替える
+        self.signals.tracks_ready.emit(placeholder, new_tracks)
+        publish(list(new_tracks))
+        return True
 
     def _run_fetch(self) -> None:
         """URL 行のメタデータだけを取得し、行を展開する（DL しない）。
@@ -379,6 +434,10 @@ class _InferStage:
 
     行の所有権: feed() へ渡した Track を DL 側が触ることはないので、
     1 つの Track を同時に触るスレッドは常に 1 本。
+
+    feed() は DL 側の publish() ロックで直列化されている前提（DL は複数
+    スレッドで走る）。close() はプールを畳んだあとのワーカースレッドから
+    呼ばれるので、_buf を同時に触るスレッドは常に 1 本になる。
     """
 
     def __init__(self, worker: "PipelineWorker"):

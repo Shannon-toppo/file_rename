@@ -210,6 +210,7 @@ class FakeYDL:
 
     info: dict | None = None
     hook_feed: list[dict] = []
+    pp_feed: list[dict] = []  # postprocessor_hooks へ流すイベント（変換段の通知用）
     last_opts: dict | None = None  # 直近に渡された yt-dlp オプション（検査用）
     last_download: bool | None = None  # extract_info の download 引数（検査用）
 
@@ -228,6 +229,9 @@ class FakeYDL:
         for d in self.hook_feed:
             for hook in self.opts.get("progress_hooks", []):
                 hook(d)
+        for d in self.pp_feed:
+            for hook in self.opts.get("postprocessor_hooks", []):
+                hook(d)
         return self.info
 
     def prepare_filename(self, entry):
@@ -244,6 +248,7 @@ def fake_ydl(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "_fetch_localized_title", lambda *a, **k: None)
     FakeYDL.info = None
     FakeYDL.hook_feed = []
+    FakeYDL.pp_feed = []
     FakeYDL.last_opts = None
     FakeYDL.last_download = None
     return FakeYDL
@@ -318,6 +323,38 @@ def test_download_tracks_progress_playlist_index(fake_ydl, tmp_path):
         "u", "mp3", on_progress=lambda n, p, i=None, t=None: seen.append((p, i, t))
     )
     assert seen == [(30.0, 2, 5)]
+
+
+def test_download_tracks_reports_stages_after_download(fake_ydl, tmp_path):
+    """受信後の段（ffmpeg 変換 → タイトル取得）が on_stage で通知される。
+
+    進捗フックは受信中しか呼ばれないので、これが無いと変換（ノーマライズ・
+    無音切り詰め込み）とタイトル取得の間ずっと「DL中 100%」に見えてしまう。
+    """
+    fake_ydl.info = entry_for(tmp_path, "a")
+    fake_ydl.pp_feed = [
+        {"status": "started", "postprocessor": "ExtractAudio"},
+        {"status": "finished", "postprocessor": "ExtractAudio"},
+    ]
+    seen = []
+    core.download_tracks("u", "mp3", on_stage=seen.append)
+    # started で「変換中」、entries ループ手前で「情報取得中」。finished は無視
+    assert seen == [core.Status.CONVERTING, core.Status.FETCHING]
+
+
+def test_download_tracks_stage_hook_does_not_cancel(fake_ydl, tmp_path):
+    """変換中のキャンセルは即座に打ち切らない（中途半端なファイルを残さない）。
+
+    キャンセルは extract_info を抜けた直後の再確認で効く。
+    """
+    fake_ydl.info = entry_for(tmp_path, "a")
+    fake_ydl.pp_feed = [{"status": "started", "postprocessor": "ExtractAudio"}]
+    cancel = threading.Event()
+    cancel.set()
+    seen = []
+    with pytest.raises(CancelledError):
+        core.download_tracks("u", "mp3", on_stage=seen.append, cancel=cancel)
+    assert seen == [core.Status.CONVERTING]  # フックは呼ばれてから中断する
 
 
 def test_download_tracks_empty_raises(fake_ydl, tmp_path):
