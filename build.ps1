@@ -1,4 +1,4 @@
-# Windows 用ビルドスクリプト: dist/FileRenameGUI/ を作る（onedir）。
+﻿# Windows 用ビルドスクリプト: dist/FileRenameGUI/ を作る（onedir）。
 # 前提: uv がインストール済みで、../mv2title が sibling に存在すること。
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
