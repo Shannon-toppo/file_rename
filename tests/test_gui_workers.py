@@ -557,6 +557,109 @@ def test_reinfer_without_force_protects_manual(qtbot, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# DL と推定の並走（_InferStage）
+# ---------------------------------------------------------------------------
+
+
+def test_infer_starts_before_all_downloads_finish(qtbot, monkeypatch):
+    """バッチ数ぶん DL が終わった時点で、残りの DL と並行して推定が始まる。
+
+    3 件目の DL を「1 バッチ目の推定が始まるまで」待たせ、イベント列で
+    推定が最後の DL より先に走ったことを確かめる（直列なら推定は全 DL の
+    後になり、順序の assert で落ちる）。
+    """
+    events = []  # list.append は GIL 下で不可分。スレッド間の記録用
+    infer_started = threading.Event()
+
+    def fake_dl(url, fmt="mp3", on_progress=None, cancel=None, **kwargs):
+        if url == "u2":
+            infer_started.wait(timeout=5)
+        events.append(f"dl:{url}")
+        return [Track(stem=url, filepath=f"{url}.mp3")]
+
+    def fake_infer(tracks, client=None, batch_size=5, force=False):
+        events.append("infer")
+        infer_started.set()
+        for t in tracks:
+            t.guessed_title = "song"
+            t.valid = True
+            t.status = Status.PENDING
+
+    monkeypatch.setattr(core, "download_tracks", fake_dl)
+    monkeypatch.setattr(core, "infer_titles", fake_infer)
+    fake_write_factory(monkeypatch)
+
+    placeholders = [Track(stem=u, url=u) for u in ("u0", "u1", "u2", "u3")]
+    worker = PipelineWorker(placeholders, mode=MODE_FULL, auto_write=True, batch_size=2)
+    run_worker(qtbot, worker, timeout=10000)
+
+    assert events.index("infer") < events.index("dl:u3")
+
+
+def test_downloads_are_fed_to_infer_in_batches(qtbot, monkeypatch):
+    """推定はバッチ数ごとに分割して呼ばれ、書き込み集計は最後に 1 回だけ出る。"""
+    urls = [f"u{i}" for i in range(5)]
+    fake_download_factory(
+        monkeypatch, {u: [Track(stem=u, filepath=f"{u}.mp3")] for u in urls}
+    )
+    calls = fake_infer_factory(monkeypatch)
+    written = fake_write_factory(monkeypatch)
+
+    placeholders = [Track(stem=u, url=u) for u in urls]
+    worker = PipelineWorker(placeholders, mode=MODE_FULL, auto_write=True, batch_size=2)
+    summaries = []
+    worker.signals.write_summary.connect(lambda d, s, e: summaries.append((d, s, e)))
+    run_worker(qtbot, worker)
+
+    # 2 + 2 + 端数 1 の 3 回に分かれ、全行がちょうど 1 回ずつ処理される
+    assert [len(c["tracks"]) for c in calls] == [2, 2, 1]
+    assert len(written) == 5
+    assert summaries == [(5, 0, 0)]  # バッチごとではなく合算で 1 回
+
+
+def test_infer_failure_stops_later_batches_but_finishes_downloads(qtbot, monkeypatch):
+    """推定が失敗したら以降のバッチは投入しない。DL は最後まで走らせる。
+
+    DL が一番コストの高い段なので、LLM が落ちていても取得ぶんは残す。
+    失敗した推定は（DL 完走後に）error シグナルで通知される。
+    """
+    downloaded = []
+    infer_failed = threading.Event()
+
+    def fake_dl(url, fmt="mp3", on_progress=None, cancel=None, **kwargs):
+        if url != "u0":
+            # 1 件目の推定が失敗するまで待ってから次の行を投入する
+            infer_failed.wait(timeout=5)
+        downloaded.append(url)
+        return [Track(stem=url, filepath=f"{url}.mp3")]
+
+    calls = []
+
+    def fake_infer(tracks, client=None, batch_size=5, force=False):
+        calls.append(list(tracks))
+        for t in tracks:
+            t.status = Status.ERROR
+            t.error = "推定失敗"
+        infer_failed.set()
+        raise CoreError("件数不一致")
+
+    monkeypatch.setattr(core, "download_tracks", fake_dl)
+    monkeypatch.setattr(core, "infer_titles", fake_infer)
+    written = fake_write_factory(monkeypatch)
+
+    placeholders = [Track(stem=u, url=u) for u in ("u0", "u1", "u2")]
+    worker = PipelineWorker(placeholders, mode=MODE_FULL, auto_write=True, batch_size=1)
+    errors = []
+    worker.signals.error.connect(errors.append)
+    run_worker(qtbot, worker, timeout=10000)
+
+    assert len(calls) == 1  # 2 バッチ目以降は投入しない
+    assert downloaded == ["u0", "u1", "u2"]  # DL は完走する
+    assert written == []
+    assert errors and "件数不一致" in errors[0]
+
+
+# ---------------------------------------------------------------------------
 # YtdlpWorker（本体 + EJS の取得・更新）
 # ---------------------------------------------------------------------------
 

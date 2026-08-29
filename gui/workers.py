@@ -19,10 +19,18 @@
    されることが保証される（ワーカーとスロットは同じ Track を同時に触らない）。
 5. キャンセルは threading.Event。停止ボタンで set() し、core.download_tracks
    に渡す。推定・書き込みは段の境目で is_set() を確認して CancelledError。
+6. MODE_FULL では DL 段と推定段を並走させる（_InferStage）。ワーカースレッド
+   の内側にもう 1 本だけスレッドを持ち、DL で溜まった行をバッチ単位で推定
+   （＋自動書き込み）へ流す。並走するのはこの 2 本だけで、推定側は
+   max_workers=1 なので LLM への同時リクエストは常に 1 本。シグナルは
+   どちらのスレッドから emit しても queued connection でメインスレッドへ
+   直列化される。行は DL 側 → 推定側の順にしか触られない（feed 済みの行を
+   DL 側が再度触ることはない）ので、Track の所有権は常に片側にある。
 """
 import logging
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, Signal
@@ -142,7 +150,13 @@ class PipelineWorker(QRunnable):
             raise CancelledError("処理がキャンセルされました。")
 
     def _run_full(self) -> None:
-        """接続チェック → DL（URL 行のみ）→ まとめて推定 → 自動書き込み。
+        """接続チェック → DL（URL 行のみ）→ 推定 → 自動書き込み。
+
+        推定は DL と**並走**させる（_InferStage）。DL の完了行をバッチ数
+        （batch_size）ぶん溜めた時点で推定へ流すので、リストが 1 バッチより
+        長ければ「残りの DL」と「溜まったぶんの推定」が同時に進む。
+        1 バッチに満たない端数は DL 完了後にまとめて流す（= 従来と同じ
+        1 回の推定）ので、少数の行では挙動が変わらない。
 
         LLM エンドポイントに届かない場合は DL のみの縮退モードへ自動で
         切り替える（行は QUEUED で残るので、サーバ起動後に再実行すれば
@@ -154,21 +168,33 @@ class PipelineWorker(QRunnable):
             if not ok:
                 skip_infer = True
                 self.signals.connection_failed.emit(msg)
-        ready: list[Track] = self._download_all()
-        self._check_cancel()
         if skip_infer:
-            return  # 縮退モード: DL のみで終了（QUEUED のまま）
-        # DL 済み + ローカル追加分のうち、推定対象を集める
-        self._run_infer(ready)
-        if not self._auto_write:
-            return  # PENDING（確認待ち）で停止
-        self._check_cancel()
-        # 推定に成功した（PENDING の）行を書き込む
-        writable = [t for t in ready if t.status is Status.PENDING]
-        self._run_write(writable)
+            # 縮退モード: DL のみで終了（QUEUED のまま）
+            self._download_all()
+            self._check_cancel()
+            return
 
-    def _download_all(self) -> list[Track]:
+        stage = _InferStage(self)
+        try:
+            self._download_all(on_ready=stage.feed)
+        finally:
+            # DL がキャンセル・例外で抜けても、投入済みバッチは必ず回収する
+            # （シグナルを finished より後に emit させないため）
+            stage.close(flush=not self._cancel.is_set())
+        self._check_cancel()
+        stage.raise_if_failed()
+        stage.emit_write_summary()
+
+    def _download_all(
+        self, on_ready: Callable[[list[Track]], None] | None = None
+    ) -> list[Track]:
         """URL 行を DL して実 Track 行へ差し替える。ローカル行はそのまま返す。
+
+        Args:
+            on_ready: 1 行ぶんの DL が終わるたびに、後続段へ渡せるように
+                なった Track のリストで呼ばれる（推定との並走用）。tracks_ready
+                を emit した**後**に呼ぶので、UI 側は必ず行の差し替えを先に
+                受け取る。None なら戻り値にまとめるだけ。
 
         Returns:
             後続の推定対象となる Track のリスト（DL 済み実 Track + ローカル行）。
@@ -182,6 +208,8 @@ class PipelineWorker(QRunnable):
                 # ローカルファイル行と DL 済みの実 Track 行（url と filepath の
                 # 両方を持つ）は DL をスキップ（再実行時の再ダウンロード防止）
                 ready.append(placeholder)
+                if on_ready is not None:
+                    on_ready([placeholder])
                 continue
             attempted += 1
 
@@ -241,6 +269,8 @@ class PipelineWorker(QRunnable):
             # プレースホルダ行を実 Track 行（再生リストは複数）へ差し替える
             self.signals.tracks_ready.emit(placeholder, new_tracks)
             ready.extend(new_tracks)
+            if on_ready is not None:
+                on_ready(list(new_tracks))
         if attempted:
             self.signals.stage_summary.emit("ダウンロード", attempted - failed, failed)
         return ready
@@ -298,6 +328,12 @@ class PipelineWorker(QRunnable):
         ]
         if not targets:
             return
+        # 推定中であることを先に見せる（DL と並走するので、DL 中の行と
+        # 推定中の行が同時に並ぶ）。core.infer_titles も同じ状態を設定する。
+        for t in targets:
+            t.status = Status.INFERRING
+            t.error = ""
+            self.signals.track_updated.emit(t)
         try:
             core.infer_titles(
                 targets, client=self._client, batch_size=self._batch_size, force=self._force
@@ -312,11 +348,147 @@ class PipelineWorker(QRunnable):
         self._check_cancel()
         if not tracks:
             return
+        done, skipped, errors = self._write_tracks(tracks)
+        self.signals.write_summary.emit(done, skipped, errors)
+
+    def _write_tracks(self, tracks: Sequence[Track]) -> tuple[int, int, int]:
+        """タグを書き込み (完了, スキップ, 失敗) を返す（emit はしない）。
+
+        並走モードでは書き込みもバッチごとに走るため、集計の通知は
+        呼び出し元（_InferStage）が最後に 1 回だけ行う。
+        """
+        if not tracks:
+            return (0, 0, 0)
         core.write_tags(list(tracks), on_result=lambda t: self.signals.track_updated.emit(t))
         done = sum(1 for t in tracks if t.status is Status.DONE)
         errors = sum(1 for t in tracks if t.status is Status.ERROR)
-        skipped = len(tracks) - done - errors
-        self.signals.write_summary.emit(done, skipped, errors)
+        return (done, len(tracks) - done - errors, errors)
+
+
+class _InferStage:
+    """DL と並走してタイトル推定（＋自動書き込み）を進める段。
+
+    PipelineWorker（= DL 側）が feed() で完了行を渡し、推定対象がバッチ数に
+    達したぶんだけ内部スレッドへ投入する。DL のネットワーク待ちと LLM の
+    推論待ちが重なるので、行数がバッチ数を超えるほど効いてくる。
+
+    スレッドは max_workers=1 の ThreadPoolExecutor 1 本だけ。LLM への
+    リクエストが同時に 2 本走らないようにするためで、バッチは投入順に
+    直列で処理される。ワーカーと同じくウィジェットには触らず、シグナルの
+    emit だけを行う（queued connection なのでスレッドは問わない）。
+
+    行の所有権: feed() へ渡した Track を DL 側が触ることはないので、
+    1 つの Track を同時に触るスレッドは常に 1 本。
+    """
+
+    def __init__(self, worker: "PipelineWorker"):
+        self._worker = worker
+        self._batch_size = max(1, worker._batch_size)
+        self._buf: list[Track] = []  # DL 側スレッドのみが触る（ロック不要）
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="infer")
+        self._lock = threading.Lock()  # 以下の集計・エラーを両スレッドで共有
+        self._error: BaseException | None = None
+        self._attempted = 0  # 書き込みを試みた行数（0 なら集計を出さない）
+        self._done = 0
+        self._skipped = 0
+        self._errors = 0
+
+    # -- DL 側スレッドから呼ばれる ------------------------------------------
+
+    def feed(self, tracks: list[Track]) -> None:
+        """DL が終わった行を受け取り、溜まったらバッチとして投入する。"""
+        self._buf.extend(tracks)
+        while self._count_targets(self._buf) >= self._batch_size:
+            self._submit(self._take_chunk())
+
+    def close(self, flush: bool = True) -> None:
+        """端数を流し込み、投入済みバッチの完了まで待つ。
+
+        Args:
+            flush: False（キャンセル時）なら残りは投入せず、未着手のバッチも
+                捨てる。実行中の 1 バッチだけは待つ（シグナルを finished より
+                後に emit させないため）。
+        """
+        while flush and self._buf:
+            self._submit(self._take_chunk())
+        self._buf = []
+        self._pool.shutdown(wait=True, cancel_futures=not flush)
+
+    def raise_if_failed(self) -> None:
+        """推定・書き込み中に起きた最初の例外を、ワーカースレッドで送出する。
+
+        並走している都合上、失敗しても DL は最後まで走らせる（DL が一番高い
+        コストなので、LLM が落ちていても取得ぶんは残す）。2 バッチ目以降は
+        投入を止めるため、同じ失敗が行数ぶん繰り返されることはない。
+        """
+        if self._error is not None:
+            raise self._error
+
+    def emit_write_summary(self) -> None:
+        """バッチごとの書き込み結果を合算して 1 回だけ通知する。"""
+        if self._attempted:
+            self._worker.signals.write_summary.emit(self._done, self._skipped, self._errors)
+
+    # -- 内部 ---------------------------------------------------------------
+
+    def _is_target(self, track: Track) -> bool:
+        """_run_infer が推定対象とみなす行か（バッチ数を数えるのに使う）。"""
+        return track.status in (Status.QUEUED, Status.PENDING) and (
+            self._worker._force or not track.manual
+        )
+
+    def _count_targets(self, tracks: list[Track]) -> int:
+        return sum(1 for t in tracks if self._is_target(t))
+
+    def _take_chunk(self) -> list[Track]:
+        """推定対象をちょうど batch_size 件含む最短の先頭部分を切り出す。
+
+        推定対象でない行（手動編集済みなど）も一緒に運ぶ。自動書き込みの
+        対象になるので、どこかのバッチに乗せないと書き残しになる。
+        """
+        count = 0
+        for i, t in enumerate(self._buf):
+            if self._is_target(t):
+                count += 1
+                if count == self._batch_size:
+                    chunk = self._buf[: i + 1]
+                    del self._buf[: i + 1]
+                    return chunk
+        chunk, self._buf = self._buf, []
+        return chunk
+
+    def _submit(self, chunk: list[Track]) -> None:
+        if not chunk:
+            return
+        with self._lock:
+            failed = self._error is not None
+        if failed or self._worker._cancel.is_set():
+            return  # 失敗・キャンセル後は投入しない（行は QUEUED のまま残る）
+        self._pool.submit(self._process, chunk)
+
+    # -- 推定スレッド側 ------------------------------------------------------
+
+    def _process(self, chunk: list[Track]) -> None:
+        try:
+            self._worker._run_infer(chunk)
+            if not self._worker._auto_write:
+                return  # PENDING（確認待ち）で停止
+            self._worker._check_cancel()
+            writable = [t for t in chunk if t.status is Status.PENDING]
+            if not writable:
+                return
+            done, skipped, errors = self._worker._write_tracks(writable)
+            with self._lock:
+                self._attempted += len(writable)
+                self._done += done
+                self._skipped += skipped
+                self._errors += errors
+        except CancelledError:
+            pass  # キャンセルは _run_full 側の _check_cancel で扱う
+        except BaseException as e:  # noqa: BLE001 - 最初の 1 件をワーカーへ運ぶ
+            with self._lock:
+                if self._error is None:
+                    self._error = e
 
 
 class YtdlpSignals(QObject):
