@@ -137,6 +137,7 @@ class MainWindow(QMainWindow):
         # 設定ダイアログで変更できる動作設定（QSettings で永続化）
         self._out_dir: Path | None = None  # None = core.FILES_DIR
         self._batch_size: int = core.BATCH_SIZE
+        self._max_downloads: int = core.MAX_DOWNLOADS  # URL 行の同時 DL 本数
         self._expand_playlist: bool = False  # 混在 URL をリスト展開するか
         self._normalize: bool = True  # DL 時に音量ノーマライズを掛けるか（既定 ON）
         self._loudness: float = core.NORMALIZE_TARGET_I  # ノーマライズ基準値 (LUFS)
@@ -728,6 +729,7 @@ class MainWindow(QMainWindow):
             auto_write=self._auto_write.isChecked(),
             cancel=self._reset_cancel(),
             batch_size=self._batch_size,
+            max_downloads=self._max_downloads,
             out_dir=self._out_dir,
             expand_playlist=self._expand_playlist,
             normalize=self._normalize,
@@ -848,6 +850,7 @@ class MainWindow(QMainWindow):
             out_dir=self._out_dir,
             fmt=self._fmt_combo.currentText(),
             batch_size=self._batch_size,
+            max_downloads=self._max_downloads,
             auto_write=self._auto_write.isChecked(),
             expand_playlist=self._expand_playlist,
             normalize=self._normalize,
@@ -867,6 +870,7 @@ class MainWindow(QMainWindow):
         # 既定の FILES_DIR と同じなら None（=core 既定）として扱う
         self._out_dir = None if out_dir == core.FILES_DIR else out_dir
         self._batch_size = int(values["batch_size"])
+        self._max_downloads = max(1, int(values.get("max_downloads", core.MAX_DOWNLOADS)))
         self._expand_playlist = bool(values.get("expand_playlist", False))
         self._normalize = bool(values.get("normalize", True))
         self._loudness = float(values.get("loudness", core.NORMALIZE_TARGET_I))
@@ -890,6 +894,7 @@ class MainWindow(QMainWindow):
                 "options/out_dir", str(self._out_dir) if self._out_dir else ""
             )
             self._settings.setValue("options/batch_size", self._batch_size)
+            self._settings.setValue("options/max_downloads", self._max_downloads)
             self._settings.setValue("options/expand_playlist", self._expand_playlist)
             self._settings.setValue("options/normalize", self._normalize)
             self._settings.setValue("options/loudness", self._loudness)
@@ -1260,6 +1265,12 @@ class MainWindow(QMainWindow):
         if batch is not None:
             try:
                 self._batch_size = max(1, int(batch))
+            except (TypeError, ValueError):
+                pass
+        max_dl = s.value("options/max_downloads")
+        if max_dl is not None:
+            try:
+                self._max_downloads = max(1, int(max_dl))
             except (TypeError, ValueError):
                 pass
         expand = s.value("options/expand_playlist")

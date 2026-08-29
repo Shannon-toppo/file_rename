@@ -6,9 +6,10 @@ core.download_tracks / infer_titles / write_tags を monkeypatch した
 LLM・yt-dlp・ネットワークは使わない。
 """
 import threading
+import time
 
 import pytest
-from PySide6.QtCore import QThreadPool
+from PySide6.QtCore import Qt, QThreadPool
 
 import core
 from core import CoreError, Status, Track
@@ -262,6 +263,7 @@ def test_worker_passes_download_and_infer_options(qtbot, monkeypatch, tmp_path):
         url,
         fmt="mp3",
         on_progress=None,
+        on_stage=None,
         cancel=None,
         out_dir=None,
         expand_playlist=False,
@@ -556,6 +558,120 @@ def test_reinfer_without_force_protects_manual(qtbot, monkeypatch):
 
 
 
+def test_download_stage_switches_row_to_converting(qtbot, monkeypatch):
+    """core の on_stage 通知が行の状態（変換中 / 情報取得中）に反映される。
+
+    受信完了後は進捗率が出ないので、状態を差し替えないと「DL中 100%」の
+    まま固まって見える。
+    """
+    dl = Track(stem="a", filepath="a.mp3")
+
+    def fake_dl(url, fmt="mp3", on_progress=None, on_stage=None, cancel=None, **kwargs):
+        if on_progress is not None:
+            on_progress("a.webm", 100.0)
+        if on_stage is not None:
+            on_stage(Status.CONVERTING)
+            on_stage(Status.FETCHING)
+        return [dl]
+
+    monkeypatch.setattr(core, "download_tracks", fake_dl)
+    fake_infer_factory(monkeypatch)
+    fake_write_factory(monkeypatch)
+
+    placeholder = Track(stem="http://u", url="http://u")
+    seen = []
+    worker = PipelineWorker([placeholder], mode=MODE_FULL, auto_write=True)
+    # DirectConnection で emit した瞬間の状態を拾う（既定の queued だと
+    # スロットが動くころには status が先へ進んでいて何も検証できない）
+    worker.signals.track_updated.connect(
+        lambda t: seen.append(t.status) if t is placeholder else None,
+        Qt.ConnectionType.DirectConnection,
+    )
+    run_worker(qtbot, worker)
+
+    assert seen == [Status.DOWNLOADING, Status.CONVERTING, Status.FETCHING]
+
+
+# ---------------------------------------------------------------------------
+# DL 同士の並列（max_downloads）
+# ---------------------------------------------------------------------------
+
+
+def test_downloads_run_in_parallel(qtbot, monkeypatch):
+    """max_downloads=2 なら 1 本目の DL 中に 2 本目が始まる。
+
+    yt-dlp は 1 呼び出しの中で受信と ffmpeg 変換を直列に回すので、行を
+    またいで重ねられないと変換の間ずっと回線が空く。
+    """
+    second_started = threading.Event()
+    waited = []
+
+    def fake_dl(url, fmt="mp3", on_progress=None, on_stage=None, cancel=None, **kwargs):
+        if url == "u0":
+            # 2 本目が走り出すまで待つ（直列なら待ち切れず False が入る）
+            waited.append(second_started.wait(timeout=5))
+        else:
+            second_started.set()
+        return [Track(stem=url, filepath=f"{url}.mp3")]
+
+    monkeypatch.setattr(core, "download_tracks", fake_dl)
+    fake_infer_factory(monkeypatch)
+    fake_write_factory(monkeypatch)
+
+    placeholders = [Track(stem=u, url=u) for u in ("u0", "u1")]
+    worker = PipelineWorker(placeholders, mode=MODE_FULL, auto_write=True, max_downloads=2)
+    run_worker(qtbot, worker, timeout=10000)
+
+    assert waited == [True]
+
+
+def test_max_downloads_one_keeps_downloads_serial(qtbot, monkeypatch):
+    """max_downloads=1 なら同時に走る DL は常に 1 本（従来どおりの直列）。"""
+    lock = threading.Lock()
+    live = {"now": 0, "peak": 0}
+
+    def fake_dl(url, fmt="mp3", on_progress=None, on_stage=None, cancel=None, **kwargs):
+        with lock:
+            live["now"] += 1
+            live["peak"] = max(live["peak"], live["now"])
+        try:
+            time.sleep(0.02)  # 重なるなら重なるだけの猶予を与える
+        finally:
+            with lock:
+                live["now"] -= 1
+        return [Track(stem=url, filepath=f"{url}.mp3")]
+
+    monkeypatch.setattr(core, "download_tracks", fake_dl)
+    fake_infer_factory(monkeypatch)
+    fake_write_factory(monkeypatch)
+
+    placeholders = [Track(stem=f"u{i}", url=f"u{i}") for i in range(4)]
+    worker = PipelineWorker(placeholders, mode=MODE_FULL, auto_write=True, max_downloads=1)
+    run_worker(qtbot, worker, timeout=10000)
+
+    assert live["peak"] == 1
+
+
+def test_parallel_downloads_keep_every_row(qtbot, monkeypatch):
+    """並列でも全行が 1 回ずつ処理され、行の対応（差し替え先）がずれない。"""
+    urls = [f"u{i}" for i in range(6)]
+    fake_download_factory(
+        monkeypatch, {u: [Track(stem=u, filepath=f"{u}.mp3")] for u in urls}
+    )
+    fake_infer_factory(monkeypatch)
+    written = fake_write_factory(monkeypatch)
+
+    placeholders = [Track(stem=u, url=u) for u in urls]
+    worker = PipelineWorker(placeholders, mode=MODE_FULL, auto_write=True, max_downloads=3)
+    pairs = []
+    worker.signals.tracks_ready.connect(lambda ph, ts: pairs.append((ph.url, ts[0].stem)))
+    run_worker(qtbot, worker, timeout=10000)
+
+    # プレースホルダと実 Track の対応が入れ替わっていないこと
+    assert sorted(pairs) == [(u, u) for u in urls]
+    assert sorted(t.stem for t in written) == urls
+
+
 # ---------------------------------------------------------------------------
 # DL と推定の並走（_InferStage）
 # ---------------------------------------------------------------------------
@@ -590,7 +706,12 @@ def test_infer_starts_before_all_downloads_finish(qtbot, monkeypatch):
     fake_write_factory(monkeypatch)
 
     placeholders = [Track(stem=u, url=u) for u in ("u0", "u1", "u2", "u3")]
-    worker = PipelineWorker(placeholders, mode=MODE_FULL, auto_write=True, batch_size=2)
+    # DL 同士の並列は別テストの担当。ここは DL 段と推定段の並走だけを見たいので
+    # max_downloads=1 で DL を直列に固定する（並列だと dl:u3 が推定より先に
+    # 走れてしまい、順序の assert が意味を失う）
+    worker = PipelineWorker(
+        placeholders, mode=MODE_FULL, auto_write=True, batch_size=2, max_downloads=1
+    )
     run_worker(qtbot, worker, timeout=10000)
 
     assert events.index("infer") < events.index("dl:u3")
@@ -648,7 +769,10 @@ def test_infer_failure_stops_later_batches_but_finishes_downloads(qtbot, monkeyp
     written = fake_write_factory(monkeypatch)
 
     placeholders = [Track(stem=u, url=u) for u in ("u0", "u1", "u2")]
-    worker = PipelineWorker(placeholders, mode=MODE_FULL, auto_write=True, batch_size=1)
+    # DL 順を確定させるため直列に固定する（並列だと downloaded の順が不定）
+    worker = PipelineWorker(
+        placeholders, mode=MODE_FULL, auto_write=True, batch_size=1, max_downloads=1
+    )
     errors = []
     worker.signals.error.connect(errors.append)
     run_worker(qtbot, worker, timeout=10000)

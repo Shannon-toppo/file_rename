@@ -53,6 +53,7 @@ class SettingsDialog(QDialog):
         out_dir: Path | None = None,
         fmt: str = "mp3",
         batch_size: int = core.BATCH_SIZE,
+        max_downloads: int = core.MAX_DOWNLOADS,
         auto_write: bool = True,
         expand_playlist: bool = False,
         normalize: bool = True,
@@ -92,6 +93,20 @@ class SettingsDialog(QDialog):
         if fmt in core.SUPPORTED_FORMATS:
             self._fmt_combo.setCurrentText(fmt)
         form.addRow("既定の音声形式", self._fmt_combo)
+
+        # 同時ダウンロード数（URL 行を何本まで並列に落とすか）
+        self._max_dl_spin = QSpinBox()
+        self._max_dl_spin.setRange(1, 4)
+        self._max_dl_spin.setValue(max_downloads)
+        self._max_dl_spin.setToolTip(
+            "URL 行を同時に何本ダウンロードするか（既定 2）。\n"
+            "1 本の受信が終わってから ffmpeg 変換が走る間、別の行の受信を\n"
+            "進められるぶん速くなる。増やしすぎると YouTube 側の制限に\n"
+            "掛かりやすく、帯域も分割される。\n"
+            "再生リストを 1 行で入れた場合、その中身は並列にならない\n"
+            "（先に [情報取得] で 1 動画 1 行へ展開すると並列になる）。"
+        )
+        form.addRow("同時ダウンロード数", self._max_dl_spin)
 
         # 動画＋リスト混在 URL（watch?v=...&list=...）の扱い
         self._expand_check = QCheckBox("再生リスト付き動画 URL はリスト全体を展開する")
@@ -361,6 +376,7 @@ class SettingsDialog(QDialog):
             "out_dir": Path(self._dir_edit.text().strip() or str(core.FILES_DIR)),
             "fmt": self._fmt_combo.currentText(),
             "batch_size": self._batch_spin.value(),
+            "max_downloads": self._max_dl_spin.value(),
             "auto_write": self._auto_check.isChecked(),
             "expand_playlist": self._expand_check.isChecked(),
             "normalize": self._normalize_check.isChecked(),

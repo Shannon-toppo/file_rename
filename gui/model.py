@@ -35,7 +35,7 @@ COPYABLE_COLUMNS = (COL_STEM,)
 _COLOR_DONE = QColor(213, 245, 213)  # 薄緑
 _COLOR_ERROR = QColor(250, 214, 214)  # 薄赤
 _COLOR_WARN = QColor(250, 244, 199)  # 薄黄（PENDING かつ valid=False）
-_COLOR_BUSY = QColor(214, 233, 250)  # 薄青（DL 中 / 推定中）
+_COLOR_BUSY = QColor(214, 233, 250)  # 薄青（情報取得 / DL / 変換 / 推定 中）
 # 淡色背景の行に使う文字色。OS がダークテーマだと既定の文字色が白のままになり
 # パステル背景に白文字が乗って読めないため、背景を塗る行は文字色も固定する。
 _COLOR_TEXT_ON_TINT = QColor(32, 32, 32)
@@ -159,10 +159,15 @@ class TrackTableModel(QAbstractTableModel):
 
     def _status_text(self, row: int, track: Track) -> str:
         text = track.status.value
-        if track.status is Status.DOWNLOADING and row in self._percent:
-            pct, label = self._percent[row]
+        if row not in self._percent:
+            return text
+        pct, label = self._percent[row]
+        if track.status is Status.DOWNLOADING:
             # 再生リストなら「DL中 2/5 45%」、単一なら「DL中 45%」
             return f"{text} {label} {pct:.0f}%" if label else f"{text} {pct:.0f}%"
+        if track.status is Status.CONVERTING and label:
+            # 変換中は進捗率が取れないので、リスト内番号だけ残す（「変換中 2/5」）
+            return f"{text} {label}"
         return text
 
     def _background(self, track: Track):
@@ -170,7 +175,12 @@ class TrackTableModel(QAbstractTableModel):
             return _COLOR_DONE
         if track.status is Status.ERROR:
             return _COLOR_ERROR
-        if track.status in (Status.FETCHING, Status.DOWNLOADING, Status.INFERRING):
+        if track.status in (
+            Status.FETCHING,
+            Status.DOWNLOADING,
+            Status.CONVERTING,
+            Status.INFERRING,
+        ):
             return _COLOR_BUSY
         if track.status is Status.PENDING and track.valid is False:
             return _COLOR_WARN
