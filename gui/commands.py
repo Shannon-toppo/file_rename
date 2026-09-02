@@ -7,7 +7,8 @@
   コマンド化してから model を触る。これで「stack 経由」と「直接 setData」の
   二重適用を防ぐ。
 - old/new は model.title_state() のタプル (guessed_title, artist, manual,
-  valid, status, error) を丸ごと保存し、restore で完全復元する（manual/status も戻る）。
+  skip_infer, valid, status, error) を丸ごと保存し、restore で完全復元する
+  （manual/status も戻る）。
 - ペーストは複数セル分のコマンドを 1 つの macro にまとめる（beginMacro/endMacro）
   ので、1 回の undo で貼り付け全体が戻る。行削除の undo はスコープ外。
 """
@@ -18,7 +19,7 @@ class _StateCommand(QUndoCommand):
     """行のタイトル状態タプルを old/new で入れ替えるコマンドの基底。
 
     redo で new 状態、undo で old 状態を復元する。old/new は
-    model.title_state() が返す 6 要素タプル。
+    model.title_state() が返す 7 要素タプル。
     """
 
     def __init__(self, model, row: int, old_state: tuple, new_state: tuple, text: str):

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from PySide6.QtCore import QCoreApplication, QItemSelectionModel, Qt
 
+import core
 from core import Status, Track
 from gui.clipboard import resolve_paste_targets, selection_to_tsv
 from gui.commands import ClearTitleCommand, EditTitleCommand
@@ -139,6 +140,29 @@ def test_clear_title_resets_fields():
     assert t.valid is None
     assert t.status is Status.QUEUED
     assert t.error == ""
+
+
+def test_clear_title_returns_direct_row_to_inference():
+    """推定不要（YouTube Music）としていた行も、クリアすれば推定対象へ戻る。"""
+    t = Track(stem="s")
+    core.use_metadata_title(t)
+    model = _make_model([t])
+    model.clear_title(0)
+    assert t.skip_infer is False
+    assert t.guessed_title == ""
+    assert t.status is Status.QUEUED
+
+
+def test_title_state_roundtrip_restores_skip_infer():
+    t = Track(stem="s")
+    core.use_metadata_title(t)
+    model = _make_model([t])
+    saved = model.title_state(0)
+    model.clear_title(0)
+    model.restore_title_state(0, saved)
+    assert t.skip_infer is True
+    assert t.guessed_title == "s"
+    assert t.status is Status.PENDING
 
 
 def test_clear_title_emits_datachanged():

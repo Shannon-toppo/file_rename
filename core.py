@@ -14,6 +14,7 @@ import os
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -141,6 +142,10 @@ BATCH_SIZE = 5
 MAX_DOWNLOADS = 2
 # YouTube の翻訳メタデータ(タイトル/チャンネル名)の優先言語
 METADATA_LANG = "ja"
+# YouTube Music のホスト名。ここから来た URL は配信元がメタデータとして
+# 曲名を持っているため、LLM による推定を挟まずそのまま採用できる
+# （is_youtube_music / download_tracks(ytmusic_direct=True) 参照）。
+YTMUSIC_HOSTS = ("music.youtube.com",)
 # 音量ノーマライズ(loudnorm)の既定パラメータ。EBU R128 相当のターゲットを
 # 単一パスで適用する(download_tracks(normalize=True) で使用)。
 # 基準値(統合ラウドネス I)は設定 / CLI から変更できる。TP / LRA は固定。
@@ -196,6 +201,9 @@ class Track:
             チャンネル名のコピー）。空文字なら書き込まない。
         valid: mv2title の検証結果。未推定なら None。
         manual: True なら guessed_title は手動編集済み（再推定で上書きしない）。
+        skip_infer: True ならタイトル推定を行わず、取得済みのメタデータ上の
+            タイトルをそのまま曲名として使う（YouTube Music 用。
+            use_metadata_title 参照）。manual と同じく再推定から保護される。
         status: 現在の処理段階。
         error: エラー・スキップ理由（正常時は空文字）。
     """
@@ -208,6 +216,7 @@ class Track:
     artist: str = ""
     valid: bool | None = None
     manual: bool = False
+    skip_infer: bool = False
     status: Status = Status.QUEUED
     error: str = ""
 
@@ -423,6 +432,33 @@ def _find_primary_title(node) -> str | None:
     return None
 
 
+def is_youtube_music(url: str | None) -> bool:
+    """URL が YouTube Music のものか判定する（ホスト名で判定）。
+
+    YouTube Music の配信データは曲名・アーティスト名を独立したメタデータ
+    として持っているため、動画タイトルから曲名を推測する必要がない
+    （download_tracks / fetch_metadata の ytmusic_direct）。
+    """
+    if not url:
+        return False
+    host = urllib.parse.urlsplit(url).hostname or ""
+    return host.lower().lstrip(".") in YTMUSIC_HOSTS
+
+
+def use_metadata_title(track: Track, title: str | None = None) -> None:
+    """推定を挟まず、取得済みのタイトルをそのまま曲名として採用する。
+
+    title を渡さなければ stem（＝動画タイトル）をそのまま使う。配信元が
+    付けた曲名なので検証(valid)は行わず True 扱いにし、書き込み待ち
+    (PENDING) にする。skip_infer=True により以降の推定からは保護される
+    （manual は立てない — ユーザーの手動編集と区別するため）。
+    """
+    track.guessed_title = (title or track.stem).strip()
+    track.skip_infer = True
+    track.valid = True
+    track.status = Status.PENDING
+
+
 def download_tracks(
     url: str,
     fmt: str = "mp3",
@@ -434,6 +470,7 @@ def download_tracks(
     normalize: bool = True,
     loudness: float = NORMALIZE_TARGET_I,
     trim_silence: bool = False,
+    ytmusic_direct: bool = True,
     logger: logging.Logger | None = None,
 ) -> list[Track]:
     """URL の音声を指定形式でダウンロードし、Track のリストを返す。
@@ -447,6 +484,9 @@ def download_tracks(
     （基準値は loudness で変更可。loudnorm_filter 参照）。trim_silence=True だと
     末尾の無音区間を削除する（試験的。TRIM_SILENCE_FILTER 参照）。どちらも
     ffmpeg の再エンコード時に適用される。
+    ytmusic_direct=True（既定）だと、YouTube Music の URL はタイトル推定を
+    行わずメタデータの曲名（track フィールド。無ければ動画タイトル）を
+    そのまま採用する（use_metadata_title）。
     on_stage は受信完了後の段（Status.CONVERTING = ffmpeg 変換、
     Status.FETCHING = 日本語タイトル取得）へ移ったときに呼ばれる。on_progress は
     バイト受信中しか呼ばれないため、これが無いと変換とタイトル取得の間ずっと
@@ -557,14 +597,18 @@ def download_tracks(
             # ため、翻訳付き動画では英語のままになる(_fetch_localized_title 参照)。
             video_id = entry.get("id")
             localized = _fetch_localized_title(video_id) if video_id else None
-            tracks.append(
-                Track(
-                    stem=localized or path.stem,
-                    url=entry.get("webpage_url") or url,
-                    filepath=path,
-                    channel=entry.get("channel") or entry.get("uploader"),
-                )
+            track = Track(
+                stem=localized or path.stem,
+                url=entry.get("webpage_url") or url,
+                filepath=path,
+                channel=entry.get("channel") or entry.get("uploader"),
             )
+            if ytmusic_direct and is_youtube_music(url):
+                # YouTube Music は曲名を独立したメタデータ(track)で持つ。
+                # webpage_url は www.youtube.com に正規化されるため、判定は
+                # 呼び出し元から渡された URL で行う。
+                use_metadata_title(track, entry.get("track"))
+            tracks.append(track)
 
     if not tracks:
         raise CoreError("ダウンロードした音声ファイルが見つかりません。")
@@ -575,6 +619,7 @@ def fetch_metadata(
     url: str,
     cancel: threading.Event | None = None,
     expand_playlist: bool = False,
+    ytmusic_direct: bool = True,
     logger: logging.Logger | None = None,
 ) -> list[Track]:
     """URL のメタデータ（タイトル・チャンネル）だけを取得し、Track のリストを返す。
@@ -585,7 +630,9 @@ def fetch_metadata(
     filepath=None の QUEUED 行なので、そのまま実行すれば通常どおり DL される。
     フラット抽出のタイトルは翻訳されないことがあるが、DL 時に stem が
     日本語タイトルへ置き直されるため（download_tracks 参照）ここでは追わない。
-    expand_playlist / logger の意味は download_tracks と同じ。
+    expand_playlist / ytmusic_direct / logger の意味は download_tracks と同じ
+    （ytmusic_direct の行は曲名を確定済みの PENDING で返る。フラット抽出は
+    track フィールドを持たないためタイトルをそのまま曲名にする）。
 
     Raises:
         CancelledError: cancel がセットされた場合。
@@ -622,6 +669,11 @@ def fetch_metadata(
         for entry in entries
         if entry
     ]
+    if ytmusic_direct and is_youtube_music(url):
+        # 展開後の行の URL は www.youtube.com になることがあるため、ここで
+        # 印を付けておく（DL 段でこの行の skip_infer が実 Track へ引き継がれる）
+        for t in tracks:
+            use_metadata_title(t)
     if not tracks:
         raise CoreError("有効な動画が見つかりません。")
     return tracks
@@ -641,14 +693,16 @@ def infer_titles(
     """各 Track の曲名を mv2title で推定し、guessed_title / valid を更新する。
 
     mv2title はバッチ設計のため、対象をまとめて 1 回で呼ぶ（1 リクエスト N 件）。
-    manual=True の行は保護してスキップする（force=True で明示的に上書き）。
+    manual=True の行と skip_infer=True の行（YouTube Music など、曲名が
+    メタデータで確定している行）は保護してスキップする
+    （force=True で明示的に上書き）。
     成功した行は Status.PENDING になる（書き込みは write_tags で行う）。
 
     Raises:
         CoreError: 応答件数が対象件数と一致しない場合（全対象行を ERROR にした上で）。
         その他: LLM 接続エラー等はそのまま伝播する（呼び出し元で処理）。
     """
-    targets = [t for t in tracks if force or not t.manual]
+    targets = [t for t in tracks if force or not (t.manual or t.skip_infer)]
     if not targets:
         return
     for t in targets:
@@ -682,6 +736,7 @@ def infer_titles(
         t.guessed_title = res.title
         t.valid = res.valid
         t.manual = False
+        t.skip_infer = False  # force で推定し直した行は以降も推定対象に戻す
         t.status = Status.PENDING
 
 

@@ -560,6 +560,116 @@ def test_fetch_metadata_logger_injection(fake_ydl):
 
 
 # ---------------------------------------------------------------------------
+# YouTube Music は推定せずメタデータの曲名を使う（ytmusic_direct）
+# ---------------------------------------------------------------------------
+
+YTM_URL = "https://music.youtube.com/watch?v=abc"
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        ("https://music.youtube.com/watch?v=a", True),
+        ("https://music.youtube.com/playlist?list=X", True),
+        ("http://MUSIC.YouTube.com/watch?v=a", True),
+        ("https://www.youtube.com/watch?v=a", False),
+        ("https://youtube.com/watch?v=a", False),
+        # ホスト名で判定するので、クエリに紛れ込んでいても誤検知しない
+        ("https://example.com/?u=music.youtube.com", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_is_youtube_music(url, expected):
+    assert core.is_youtube_music(url) is expected
+
+
+def test_download_tracks_ytmusic_uses_track_metadata(fake_ydl, tmp_path):
+    entry = entry_for(tmp_path, "Song (Official Video) [abc]", channel="Artist - Topic")
+    entry["track"] = "Song"
+    fake_ydl.info = entry
+    (track,) = core.download_tracks(YTM_URL, "mp3")
+    # 元タイトルは残したまま、曲名だけメタデータの track を採用する
+    assert track.stem == "Song (Official Video) [abc]"
+    assert track.guessed_title == "Song"
+    assert track.skip_infer is True
+    assert track.valid is True
+    assert track.manual is False
+    assert track.status is Status.PENDING
+
+
+def test_download_tracks_ytmusic_falls_back_to_title(fake_ydl, tmp_path):
+    fake_ydl.info = entry_for(tmp_path, "Song [abc]")  # track フィールド無し
+    (track,) = core.download_tracks(YTM_URL, "mp3")
+    assert track.guessed_title == "Song [abc]"
+    assert track.skip_infer is True
+
+
+def test_download_tracks_ytmusic_direct_disabled(fake_ydl, tmp_path):
+    entry = entry_for(tmp_path, "Song [abc]")
+    entry["track"] = "Song"
+    fake_ydl.info = entry
+    (track,) = core.download_tracks(YTM_URL, "mp3", ytmusic_direct=False)
+    assert track.skip_infer is False
+    assert track.guessed_title == ""
+    assert track.status is Status.QUEUED
+
+
+def test_download_tracks_non_ytmusic_untouched(fake_ydl, tmp_path):
+    entry = entry_for(tmp_path, "Song [abc]")
+    entry["track"] = "Song"
+    fake_ydl.info = entry
+    (track,) = core.download_tracks("https://www.youtube.com/watch?v=abc", "mp3")
+    assert track.skip_infer is False
+    assert track.guessed_title == ""
+
+
+def test_fetch_metadata_ytmusic_marks_rows(fake_ydl):
+    fake_ydl.info = {
+        "entries": [
+            {"title": "Song A", "url": "https://www.youtube.com/watch?v=a"},
+            {"title": "Song B", "url": "https://www.youtube.com/watch?v=b"},
+        ]
+    }
+    tracks = core.fetch_metadata("https://music.youtube.com/playlist?list=X")
+    assert [t.guessed_title for t in tracks] == ["Song A", "Song B"]
+    assert all(t.skip_infer and t.status is Status.PENDING for t in tracks)
+
+
+def test_infer_titles_protects_skip_infer_rows(monkeypatch):
+    fake, captured = fake_extract_factory(ok_results)
+    monkeypatch.setattr(core, "extract_titles", fake)
+    direct = Track(stem="b", guessed_title="B", skip_infer=True, status=Status.PENDING)
+    auto = Track(stem="a")
+    core.infer_titles([direct, auto], client=object())
+
+    assert [i.title for i in captured["inputs"]] == ["a"]
+    assert direct.guessed_title == "B"  # 上書きされない
+    assert auto.guessed_title == "song0"
+
+
+def test_infer_titles_force_overrides_skip_infer(monkeypatch):
+    fake, _ = fake_extract_factory(ok_results)
+    monkeypatch.setattr(core, "extract_titles", fake)
+    direct = Track(stem="b", guessed_title="B", skip_infer=True, status=Status.PENDING)
+    core.infer_titles([direct], client=object(), force=True)
+
+    assert direct.guessed_title == "song0"
+    # 明示的に推定し直した行は、以降も推定対象へ戻す
+    assert direct.skip_infer is False
+
+
+def test_write_tags_writes_skip_infer_row(tmp_path):
+    mp3 = tmp_path / "s.mp3"
+    mp3.write_bytes(b"\x00")
+    track = Track(stem="s", filepath=mp3)
+    core.use_metadata_title(track)
+    core.write_tags([track])
+    assert track.status is Status.DONE
+    assert track.guessed_title == "s"
+
+
+# ---------------------------------------------------------------------------
 # read_url_list
 # ---------------------------------------------------------------------------
 

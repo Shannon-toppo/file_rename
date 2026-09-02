@@ -243,6 +243,91 @@ def test_connection_failure_degrades_to_download_only(qtbot, monkeypatch):
     assert dl.status is Status.QUEUED
 
 
+def direct_track(stem: str, title: str) -> Track:
+    """YouTube Music 由来の「推定不要」行（core.use_metadata_title 相当）。"""
+    t = Track(stem=stem, filepath=f"{stem}.mp3")
+    core.use_metadata_title(t, title)
+    return t
+
+
+def test_full_pipeline_skips_infer_for_direct_rows(qtbot, monkeypatch):
+    """skip_infer 行は推定へ渡さず、書き込みだけ行う（YouTube Music）。"""
+    direct = direct_track("ytm", "Song")
+    normal = Track(stem="n.mp3", filepath="n.mp3")
+    fake_download_factory(
+        monkeypatch, {"http://ytm": [direct], "http://n": [normal]}
+    )
+    infer_calls = fake_infer_factory(monkeypatch)
+    written = fake_write_factory(monkeypatch)
+
+    phs = [Track(stem="http://ytm", url="http://ytm"), Track(stem="http://n", url="http://n")]
+    worker = PipelineWorker(phs, mode=MODE_FULL, auto_write=True)
+    run_worker(qtbot, worker)
+
+    inferred = [t for c in infer_calls for t in c["tracks"]]
+    assert direct not in inferred and normal in inferred
+    assert direct.guessed_title == "Song"  # 推定で上書きされない
+    assert sorted(id(t) for t in written) == sorted(id(t) for t in (direct, normal))
+    assert direct.status is Status.DONE
+
+
+def test_degraded_mode_still_writes_direct_rows(qtbot, monkeypatch):
+    """LLM 未接続でも、推定の要らない行（YouTube Music）は書き込む。"""
+    monkeypatch.setattr(core, "check_connection", lambda timeout=3.0: (False, "down"))
+    direct = direct_track("ytm", "Song")
+    normal = Track(stem="n.mp3", filepath="n.mp3")
+    fake_download_factory(
+        monkeypatch, {"http://ytm": [direct], "http://n": [normal]}
+    )
+    infer_calls = fake_infer_factory(monkeypatch)
+    written = fake_write_factory(monkeypatch)
+
+    phs = [Track(stem="http://ytm", url="http://ytm"), Track(stem="http://n", url="http://n")]
+    worker = PipelineWorker(phs, mode=MODE_FULL, auto_write=True)
+    run_worker(qtbot, worker)
+
+    assert infer_calls == []
+    assert written == [direct]  # 推定が要る行は QUEUED のまま残す
+    assert direct.status is Status.DONE
+    assert normal.status is Status.QUEUED
+
+
+def test_degraded_mode_without_auto_write_leaves_direct_rows_pending(qtbot, monkeypatch):
+    monkeypatch.setattr(core, "check_connection", lambda timeout=3.0: (False, "down"))
+    direct = direct_track("ytm", "Song")
+    fake_download_factory(monkeypatch, {"http://ytm": [direct]})
+    fake_infer_factory(monkeypatch)
+    written = fake_write_factory(monkeypatch)
+
+    worker = PipelineWorker(
+        [Track(stem="http://ytm", url="http://ytm")], mode=MODE_FULL, auto_write=False
+    )
+    run_worker(qtbot, worker)
+    assert written == [] and direct.status is Status.PENDING
+
+
+def test_download_carries_over_direct_title_from_fetched_row(qtbot, monkeypatch):
+    """情報取得段で確定した曲名は、DL 後の実 Track へ引き継がれる。
+
+    YouTube Music の再生リストを展開すると各行の URL は www.youtube.com に
+    なるため、DL 段だけでは YouTube Music と判定できない。
+    """
+    real = Track(stem="Song (Official) [id]", filepath="a.mp3")
+    fake_download_factory(monkeypatch, {"http://v/a": [real]})
+    infer_calls = fake_infer_factory(monkeypatch)
+    fake_write_factory(monkeypatch)
+
+    fetched = Track(stem="Song", url="http://v/a")
+    core.use_metadata_title(fetched)
+    worker = PipelineWorker([fetched], mode=MODE_FULL, auto_write=True)
+    run_worker(qtbot, worker)
+
+    assert real.skip_infer is True
+    assert real.guessed_title == "Song"
+    assert [t for c in infer_calls for t in c["tracks"]] == []
+    assert real.status is Status.DONE
+
+
 def test_reinfer_does_not_check_connection(qtbot, monkeypatch):
     """MODE_INFER は接続チェックしない（失敗すれば既存のエラー経路に乗る）。"""
     called = []
@@ -270,6 +355,7 @@ def test_worker_passes_download_and_infer_options(qtbot, monkeypatch, tmp_path):
         normalize=True,
         loudness=core.NORMALIZE_TARGET_I,
         trim_silence=False,
+        ytmusic_direct=True,
         logger=None,
     ):
         captured["out_dir"] = out_dir
@@ -277,6 +363,7 @@ def test_worker_passes_download_and_infer_options(qtbot, monkeypatch, tmp_path):
         captured["normalize"] = normalize
         captured["loudness"] = loudness
         captured["trim_silence"] = trim_silence
+        captured["ytmusic_direct"] = ytmusic_direct
         return [Track(stem="a", filepath="a.mp3")]
 
     def fake_infer(tracks, client=None, batch_size=5, force=False):
@@ -301,6 +388,7 @@ def test_worker_passes_download_and_infer_options(qtbot, monkeypatch, tmp_path):
         normalize=False,
         loudness=-10.0,
         trim_silence=True,
+        ytmusic_direct=False,
     )
     run_worker(qtbot, worker)
     assert captured == {
@@ -310,6 +398,7 @@ def test_worker_passes_download_and_infer_options(qtbot, monkeypatch, tmp_path):
         "normalize": False,
         "loudness": -10.0,
         "trim_silence": True,
+        "ytmusic_direct": False,
     }
 
 
@@ -411,7 +500,7 @@ def test_fetch_mode_expands_placeholder(qtbot, monkeypatch):
     b = Track(stem="B", url="http://v/b")
     fetched_urls = []
 
-    def fake_fetch(url, cancel=None, expand_playlist=False, logger=None):
+    def fake_fetch(url, cancel=None, expand_playlist=False, **kwargs):
         fetched_urls.append(url)
         return [a, b]
 
@@ -437,7 +526,7 @@ def test_fetch_mode_expands_placeholder(qtbot, monkeypatch):
 def test_fetch_mode_error_isolation(qtbot, monkeypatch):
     ok = Track(stem="A", url="http://v/a")
 
-    def fake_fetch(url, cancel=None, expand_playlist=False, logger=None):
+    def fake_fetch(url, cancel=None, expand_playlist=False, **kwargs):
         if url == "http://bad":
             raise RuntimeError("boom")
         return [ok]
@@ -458,7 +547,7 @@ def test_fetch_stage_summary_counts_failures(qtbot, monkeypatch):
     """情報取得の完了/失敗件数が stage_summary で通知される。"""
     ok = Track(stem="A", url="http://v/a")
 
-    def fake_fetch(url, cancel=None, expand_playlist=False, logger=None):
+    def fake_fetch(url, cancel=None, expand_playlist=False, **kwargs):
         if url == "http://bad":
             raise RuntimeError("boom")
         return [ok]
@@ -510,7 +599,7 @@ def test_stage_summary_not_emitted_for_local_only(qtbot, monkeypatch):
 def test_fetch_mode_passes_expand_playlist(qtbot, monkeypatch):
     captured = {}
 
-    def fake_fetch(url, cancel=None, expand_playlist=False, logger=None):
+    def fake_fetch(url, cancel=None, expand_playlist=False, **kwargs):
         captured["expand_playlist"] = expand_playlist
         return [Track(stem="A", url="http://v/a")]
 

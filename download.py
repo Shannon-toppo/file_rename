@@ -33,12 +33,18 @@ def process_url(
     normalize: bool = True,
     loudness: float = core.NORMALIZE_TARGET_I,
     trim_silence: bool = False,
+    ytmusic_direct: bool = True,
 ) -> None:
     """1 件の URL をダウンロードしてメタデータを書き込む。"""
     print(f"Downloading audio ({fmt}) from: {url}")
     try:
         tracks = core.download_tracks(
-            url, fmt, normalize=normalize, loudness=loudness, trim_silence=trim_silence
+            url,
+            fmt,
+            normalize=normalize,
+            loudness=loudness,
+            trim_silence=trim_silence,
+            ytmusic_direct=ytmusic_direct,
         )
     except Exception as e:
         print(f"Error: ダウンロードに失敗しました: {e}")
@@ -49,7 +55,11 @@ def process_url(
         assert t.filepath is not None
         print(f"  {t.filepath.name}")
 
-    print("Inferring titles...")
+    if all(t.skip_infer for t in tracks):
+        # YouTube Music など、メタデータの曲名をそのまま使う行だけの場合
+        print("Using metadata titles (inference skipped)...")
+    else:
+        print("Inferring titles...")
     try:
         core.infer_titles(tracks)
     except Exception as e:
@@ -89,6 +99,14 @@ def main() -> None:
         help=f"ノーマライズの基準値 LUFS（既定: {core.NORMALIZE_TARGET_I:g}）",
     )
     parser.add_argument(
+        "--no-ytmusic-direct",
+        action="store_true",
+        help=(
+            "YouTube Music の URL でもタイトル推定を行う"
+            "（既定はメタデータの曲名をそのまま書き込む）"
+        ),
+    )
+    parser.add_argument(
         "--trim-silence",
         action="store_true",
         help="末尾の無音区間を削除する（試験的。-50dB 以下を 1 秒残して削除）",
@@ -121,6 +139,7 @@ def main() -> None:
             normalize=not args.no_normalize,
             loudness=args.loudness,
             trim_silence=args.trim_silence,
+            ytmusic_direct=not args.no_ytmusic_direct,
         )
 
 
