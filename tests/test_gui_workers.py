@@ -13,7 +13,13 @@ from PySide6.QtCore import Qt, QThreadPool
 
 import core
 from core import CoreError, Status, Track
-from gui.workers import MODE_FETCH, MODE_FULL, MODE_INFER, PipelineWorker
+from gui.workers import (
+    MODE_FETCH,
+    MODE_FULL,
+    MODE_INFER,
+    PipelineWorker,
+    _InferStage,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -761,9 +767,21 @@ def test_infer_failure_stops_later_batches_but_finishes_downloads(qtbot, monkeyp
         for t in tracks:
             t.status = Status.ERROR
             t.error = "推定失敗"
-        infer_failed.set()
         raise CoreError("件数不一致")
 
+    # 失敗の記録は _process の except 節（＝ fake_infer の raise が伝播した後）
+    # で行われる。fake_infer の中で event を set すると、_error がまだ None の
+    # うちに DL 側が動き出して 2 バッチ目を投入できてしまう（flaky の原因）。
+    # _process を抜けたあとに set することで「記録済み」を保証する。
+    orig_process = _InferStage._process
+
+    def process_then_release(self, chunk):
+        try:
+            orig_process(self, chunk)
+        finally:
+            infer_failed.set()
+
+    monkeypatch.setattr(_InferStage, "_process", process_then_release)
     monkeypatch.setattr(core, "download_tracks", fake_dl)
     monkeypatch.setattr(core, "infer_titles", fake_infer)
     written = fake_write_factory(monkeypatch)
