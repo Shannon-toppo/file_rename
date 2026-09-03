@@ -255,18 +255,35 @@ class TrackTableModel(QAbstractTableModel):
     def title_state(self, row: int) -> tuple:
         """タイトル/アーティスト編集に関わる状態を undo 用タプルで取り出す。
 
-        タプルの並び: (guessed_title, artist, manual, valid, status, error)。
+        タプルの並び:
+        (guessed_title, artist, manual, skip_infer, valid, status, error)。
         Edit 系コマンドが old/new を丸ごと保存し restore で復元する。
         """
         t = self._tracks[row]
-        return (t.guessed_title, t.artist, t.manual, t.valid, t.status, t.error)
+        return (
+            t.guessed_title,
+            t.artist,
+            t.manual,
+            t.skip_infer,
+            t.valid,
+            t.status,
+            t.error,
+        )
 
     def restore_title_state(self, row: int, state: tuple) -> None:
         """title_state で取り出したタプルを行へ書き戻し、再描画する。"""
         if not (0 <= row < len(self._tracks)):
             return
         t = self._tracks[row]
-        t.guessed_title, t.artist, t.manual, t.valid, t.status, t.error = state
+        (
+            t.guessed_title,
+            t.artist,
+            t.manual,
+            t.skip_infer,
+            t.valid,
+            t.status,
+            t.error,
+        ) = state
         self._emit_row(row)
 
     def set_title(self, row: int, title: str) -> None:
@@ -316,14 +333,16 @@ class TrackTableModel(QAbstractTableModel):
         """推定タイトルをクリアし、再推定対象へ戻す。
 
         編集（手動確定）とは意味が異なるため manual は立てない。
-        guessed_title="" / manual=False / valid=None / QUEUED / error="" に
-        リセットし、次回実行で再推定される状態にする。
+        guessed_title="" / manual=False / skip_infer=False / valid=None /
+        QUEUED / error="" にリセットし、次回実行で再推定される状態にする
+        （推定不要としていた行も、クリアすれば推定対象へ戻す）。
         """
         if not (0 <= row < len(self._tracks)):
             return
         t = self._tracks[row]
         t.guessed_title = ""
         t.manual = False
+        t.skip_infer = False
         t.valid = None
         t.status = Status.QUEUED
         t.error = ""

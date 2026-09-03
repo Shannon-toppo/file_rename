@@ -90,6 +90,8 @@ class PipelineWorker(QRunnable):
         normalize: True（既定）なら DL 時に音量ノーマライズ(loudnorm)を掛ける。
         loudness: ノーマライズの基準値 LUFS（loudnorm の I）。
         trim_silence: True なら DL 時に末尾の無音区間を削除する（試験的）。
+        ytmusic_direct: True（既定）なら YouTube Music の URL はタイトル推定を
+            行わず、メタデータの曲名をそのまま使う（core.use_metadata_title）。
     """
 
     def __init__(
@@ -109,6 +111,7 @@ class PipelineWorker(QRunnable):
         normalize: bool = True,
         loudness: float = core.NORMALIZE_TARGET_I,
         trim_silence: bool = False,
+        ytmusic_direct: bool = True,
     ):
         super().__init__()
         self.signals = WorkerSignals()
@@ -129,6 +132,7 @@ class PipelineWorker(QRunnable):
         self._normalize = normalize
         self._loudness = loudness
         self._trim_silence = trim_silence
+        self._ytmusic_direct = ytmusic_direct
 
     # -- QRunnable のエントリポイント ---------------------------------------
 
@@ -178,9 +182,15 @@ class PipelineWorker(QRunnable):
                 skip_infer = True
                 self.signals.connection_failed.emit(msg)
         if skip_infer:
-            # 縮退モード: DL のみで終了（QUEUED のまま）
-            self._download_all()
+            # 縮退モード: DL のみで終了（QUEUED のまま）。ただし推定が要らない
+            # 行（YouTube Music など曲名が確定済み）は LLM 抜きでも書けるので、
+            # 自動書き込み ON ならここで書いてしまう
+            ready = self._download_all()
             self._check_cancel()
+            if self._auto_write:
+                direct = [t for t in ready if t.skip_infer and t.status is Status.PENDING]
+                if direct:
+                    self._run_write(direct)
             return
 
         stage = _InferStage(self)
@@ -297,6 +307,7 @@ class PipelineWorker(QRunnable):
                 normalize=self._normalize,
                 loudness=self._loudness,
                 trim_silence=self._trim_silence,
+                ytmusic_direct=self._ytmusic_direct,
                 # yt-dlp の出力をログパネルへ流す（GUI 経由の DL は常に
                 # logging 経由）。ハンドラはワーカースレッドから呼ばれるが
                 # QtLogHandler はシグナル emit のみでスレッド安全（logpanel.py）
@@ -322,8 +333,20 @@ class PipelineWorker(QRunnable):
                 real.manual = True
                 real.valid = placeholder.valid
                 real.status = Status.PENDING
+            elif placeholder.skip_infer and not real.skip_infer:
+                # 情報取得段で「推定不要」と確定した行（YouTube Music）。
+                # 展開後の行の URL は www.youtube.com になり DL 段では
+                # YouTube Music と判定できないため、ここで引き継ぐ
+                core.use_metadata_title(real, placeholder.guessed_title)
             if placeholder.artist:
                 real.artist = placeholder.artist
+        elif placeholder.skip_infer:
+            # 情報取得済みの「推定不要」行が複数行へ展開された場合
+            # （再生リスト付き URL ＋ リスト展開 ON）。どの行がどの曲かは
+            # 対応付けられないので、各行は自分のタイトルをそのまま使う。
+            for real in new_tracks:
+                if not real.skip_infer:
+                    core.use_metadata_title(real)
 
         # プレースホルダ行を実 Track 行（再生リストは複数）へ差し替える
         self.signals.tracks_ready.emit(placeholder, new_tracks)
@@ -355,6 +378,7 @@ class PipelineWorker(QRunnable):
                     placeholder.url,
                     cancel=self._cancel,
                     expand_playlist=self._expand_playlist,
+                    ytmusic_direct=self._ytmusic_direct,
                     # yt-dlp の出力をログパネルへ流す（DL と同じ経路）
                     logger=logging.getLogger("yt_dlp"),
                 )
@@ -375,11 +399,13 @@ class PipelineWorker(QRunnable):
     def _run_infer(self, tracks: Sequence[Track]) -> None:
         """対象行をまとめて 1 回で推定する（バッチ）。"""
         self._check_cancel()
-        # QUEUED / PENDING かつ（force でなければ）manual=False の行を対象に
+        # QUEUED / PENDING かつ（force でなければ）manual / skip_infer の
+        # どちらも立っていない行を対象に
         targets = [
             t
             for t in tracks
-            if t.status in (Status.QUEUED, Status.PENDING) and (self._force or not t.manual)
+            if t.status in (Status.QUEUED, Status.PENDING)
+            and (self._force or not (t.manual or t.skip_infer))
         ]
         if not targets:
             return
@@ -493,7 +519,7 @@ class _InferStage:
     def _is_target(self, track: Track) -> bool:
         """_run_infer が推定対象とみなす行か（バッチ数を数えるのに使う）。"""
         return track.status in (Status.QUEUED, Status.PENDING) and (
-            self._worker._force or not track.manual
+            self._worker._force or not (track.manual or track.skip_infer)
         )
 
     def _count_targets(self, tracks: list[Track]) -> int:
@@ -502,7 +528,7 @@ class _InferStage:
     def _take_chunk(self) -> list[Track]:
         """推定対象をちょうど batch_size 件含む最短の先頭部分を切り出す。
 
-        推定対象でない行（手動編集済みなど）も一緒に運ぶ。自動書き込みの
+        推定対象でない行（手動編集済み・推定不要）も一緒に運ぶ。自動書き込みの
         対象になるので、どこかのバッチに乗せないと書き残しになる。
         """
         count = 0

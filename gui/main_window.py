@@ -142,6 +142,8 @@ class MainWindow(QMainWindow):
         self._normalize: bool = True  # DL 時に音量ノーマライズを掛けるか（既定 ON）
         self._loudness: float = core.NORMALIZE_TARGET_I  # ノーマライズ基準値 (LUFS)
         self._trim_silence: bool = False  # 末尾の無音削除（試験的、既定 OFF）
+        # YouTube Music の URL は推定を挟まずメタデータの曲名をそのまま使う
+        self._ytmusic_direct: bool = True
         self._theme: str = "system"  # "system" / "light" / "dark"
         # ログパネルの表示レベル（"DEBUG"/"INFO"/"WARNING"/"ERROR"）。
         # フィルタはハンドラ側 1 箇所で行う（logpanel.attach_handler 参照）
@@ -735,6 +737,7 @@ class MainWindow(QMainWindow):
             normalize=self._normalize,
             loudness=self._loudness,
             trim_silence=self._trim_silence,
+            ytmusic_direct=self._ytmusic_direct,
         )
         self._start(worker, "実行中...")
 
@@ -774,6 +777,7 @@ class MainWindow(QMainWindow):
             mode=MODE_FETCH,
             cancel=self._reset_cancel(),
             expand_playlist=self._expand_playlist,
+            ytmusic_direct=self._ytmusic_direct,
         )
         self._start(worker, "情報取得中...")
 
@@ -852,6 +856,7 @@ class MainWindow(QMainWindow):
             batch_size=self._batch_size,
             max_downloads=self._max_downloads,
             auto_write=self._auto_write.isChecked(),
+            ytmusic_direct=self._ytmusic_direct,
             expand_playlist=self._expand_playlist,
             normalize=self._normalize,
             loudness=self._loudness,
@@ -871,6 +876,7 @@ class MainWindow(QMainWindow):
         self._out_dir = None if out_dir == core.FILES_DIR else out_dir
         self._batch_size = int(values["batch_size"])
         self._max_downloads = max(1, int(values.get("max_downloads", core.MAX_DOWNLOADS)))
+        self._ytmusic_direct = bool(values.get("ytmusic_direct", True))
         self._expand_playlist = bool(values.get("expand_playlist", False))
         self._normalize = bool(values.get("normalize", True))
         self._loudness = float(values.get("loudness", core.NORMALIZE_TARGET_I))
@@ -895,6 +901,7 @@ class MainWindow(QMainWindow):
             )
             self._settings.setValue("options/batch_size", self._batch_size)
             self._settings.setValue("options/max_downloads", self._max_downloads)
+            self._settings.setValue("options/ytmusic_direct", self._ytmusic_direct)
             self._settings.setValue("options/expand_playlist", self._expand_playlist)
             self._settings.setValue("options/normalize", self._normalize)
             self._settings.setValue("options/loudness", self._loudness)
@@ -1273,6 +1280,9 @@ class MainWindow(QMainWindow):
                 self._max_downloads = max(1, int(max_dl))
             except (TypeError, ValueError):
                 pass
+        ytmusic = s.value("options/ytmusic_direct")
+        if ytmusic is not None:
+            self._ytmusic_direct = _as_bool(ytmusic)
         expand = s.value("options/expand_playlist")
         if expand is not None:
             self._expand_playlist = _as_bool(expand)

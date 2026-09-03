@@ -41,6 +41,7 @@ def test_settings_dialog_roundtrip(qtbot, tmp_path):
         batch_size=9,
         max_downloads=3,
         auto_write=False,
+        ytmusic_direct=False,
         expand_playlist=True,
         normalize=False,
         loudness=-16.5,
@@ -57,6 +58,7 @@ def test_settings_dialog_roundtrip(qtbot, tmp_path):
         "batch_size": 9,
         "max_downloads": 3,
         "auto_write": False,
+        "ytmusic_direct": False,
         "expand_playlist": True,
         "normalize": False,
         "loudness": -16.5,
@@ -75,6 +77,7 @@ def test_settings_dialog_defaults(qtbot):
     assert v["batch_size"] == core.BATCH_SIZE
     assert v["max_downloads"] == core.MAX_DOWNLOADS  # 既定 2（DL と変換を重ねる）
     assert v["auto_write"] is True
+    assert v["ytmusic_direct"] is True  # 既定 ON（YouTube Music は推定しない）
     assert v["expand_playlist"] is False  # 既定は現行どおり動画 1 本のみ
     assert v["normalize"] is True  # 既定で音量ノーマライズ ON
     assert v["loudness"] == core.NORMALIZE_TARGET_I  # 既定の基準値 -14 LUFS

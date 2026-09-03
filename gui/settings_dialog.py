@@ -55,6 +55,7 @@ class SettingsDialog(QDialog):
         batch_size: int = core.BATCH_SIZE,
         max_downloads: int = core.MAX_DOWNLOADS,
         auto_write: bool = True,
+        ytmusic_direct: bool = True,
         expand_playlist: bool = False,
         normalize: bool = True,
         loudness: float = core.NORMALIZE_TARGET_I,
@@ -173,6 +174,18 @@ class SettingsDialog(QDialog):
         self._auto_check = QCheckBox("起動時に自動書き込みを ON にする")
         self._auto_check.setChecked(auto_write)
         llm_form.addRow("自動書き込み", self._auto_check)
+
+        # YouTube Music は曲名がメタデータで確定しているので推定を挟まない
+        self._ytmusic_check = QCheckBox("YouTube Music は推定せず曲名をそのまま使う")
+        self._ytmusic_check.setChecked(ytmusic_direct)
+        self._ytmusic_check.setToolTip(
+            "music.youtube.com の URL は、YouTube Music 上の曲名と\n"
+            "アーティスト名をそのまま書き込みます（LLM を呼びません）。\n"
+            "曲名は動画タイトルとは別物で、YouTube Music へ 1 曲ずつ\n"
+            "問い合わせます（例: 動画『 Pale 』feat. 初音ミク → 曲名 Pale）。\n"
+            "行をクリア（Delete）すれば通常どおり推定し直せます。"
+        )
+        llm_form.addRow("YouTube Music", self._ytmusic_check)
 
         def _placeholder(key: str, secret: bool = False) -> str:
             value = defaults.get(key)
@@ -378,6 +391,7 @@ class SettingsDialog(QDialog):
             "batch_size": self._batch_spin.value(),
             "max_downloads": self._max_dl_spin.value(),
             "auto_write": self._auto_check.isChecked(),
+            "ytmusic_direct": self._ytmusic_check.isChecked(),
             "expand_playlist": self._expand_check.isChecked(),
             "normalize": self._normalize_check.isChecked(),
             "loudness": self._loudness_spin.value(),
