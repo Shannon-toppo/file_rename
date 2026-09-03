@@ -176,11 +176,13 @@ class SettingsDialog(QDialog):
         llm_form.addRow("自動書き込み", self._auto_check)
 
         # YouTube Music は曲名がメタデータで確定しているので推定を挟まない
-        self._ytmusic_check = QCheckBox("YouTube Music は推定せずタイトルをそのまま使う")
+        self._ytmusic_check = QCheckBox("YouTube Music は推定せず曲名をそのまま使う")
         self._ytmusic_check.setChecked(ytmusic_direct)
         self._ytmusic_check.setToolTip(
-            "music.youtube.com の URL は、配信元のメタデータにある曲名を\n"
-            "そのままタイトルとして書き込みます（LLM を呼びません）。\n"
+            "music.youtube.com の URL は、YouTube Music 上の曲名と\n"
+            "アーティスト名をそのまま書き込みます（LLM を呼びません）。\n"
+            "曲名は動画タイトルとは別物で、YouTube Music へ 1 曲ずつ\n"
+            "問い合わせます（例: 動画『 Pale 』feat. 初音ミク → 曲名 Pale）。\n"
             "行をクリア（Delete）すれば通常どおり推定し直せます。"
         )
         llm_form.addRow("YouTube Music", self._ytmusic_check)

@@ -328,6 +328,29 @@ def test_download_carries_over_direct_title_from_fetched_row(qtbot, monkeypatch)
     assert real.status is Status.DONE
 
 
+def test_download_carries_over_direct_flag_to_expanded_rows(qtbot, monkeypatch):
+    """情報取得済みの「推定不要」行が複数行へ展開されても印を落とさない。
+
+    再生リスト付き URL ＋ リスト展開 ON のとき、1 行の DL が複数 Track を
+    返す。どの行がどの曲かは対応付けられないので、各行は自分のタイトルを
+    そのまま曲名として使う。
+    """
+    reals = [Track(stem="Song A", filepath="a.mp3"), Track(stem="Song B", filepath="b.mp3")]
+    fake_download_factory(monkeypatch, {"http://v/list": reals})
+    infer_calls = fake_infer_factory(monkeypatch)
+    fake_write_factory(monkeypatch)
+
+    fetched = Track(stem="Song A", url="http://v/list")
+    core.use_metadata_title(fetched)
+    worker = PipelineWorker([fetched], mode=MODE_FULL, auto_write=True)
+    run_worker(qtbot, worker)
+
+    assert all(t.skip_infer for t in reals)
+    assert [t.guessed_title for t in reals] == ["Song A", "Song B"]
+    assert [t for c in infer_calls for t in c["tracks"]] == []
+    assert all(t.status is Status.DONE for t in reals)
+
+
 def test_reinfer_does_not_check_connection(qtbot, monkeypatch):
     """MODE_INFER は接続チェックしない（失敗すれば既存のエラー経路に乗る）。"""
     called = []

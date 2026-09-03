@@ -243,9 +243,10 @@ def fake_ydl(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "YoutubeDL", FakeYDL)
     # 出力先も一時ディレクトリへ
     monkeypatch.setattr(core, "FILES_DIR", tmp_path)
-    # ローカライズ済みタイトルの取得は実 HTTP を叩くため必ず無効化する
-    # (使うテストは個別に上書きする)
+    # ローカライズ済みタイトル / YouTube Music の曲名の取得は実 HTTP を叩く
+    # ため必ず無効化する (使うテストは個別に上書きする)
     monkeypatch.setattr(core, "_fetch_localized_title", lambda *a, **k: None)
+    monkeypatch.setattr(core, "_fetch_ytmusic_song", lambda *a, **k: (None, None))
     FakeYDL.info = None
     FakeYDL.hook_feed = []
     FakeYDL.pp_feed = []
@@ -572,6 +573,9 @@ YTM_URL = "https://music.youtube.com/watch?v=abc"
         ("https://music.youtube.com/watch?v=a", True),
         ("https://music.youtube.com/playlist?list=X", True),
         ("http://MUSIC.YouTube.com/watch?v=a", True),
+        # スキームを省いて貼り付けられた URL（yt-dlp は受け付ける）
+        ("music.youtube.com/playlist?list=X", True),
+        ("www.youtube.com/watch?v=a", False),
         ("https://www.youtube.com/watch?v=a", False),
         ("https://youtube.com/watch?v=a", False),
         # ホスト名で判定するので、クエリに紛れ込んでいても誤検知しない
@@ -582,6 +586,13 @@ YTM_URL = "https://music.youtube.com/watch?v=abc"
 )
 def test_is_youtube_music(url, expected):
     assert core.is_youtube_music(url) is expected
+
+
+def test_is_youtube_music_any_of_several_urls():
+    """候補のどれか 1 つが YouTube Music なら True（再生リストの判定用）。"""
+    assert core.is_youtube_music(None, "https://www.youtube.com/watch?v=a", YTM_URL)
+    assert not core.is_youtube_music(None, "https://www.youtube.com/watch?v=a")
+    assert not core.is_youtube_music()
 
 
 def test_download_tracks_ytmusic_uses_track_metadata(fake_ydl, tmp_path):
@@ -603,6 +614,188 @@ def test_download_tracks_ytmusic_falls_back_to_title(fake_ydl, tmp_path):
     (track,) = core.download_tracks(YTM_URL, "mp3")
     assert track.guessed_title == "Song [abc]"
     assert track.skip_infer is True
+
+
+def ytm_entry(tmp_path: Path, name: str, title: str, track: str | None = None) -> dict:
+    """YouTube Music 再生リストのエントリ相当（webpage_url は www へ正規化済み）。"""
+    entry = entry_for(tmp_path, name)
+    entry["webpage_url"] = f"https://www.youtube.com/watch?v={name}"
+    entry["title"] = title
+    if track is not None:
+        entry["track"] = track
+    return entry
+
+
+def test_download_tracks_ytmusic_playlist_marks_every_entry(fake_ydl, tmp_path):
+    """再生リストの全エントリが直採用になる（曲名は track → title の順）。"""
+    fake_ydl.info = {
+        "entries": [
+            ytm_entry(tmp_path, "a", "Song A (Official Video)", track="Song A"),
+            ytm_entry(tmp_path, "b", "Song B"),  # track メタデータ無し
+        ]
+    }
+    tracks = core.download_tracks("https://music.youtube.com/playlist?list=OLAK5uy_x", "mp3")
+    assert [t.guessed_title for t in tracks] == ["Song A", "Song B"]
+    assert all(t.skip_infer and t.status is Status.PENDING for t in tracks)
+
+
+def test_download_tracks_ytmusic_detected_from_playlist_original_url(fake_ydl, tmp_path):
+    """entry 側に music.youtube.com が残らなくても、抽出結果の元 URL で判定する。"""
+    fake_ydl.info = {
+        "original_url": "https://music.youtube.com/playlist?list=OLAK5uy_x",
+        "webpage_url": "https://www.youtube.com/playlist?list=OLAK5uy_x",
+        "entries": [ytm_entry(tmp_path, "a", "Song A", track="Song A")],
+    }
+    # 呼び出し元から渡る URL が正規化済みでも取りこぼさない
+    (track,) = core.download_tracks("https://www.youtube.com/playlist?list=OLAK5uy_x", "mp3")
+    assert track.skip_infer is True
+    assert track.guessed_title == "Song A"
+
+
+def test_download_tracks_ytmusic_title_has_no_video_id(fake_ydl, tmp_path):
+    """曲名は entry のタイトル由来（ファイル名の " [id]" は混ぜない）。"""
+    entry = ytm_entry(tmp_path, "Song [vid123]", "Song")
+    fake_ydl.info = entry
+    (track,) = core.download_tracks(YTM_URL, "mp3")
+    assert track.stem == "Song [vid123]"  # 元タイトル列はファイル名どおり
+    assert track.guessed_title == "Song"
+
+
+def test_fetch_metadata_ytmusic_detected_from_original_url(fake_ydl):
+    fake_ydl.info = {
+        "original_url": "https://music.youtube.com/playlist?list=OLAK5uy_x",
+        "entries": [{"title": "Song A", "url": "https://www.youtube.com/watch?v=a"}],
+    }
+    (track,) = core.fetch_metadata("https://www.youtube.com/playlist?list=OLAK5uy_x")
+    assert track.skip_infer is True
+    assert track.guessed_title == "Song A"
+
+
+def test_download_tracks_ytmusic_uses_song_title_not_video_title(fake_ydl, tmp_path, monkeypatch):
+    """曲名は YouTube Music に問い合わせる（動画タイトルとは別物）。
+
+    実測: 06YWg6Y1kxo の YouTube 上のタイトルは "MIMI『 Pale 』feat. 初音ミク"
+    だが、YouTube Music 上の曲名は "Pale"。yt-dlp のメタデータには出てこない。
+    """
+    entry = ytm_entry(tmp_path, "MIMI『 Pale 』feat. 初音ミク", "MIMI『 Pale 』feat. 初音ミク")
+    entry["id"] = "06YWg6Y1kxo"
+    fake_ydl.info = entry
+    asked = []
+    monkeypatch.setattr(
+        core,
+        "_fetch_ytmusic_song",
+        lambda vid, **k: asked.append(vid) or ("Pale", "MIMI"),
+    )
+    (track,) = core.download_tracks(YTM_URL, "mp3")
+    assert asked == ["06YWg6Y1kxo"]
+    assert track.guessed_title == "Pale"
+    assert track.artist == "MIMI"  # アーティスト欄も YouTube Music から埋める
+    # 元タイトル（推定入力・表示用）は動画タイトルのまま
+    assert track.stem == "MIMI『 Pale 』feat. 初音ミク"
+
+
+def test_download_tracks_ytmusic_falls_back_when_lookup_fails(fake_ydl, tmp_path):
+    """曲名を取れなければ track フィールド → 動画タイトルの順に落とす。"""
+    entry = ytm_entry(tmp_path, "a", "Song A (Official Video)", track="Song A")
+    entry["id"] = "a"
+    fake_ydl.info = entry  # フィクスチャの _fetch_ytmusic_song は (None, None)
+    (track,) = core.download_tracks(YTM_URL, "mp3")
+    assert track.guessed_title == "Song A"
+
+
+def test_fetch_metadata_ytmusic_uses_song_title(fake_ydl, monkeypatch):
+    """情報取得の段でも曲名を採用する（DL 前に確認できるように）。"""
+    fake_ydl.info = {
+        "entries": [
+            {"id": "06YWg6Y1kxo", "title": "MIMI『 Pale 』feat. 初音ミク",
+             "url": "https://music.youtube.com/watch?v=06YWg6Y1kxo"},
+        ]
+    }
+    monkeypatch.setattr(core, "_fetch_ytmusic_song", lambda vid, **k: ("Pale", "MIMI"))
+    (track,) = core.fetch_metadata("https://music.youtube.com/playlist?list=X")
+    assert track.stem == "MIMI『 Pale 』feat. 初音ミク"
+    assert track.guessed_title == "Pale"
+    assert track.artist == "MIMI"
+    assert track.skip_infer is True
+
+
+def _byline_run(text: str, page_type: str | None = None) -> dict:
+    """longBylineText の run 1 つぶん（page_type 付きならリンク付きの run）。"""
+    run: dict = {"text": text}
+    if page_type is not None:
+        run["navigationEndpoint"] = {
+            "browseEndpoint": {
+                "browseEndpointContextSupportedConfigs": {
+                    "browseEndpointContextMusicConfig": {"pageType": page_type}
+                }
+            }
+        }
+    return run
+
+
+ARTIST_PAGE = "MUSIC_PAGE_TYPE_ARTIST"
+
+
+def _panel(video_id: str, title: str, byline_runs: list[dict] | None = None) -> dict:
+    renderer = {"videoId": video_id, "title": {"runs": [{"text": title}]}}
+    if byline_runs is not None:
+        renderer["longBylineText"] = {"runs": byline_runs}
+    return {"playlistPanelVideoRenderer": renderer}
+
+
+def test_find_ytmusic_song_parsing():
+    """再生キューの中から、当該 videoId の曲名とアーティスト名を取り出す。"""
+    data = {
+        "contents": {
+            "results": [
+                _panel("other", "別の曲", [_byline_run("別の人", ARTIST_PAGE)]),
+                {"playlistPanelVideoRenderer": {
+                    "videoId": "abc",
+                    "title": {"runs": [{"text": "Pa"}, {"text": "le"}]},
+                    "longBylineText": {"runs": [
+                        _byline_run("MIMI", ARTIST_PAGE),
+                        _byline_run(" • "),
+                        # アルバム・再生回数の run はアーティストとして拾わない
+                        _byline_run("Pale", "MUSIC_PAGE_TYPE_ALBUM"),
+                        _byline_run(" • "),
+                        _byline_run("393万回視聴"),
+                    ]},
+                }},
+            ]
+        }
+    }
+    assert core._find_ytmusic_song(data, "abc") == ("Pale", "MIMI")
+    assert core._find_ytmusic_song(data, "missing") == (None, None)
+    assert core._find_ytmusic_song({}, "abc") == (None, None)
+
+
+def test_find_ytmusic_song_multiple_artists():
+    data = {"contents": [_panel("abc", "曲", [
+        _byline_run("A", ARTIST_PAGE), _byline_run(" & "), _byline_run("B", ARTIST_PAGE),
+    ])]}
+    assert core._find_ytmusic_song(data, "abc") == ("曲", "A, B")
+
+
+def test_find_ytmusic_song_without_artist_link():
+    """アーティストの run が無ければアーティストは None（曲名だけ使う）。"""
+    data = {"contents": [_panel("abc", "曲", [_byline_run("393万回視聴")])]}
+    assert core._find_ytmusic_song(data, "abc") == ("曲", None)
+    assert core._find_ytmusic_song({"contents": [_panel("abc", "曲")]}, "abc") == ("曲", None)
+
+
+def test_use_metadata_title_keeps_existing_artist():
+    """手動入力・チャンネル名コピー済みのアーティストは上書きしない。"""
+    track = Track(stem="s", artist="手動アーティスト")
+    core.use_metadata_title(track, "曲", artist="YTM アーティスト")
+    assert track.artist == "手動アーティスト"
+
+
+def test_fetch_ytmusic_song_network_failure_returns_none(monkeypatch):
+    def boom(*a, **k):
+        raise urllib.error.URLError("no network")
+
+    monkeypatch.setattr(core.urllib.request, "urlopen", boom)
+    assert core._fetch_ytmusic_song("06YWg6Y1kxo") == (None, None)
 
 
 def test_download_tracks_ytmusic_direct_disabled(fake_ydl, tmp_path):

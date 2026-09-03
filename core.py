@@ -35,6 +35,10 @@ from ytdlp_runtime import YtdlpUnavailable  # noqa: F401 - 呼び出し元の ex
 
 _ROOT = Path(__file__).parent.parent
 
+# GUI のログパネルは "core" / "mv2title" / "yt_dlp" ロガーを購読する
+# （gui/logpanel.attach_handler 参照）。CLI では未設定なので何も出ない。
+_LOG = logging.getLogger(__name__)
+
 # PyInstaller で凍結された exe / .app として動いているか
 _IS_FROZEN = bool(getattr(sys, "frozen", False))
 
@@ -146,6 +150,12 @@ METADATA_LANG = "ja"
 # 曲名を持っているため、LLM による推定を挟まずそのまま採用できる
 # （is_youtube_music / download_tracks(ytmusic_direct=True) 参照）。
 YTMUSIC_HOSTS = ("music.youtube.com",)
+# YouTube Music の innertube クライアント（曲名の取得に使う。
+# _fetch_ytmusic_song 参照）。バージョンは形式さえ合っていれば通る。
+_YTMUSIC_CLIENT = "WEB_REMIX"
+_YTMUSIC_CLIENT_VERSION = "1.20250101.01.00"
+# アーティスト名の run に付く遷移先の種別（_byline_artist 参照）
+_YTMUSIC_ARTIST_PAGE = "MUSIC_PAGE_TYPE_ARTIST"
 # 音量ノーマライズ(loudnorm)の既定パラメータ。EBU R128 相当のターゲットを
 # 単一パスで適用する(download_tracks(normalize=True) で使用)。
 # 基準値(統合ラウドネス I)は設定 / CLI から変更できる。TP / LRA は固定。
@@ -432,28 +442,148 @@ def _find_primary_title(node) -> str | None:
     return None
 
 
-def is_youtube_music(url: str | None) -> bool:
-    """URL が YouTube Music のものか判定する（ホスト名で判定）。
+def _fetch_ytmusic_song(
+    video_id: str, lang: str = METADATA_LANG, timeout: float = 5.0
+) -> tuple[str | None, str | None]:
+    """YouTube Music が表示している曲名とアーティスト名を innertube から取る。
+
+    YouTube Music は動画タイトルとは別に「曲名」を持っている。例えば
+    06YWg6Y1kxo の YouTube 上のタイトルは "MIMI『 Pale 』feat. 初音ミク"
+    だが、YouTube Music 上の曲名は "Pale"、アーティストは "MIMI" である。
+    これらは yt-dlp が参照する player / tab のメタデータには現れない
+    （entry["track"] は「この動画の音楽」欄がある動画にしか入らず、実測では
+    多くの動画で None）ため、YouTube Music のクライアント(WEB_REMIX)として
+    直接問い合わせる。
+
+    構造変更や通信失敗など、どんな理由でも失敗したら (None, None) を返す
+    （呼び出し元は entry["track"] や動画タイトルへフォールバックする）。
+    """
+    payload = json.dumps(
+        {
+            "context": {
+                "client": {
+                    "clientName": _YTMUSIC_CLIENT,
+                    "clientVersion": _YTMUSIC_CLIENT_VERSION,
+                    "hl": lang,
+                }
+            },
+            "videoId": video_id,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        "https://music.youtube.com/youtubei/v1/next",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.load(resp)
+    except Exception:
+        return (None, None)
+    return _find_ytmusic_song(data, video_id)
+
+
+def _find_ytmusic_song(node, video_id: str) -> tuple[str | None, str | None]:
+    """next API 応答から、再生キュー内の当該動画の曲名とアーティスト名を探す。
+
+    曲名は playlistPanelVideoRenderer.title に入る。videoId 指定の呼び出し
+    では通常 1 件だけ返るが、別の曲の行を拾わないよう videoId で照合する
+    （応答構造は YouTube 側の変更で変わり得るのでキー位置は決め打ちしない）。
+    アーティスト名は longBylineText の中から拾う（_byline_artist 参照）。
+    """
+    renderers: list[dict] = []
+    _collect_renderers(node, "playlistPanelVideoRenderer", renderers)
+    for renderer in renderers:
+        if renderer.get("videoId") not in (None, video_id):
+            continue
+        title = renderer.get("title") or {}
+        runs = title.get("runs") or []
+        text = "".join(r.get("text", "") for r in runs) or title.get("simpleText")
+        if text:
+            return (text, _byline_artist(renderer.get("longBylineText")))
+    return (None, None)
+
+
+def _byline_artist(byline) -> str | None:
+    """longBylineText の runs からアーティスト名だけを取り出す。
+
+    byline は "MIMI • 393万回視聴 • 高評価 6.5万 件"（MV）や
+    "MIMI • Pale • 2020年"（アルバム収録曲）のように、アーティスト・
+    アルバム・再生回数が中黒で連なる。テキストを分割すると曲によって
+    構成が変わって当てにならないので、run に付いている遷移先の種別
+    （pageType = MUSIC_PAGE_TYPE_ARTIST）でアーティストの run だけを選ぶ。
+    複数アーティストは ", " で連結する。見つからなければ None。
+    """
+    runs = (byline or {}).get("runs") or []
+    names = []
+    for run in runs:
+        endpoint = (run.get("navigationEndpoint") or {}).get("browseEndpoint") or {}
+        configs = endpoint.get("browseEndpointContextSupportedConfigs") or {}
+        music = configs.get("browseEndpointContextMusicConfig") or {}
+        if music.get("pageType") == _YTMUSIC_ARTIST_PAGE:
+            name = (run.get("text") or "").strip()
+            if name:
+                names.append(name)
+    return ", ".join(names) or None
+
+
+def _collect_renderers(node, key: str, found: list[dict]) -> None:
+    """応答ツリーから key という名前の renderer dict を再帰的に集める。"""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == key and isinstance(v, dict):
+                found.append(v)
+            _collect_renderers(v, key, found)
+    elif isinstance(node, list):
+        for v in node:
+            _collect_renderers(v, key, found)
+
+
+def _hostname(url: str) -> str:
+    """URL のホスト名を小文字で返す（スキーム無しの貼り付けにも対応）。
+
+    "music.youtube.com/playlist?list=..." のようにスキームを省いた URL は
+    urlsplit がホストではなくパスとして解釈するため、"//" を補って解析する
+    （yt-dlp 自体はスキーム無しでも受け付けるので、判定側だけ落ちるのを防ぐ）。
+    """
+    parts = urllib.parse.urlsplit(url)
+    if not parts.scheme and not parts.netloc:
+        parts = urllib.parse.urlsplit("//" + url)
+    return (parts.hostname or "").lower().lstrip(".")
+
+
+def is_youtube_music(*urls: str | None) -> bool:
+    """渡された URL のいずれかが YouTube Music のものか判定する。
 
     YouTube Music の配信データは曲名・アーティスト名を独立したメタデータ
     として持っているため、動画タイトルから曲名を推測する必要がない
     （download_tracks / fetch_metadata の ytmusic_direct）。
+
+    複数取るのは、判定できる URL が抽出のどこに残るか一定しないため。
+    yt-dlp は entry の webpage_url を www.youtube.com へ正規化するので、
+    呼び出し元から渡した URL・再生リスト側の original_url / webpage_url・
+    エントリ側の元 URL を順に見る（どれか 1 つでも music.youtube.com なら
+    その抽出は YouTube Music 由来）。
     """
-    if not url:
-        return False
-    host = urllib.parse.urlsplit(url).hostname or ""
-    return host.lower().lstrip(".") in YTMUSIC_HOSTS
+    return any(_hostname(u) in YTMUSIC_HOSTS for u in urls if u)
 
 
-def use_metadata_title(track: Track, title: str | None = None) -> None:
+def use_metadata_title(
+    track: Track, title: str | None = None, artist: str | None = None
+) -> None:
     """推定を挟まず、取得済みのタイトルをそのまま曲名として採用する。
 
     title を渡さなければ stem（＝動画タイトル）をそのまま使う。配信元が
     付けた曲名なので検証(valid)は行わず True 扱いにし、書き込み待ち
     (PENDING) にする。skip_infer=True により以降の推定からは保護される
     （manual は立てない — ユーザーの手動編集と区別するため）。
+    artist を渡すとアーティスト欄も埋める（既に入っている行は上書きしない
+    — 手動入力やチャンネル名コピーの結果を消さないため）。
     """
     track.guessed_title = (title or track.stem).strip()
+    if artist and not track.artist:
+        track.artist = artist.strip()
     track.skip_infer = True
     track.valid = True
     track.status = Status.PENDING
@@ -485,8 +615,8 @@ def download_tracks(
     末尾の無音区間を削除する（試験的。TRIM_SILENCE_FILTER 参照）。どちらも
     ffmpeg の再エンコード時に適用される。
     ytmusic_direct=True（既定）だと、YouTube Music の URL はタイトル推定を
-    行わずメタデータの曲名（track フィールド。無ければ動画タイトル）を
-    そのまま採用する（use_metadata_title）。
+    行わず、YouTube Music 上の曲名とアーティスト名をそのまま採用する
+    （_fetch_ytmusic_song / use_metadata_title）。
     on_stage は受信完了後の段（Status.CONVERTING = ffmpeg 変換、
     Status.FETCHING = 日本語タイトル取得）へ移ったときに呼ばれる。on_progress は
     バイト受信中しか呼ばれないため、これが無いと変換とタイトル取得の間ずっと
@@ -580,6 +710,10 @@ def download_tracks(
 
         # 再生リストなら entries を、単一動画ならそれ自身を対象にする
         entries = info["entries"] if "entries" in info else [info]
+        # YouTube Music 判定に使う URL 候補（再生リストでは entry 側に
+        # music.youtube.com が残らないため、抽出結果の元 URL も見る）
+        source_urls = (url, info.get("original_url"), info.get("webpage_url"))
+        direct_count = 0
         if on_stage is not None:
             # 以降は動画ごとに watch 画面へ問い合わせる（1 本あたり最大 5 秒）。
             # ここも進捗が出ないので、変換とは別の段として見せる。
@@ -603,12 +737,26 @@ def download_tracks(
                 filepath=path,
                 channel=entry.get("channel") or entry.get("uploader"),
             )
-            if ytmusic_direct and is_youtube_music(url):
-                # YouTube Music は曲名を独立したメタデータ(track)で持つ。
-                # webpage_url は www.youtube.com に正規化されるため、判定は
-                # 呼び出し元から渡された URL で行う。
-                use_metadata_title(track, entry.get("track"))
+            if ytmusic_direct and is_youtube_music(
+                *source_urls, entry.get("original_url")
+            ):
+                # YouTube Music 上の曲名・アーティスト名を採用する。曲名は
+                # 動画タイトルとは別物で（例: "MIMI『 Pale 』feat. 初音ミク"
+                # の曲名は "Pale"）、yt-dlp のメタデータには出てこないため
+                # 直接問い合わせる。曲名が取れなければ track フィールド →
+                # 動画タイトルの順に落とす。
+                song, singer = _fetch_ytmusic_song(video_id) if video_id else (None, None)
+                use_metadata_title(
+                    track,
+                    song or entry.get("track") or entry.get("title"),
+                    artist=singer or entry.get("artist"),
+                )
+                direct_count += 1
             tracks.append(track)
+        if direct_count:
+            _LOG.info(
+                "YouTube Music: %d 件のタイトルを推定せずそのまま使います", direct_count
+            )
 
     if not tracks:
         raise CoreError("ダウンロードした音声ファイルが見つかりません。")
@@ -631,8 +779,9 @@ def fetch_metadata(
     フラット抽出のタイトルは翻訳されないことがあるが、DL 時に stem が
     日本語タイトルへ置き直されるため（download_tracks 参照）ここでは追わない。
     expand_playlist / ytmusic_direct / logger の意味は download_tracks と同じ
-    （ytmusic_direct の行は曲名を確定済みの PENDING で返る。フラット抽出は
-    track フィールドを持たないためタイトルをそのまま曲名にする）。
+    （ytmusic_direct の行は曲名・アーティスト名を確定済みの PENDING で
+    返る。_fetch_ytmusic_song で 1 件ずつ問い合わせるため、YouTube Music の
+    大きい再生リストではその件数ぶん時間がかかる）。
 
     Raises:
         CancelledError: cancel がセットされた場合。
@@ -659,21 +808,38 @@ def fetch_metadata(
         raise CoreError("情報を取得できませんでした（URL を確認してください）。")
 
     entries = info["entries"] if "entries" in info else [info]
-    tracks = [
-        Track(
+    # YouTube Music 判定に使う URL 候補（download_tracks と同じ考え方）
+    source_urls = (url, info.get("original_url"), info.get("webpage_url"))
+    tracks: list[Track] = []
+    for entry in entries:
+        if not entry:
+            continue
+        track = Track(
             stem=entry.get("title") or entry.get("id") or url,
             # フラット抽出のエントリは webpage_url を持たず url が動画 URL
             url=entry.get("webpage_url") or entry.get("url") or url,
             channel=entry.get("channel") or entry.get("uploader"),
         )
-        for entry in entries
-        if entry
-    ]
-    if ytmusic_direct and is_youtube_music(url):
-        # 展開後の行の URL は www.youtube.com になることがあるため、ここで
-        # 印を付けておく（DL 段でこの行の skip_infer が実 Track へ引き継がれる）
-        for t in tracks:
-            use_metadata_title(t)
+        if ytmusic_direct and is_youtube_music(
+            *source_urls, entry.get("url"), entry.get("webpage_url")
+        ):
+            # 展開後の行の URL は www.youtube.com になることがあるため、ここで
+            # 印を付けておく（DL 段でこの行の skip_infer が実 Track へ引き継がれる）。
+            # 曲名も DL 段と同じ経路で取る（フラット抽出のタイトルは動画
+            # タイトルなので、ここで曲名にしておかないと確認の役に立たない）。
+            video_id = entry.get("id")
+            song, singer = _fetch_ytmusic_song(video_id) if video_id else (None, None)
+            use_metadata_title(
+                track,
+                song or entry.get("track") or entry.get("title"),
+                artist=singer or entry.get("artist"),
+            )
+        tracks.append(track)
+    direct_count = sum(1 for t in tracks if t.skip_infer)
+    if direct_count:
+        _LOG.info(
+            "YouTube Music: %d 件のタイトルを推定せずそのまま使います", direct_count
+        )
     if not tracks:
         raise CoreError("有効な動画が見つかりません。")
     return tracks

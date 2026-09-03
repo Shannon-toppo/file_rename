@@ -340,6 +340,13 @@ class PipelineWorker(QRunnable):
                 core.use_metadata_title(real, placeholder.guessed_title)
             if placeholder.artist:
                 real.artist = placeholder.artist
+        elif placeholder.skip_infer:
+            # 情報取得済みの「推定不要」行が複数行へ展開された場合
+            # （再生リスト付き URL ＋ リスト展開 ON）。どの行がどの曲かは
+            # 対応付けられないので、各行は自分のタイトルをそのまま使う。
+            for real in new_tracks:
+                if not real.skip_infer:
+                    core.use_metadata_title(real)
 
         # プレースホルダ行を実 Track 行（再生リストは複数）へ差し替える
         self.signals.tracks_ready.emit(placeholder, new_tracks)
