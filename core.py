@@ -352,6 +352,25 @@ YoutubeDL = None
 # 同時に sys.path 操作と import を行うのを防ぐ）。
 _YTDLP_LOCK = threading.Lock()
 
+# yt-dlp のフック内から投げるキャンセル例外（CancelledError と yt-dlp の
+# DownloadCancelled の両方を継承する）。ensure_ytdlp() でロード後に作る。
+_YDL_CANCELLED: type[BaseException] | None = None
+
+
+def _cancelled(message: str) -> BaseException:
+    """yt-dlp のフックから投げるキャンセル例外を作る。
+
+    素の CancelledError では駄目 — yt-dlp の _handle_extraction_exceptions は
+    ignoreerrors=True のとき「予期しない例外」を report_error で握り潰し、
+    **再生リストの次のエントリへ進んでしまう**（停止ボタンを押しても最後まで
+    走り続ける）。yt-dlp が中断として特別扱いするのは DownloadCancelled だけで、
+    これだけは握り潰さず再送出されるため、その場でリスト全体が止まる。
+    呼び出し元は従来どおり CancelledError として捕捉できる。
+    yt-dlp 未ロード（テストの代役など）では素の CancelledError に落とす。
+    """
+    cls = _YDL_CANCELLED or CancelledError
+    return cls(message)
+
 
 def ensure_ytdlp() -> None:
     """yt-dlp をロードして core.YoutubeDL に載せる（済んでいれば何もしない）。
@@ -374,7 +393,24 @@ def ensure_ytdlp() -> None:
             raise CoreError(str(e)) from e
         except ImportError as e:  # load() が通ったのに import できないのは壊れた展開
             raise CoreError(f"yt-dlp を読み込めませんでした: {e}") from e
+        _load_cancel_exception()
         YoutubeDL = _YoutubeDL
+
+
+def _load_cancel_exception() -> None:
+    """yt-dlp の DownloadCancelled を継承したキャンセル例外を用意する。
+
+    ロードできない古い yt-dlp では None のままにし、_cancelled() が素の
+    CancelledError に落ちる（従来どおり単一動画では止まる）。
+    """
+    global _YDL_CANCELLED
+    if _YDL_CANCELLED is not None:
+        return
+    try:
+        from yt_dlp.utils import DownloadCancelled
+    except ImportError:
+        return
+    _YDL_CANCELLED = type("_YdlCancelled", (CancelledError, DownloadCancelled), {})
 
 
 def _fetch_localized_title(
@@ -589,6 +625,50 @@ def use_metadata_title(
     track.status = Status.PENDING
 
 
+# yt-dlp が失敗を報告したときの文言。ignoreerrors=True では extract_info が
+# 例外を投げず None（または欠けた entries）を返すだけなので、拾っておかないと
+# 「なぜ失敗したか」が呼び出し元に一切残らず、URL は正しいのに「URL を確認して
+# ください」と出てしまう（例: YouTube が Premium 限定に指定した動画）。
+# yt-dlp の出力自体はロガーを渡した GUI のログパネルにしか出ないため、
+# ここで拾って CoreError の文言＝GUI の行に出る文言に載せる。
+GENERIC_EXTRACT_ERROR = "情報を取得できませんでした（URL を確認してください）。"
+
+
+def _record_ydl_errors(ydl) -> list[str]:
+    """ydl.report_error を差し替え、報告されたエラー文言を溜めるリストを返す。
+
+    report_error は ignoreerrors で握り潰される経路も含めて必ず通るため、
+    ここが理由を拾える唯一の場所になる（logger オプションは CLI では未設定で、
+    設定すると yt-dlp の進捗表示が壊れるので使えない）。report_error を持たない
+    実装（テストの代役など）では何もせず空リストを返す。
+    """
+    errors: list[str] = []
+    original = getattr(ydl, "report_error", None)
+    if original is None:
+        return errors
+
+    def report_error(message, *args, **kwargs):
+        errors.append(str(message))
+        return original(message, *args, **kwargs)
+
+    ydl.report_error = report_error
+    return errors
+
+
+def _ydl_error_message(errors: Sequence[str], fallback: str) -> str:
+    """溜めたエラー文言を 1 行にまとめる。1 件も無ければ fallback を返す。"""
+    seen: list[str] = []
+    for raw in errors:
+        # 表の 1 セルに収めるため改行を潰す（yt-dlp は対処法を改行で足す）
+        msg = " ".join(str(raw).split())
+        # report_error には接頭辞なしで渡るが、念のため落としておく
+        if msg.startswith("ERROR:"):
+            msg = msg[len("ERROR:"):].strip()
+        if msg and msg not in seen:
+            seen.append(msg)
+    return " / ".join(seen) if seen else fallback
+
+
 def download_tracks(
     url: str,
     fmt: str = "mp3",
@@ -629,6 +709,8 @@ def download_tracks(
     Raises:
         CancelledError: cancel がセットされた場合（DL 途中で中断）。
         CoreError: 情報取得に失敗、または 1 件もダウンロードできなかった場合。
+            文言には yt-dlp が報告した理由をそのまま載せる
+            （_record_ydl_errors / _ydl_error_message 参照）。
     """
     if fmt not in SUPPORTED_FORMATS:
         raise ValueError(f"unsupported format: {fmt}")
@@ -638,9 +720,11 @@ def download_tracks(
     outtmpl = str(dest / "%(title)s [%(id)s].%(ext)s")
 
     def hook(d: dict) -> None:
-        # yt-dlp のフックから例外を投げると当該エントリの DL が中断される
+        # yt-dlp のフックから例外を投げると当該エントリの DL が中断される。
+        # 再生リストの残りまで止めるには DownloadCancelled 系である必要がある
+        # （_cancelled 参照。素の CancelledError は ignoreerrors に食われる）
         if cancel is not None and cancel.is_set():
-            raise CancelledError("ダウンロードがキャンセルされました。")
+            raise _cancelled("ダウンロードがキャンセルされました。")
         if on_progress is not None and d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             if total:
@@ -662,6 +746,15 @@ def download_tracks(
         if on_stage is not None and d.get("status") == "started":
             on_stage(Status.CONVERTING)
 
+    def cancel_filter(info: dict, *, incomplete: bool = False) -> str | None:
+        # 各エントリの処理に入る前に呼ばれる。進捗フックはバイトを受け取り
+        # 始めてからしか鳴らないため（ライブや HLS では最初の 1 個目が来る
+        # まで数十秒かかる）、ここで先に止める。DownloadCancelled を投げると
+        # 残りのエントリごと中断されることが match_filter の仕様に明記されている。
+        if cancel is not None and cancel.is_set():
+            raise _cancelled("ダウンロードがキャンセルされました。")
+        return None
+
     opts = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
@@ -674,6 +767,8 @@ def download_tracks(
         # の優先言語を日本語に指定する（日本語版が無ければ原語のまま）。
         # タイトルはファイル名(= 推定の入力)にも使われるためここで効く。
         "extractor_args": {"youtube": {"lang": [METADATA_LANG]}},
+        # 受信開始前にキャンセルを効かせる（cancel_filter 参照）
+        "match_filter": cancel_filter,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -699,14 +794,22 @@ def download_tracks(
         opts["quiet"] = True
 
     tracks: list[Track] = []
+    ydl_errors: list[str] = []
     with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+        # 失敗理由は握り潰されるので、CoreError に載せるため控えておく
+        ydl_errors = _record_ydl_errors(ydl)
+        try:
+            info = ydl.extract_info(url, download=True)
+        except CancelledError:
+            # match_filter 経由の中断では yt-dlp が break_err() を引数なしで
+            # 作り直すため文言が英語の既定値に化ける。ここで戻す
+            raise CancelledError("ダウンロードがキャンセルされました。") from None
         # ignoreerrors=True では CancelledError も entry 単位で握り潰されるため、
         # 抜けた直後に必ず再確認する
         if cancel is not None and cancel.is_set():
             raise CancelledError("ダウンロードがキャンセルされました。")
         if not info:
-            raise CoreError("情報を取得できませんでした（URL を確認してください）。")
+            raise CoreError(_ydl_error_message(ydl_errors, GENERIC_EXTRACT_ERROR))
 
         # 再生リストなら entries を、単一動画ならそれ自身を対象にする
         entries = info["entries"] if "entries" in info else [info]
@@ -719,6 +822,10 @@ def download_tracks(
             # ここも進捗が出ないので、変換とは別の段として見せる。
             on_stage(Status.FETCHING)
         for entry in entries:
+            # 1 本ごとに watch 画面へ問い合わせる段（最大 5 秒 × 件数）なので、
+            # ここで見ないと大きなリストでは停止ボタンが数分効かなく見える
+            if cancel is not None and cancel.is_set():
+                raise CancelledError("ダウンロードがキャンセルされました。")
             if not entry:
                 # ignoreerrors により失敗した項目は None になる
                 continue
@@ -759,7 +866,11 @@ def download_tracks(
             )
 
     if not tracks:
-        raise CoreError("ダウンロードした音声ファイルが見つかりません。")
+        raise CoreError(
+            _ydl_error_message(
+                ydl_errors, "ダウンロードした音声ファイルが見つかりません。"
+            )
+        )
     return tracks
 
 
@@ -786,6 +897,7 @@ def fetch_metadata(
     Raises:
         CancelledError: cancel がセットされた場合。
         CoreError: 情報を取得できなかった、または有効なエントリが無かった場合。
+            download_tracks と同じく yt-dlp の理由を文言に載せる。
     """
     ensure_ytdlp()
     opts = {
@@ -801,17 +913,22 @@ def fetch_metadata(
     if cancel is not None and cancel.is_set():
         raise CancelledError("情報取得がキャンセルされました。")
     with YoutubeDL(opts) as ydl:
+        # download_tracks と同じく、握り潰される失敗理由を控えておく
+        ydl_errors = _record_ydl_errors(ydl)
         info = ydl.extract_info(url, download=False)
     if cancel is not None and cancel.is_set():
         raise CancelledError("情報取得がキャンセルされました。")
     if not info:
-        raise CoreError("情報を取得できませんでした（URL を確認してください）。")
+        raise CoreError(_ydl_error_message(ydl_errors, GENERIC_EXTRACT_ERROR))
 
     entries = info["entries"] if "entries" in info else [info]
     # YouTube Music 判定に使う URL 候補（download_tracks と同じ考え方）
     source_urls = (url, info.get("original_url"), info.get("webpage_url"))
     tracks: list[Track] = []
     for entry in entries:
+        # YouTube Music 行は 1 件ずつ曲名を問い合わせるため、ここでも見る
+        if cancel is not None and cancel.is_set():
+            raise CancelledError("情報取得がキャンセルされました。")
         if not entry:
             continue
         track = Track(
@@ -841,7 +958,7 @@ def fetch_metadata(
             "YouTube Music: %d 件のタイトルを推定せずそのまま使います", direct_count
         )
     if not tracks:
-        raise CoreError("有効な動画が見つかりません。")
+        raise CoreError(_ydl_error_message(ydl_errors, "有効な動画が見つかりません。"))
     return tracks
 
 
