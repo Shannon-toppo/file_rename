@@ -211,6 +211,7 @@ class FakeYDL:
     info: dict | None = None
     hook_feed: list[dict] = []
     pp_feed: list[dict] = []  # postprocessor_hooks へ流すイベント（変換段の通知用）
+    error_feed: list[str] = []  # report_error へ流す文言（ignoreerrors 時の失敗）
     last_opts: dict | None = None  # 直近に渡された yt-dlp オプション（検査用）
     last_download: bool | None = None  # extract_info の download 引数（検査用）
 
@@ -232,7 +233,15 @@ class FakeYDL:
         for d in self.pp_feed:
             for hook in self.opts.get("postprocessor_hooks", []):
                 hook(d)
+        # ignoreerrors=True の本物と同じく、失敗は例外ではなく report_error で
+        # 報告して info を返すだけにする
+        for msg in self.error_feed:
+            self.report_error(msg)
         return self.info
+
+    def report_error(self, message, *args, **kwargs):
+        # 本物は stderr / logger へ出す。ここでは core 側のフックだけが要る
+        pass
 
     def prepare_filename(self, entry):
         return entry["_filename"]
@@ -250,6 +259,7 @@ def fake_ydl(monkeypatch, tmp_path):
     FakeYDL.info = None
     FakeYDL.hook_feed = []
     FakeYDL.pp_feed = []
+    FakeYDL.error_feed = []
     FakeYDL.last_opts = None
     FakeYDL.last_download = None
     return FakeYDL
@@ -356,6 +366,97 @@ def test_download_tracks_stage_hook_does_not_cancel(fake_ydl, tmp_path):
     with pytest.raises(CancelledError):
         core.download_tracks("u", "mp3", on_stage=seen.append, cancel=cancel)
     assert seen == [core.Status.CONVERTING]  # フックは呼ばれてから中断する
+
+
+def test_download_tracks_installs_cancel_match_filter(fake_ydl, tmp_path):
+    """受信開始前にも止まるよう match_filter でキャンセルを見る。
+
+    進捗フックはバイトを受け取り始めてからしか鳴らないため、これが無いと
+    ライブ配信や HLS のエントリで停止ボタンが何十秒も効かない。
+    """
+    fake_ydl.info = entry_for(tmp_path, "a")
+    cancel = threading.Event()
+    core.download_tracks("u", "mp3", cancel=cancel)
+    match_filter = fake_ydl.last_opts["match_filter"]
+    assert match_filter({}, incomplete=True) is None  # 未キャンセルなら通す
+    cancel.set()
+    with pytest.raises(CancelledError):
+        match_filter({}, incomplete=True)
+
+
+def test_download_tracks_no_match_filter_without_cancel(fake_ydl, tmp_path):
+    """cancel を渡さない CLI 経路でも match_filter 自体は無害に通る。"""
+    fake_ydl.info = entry_for(tmp_path, "a")
+    core.download_tracks("u", "mp3")
+    assert fake_ydl.last_opts["match_filter"]({}, incomplete=True) is None
+
+
+def test_cancel_exception_is_recognized_by_ytdlp(monkeypatch):
+    """キャンセル例外は yt-dlp の DownloadCancelled でもあること。
+
+    素の CancelledError だと ignoreerrors=True に握り潰され、再生リストの
+    残りが処理され続ける（= 停止ボタンが効かない）。DownloadCancelled だけは
+    _handle_extraction_exceptions が再送出するので、その場で全体が止まる。
+    """
+    from yt_dlp.utils import DownloadCancelled
+
+    monkeypatch.setattr(core, "_YDL_CANCELLED", None)
+    core._load_cancel_exception()
+    exc = core._cancelled("停止")
+    assert isinstance(exc, CancelledError)
+    assert isinstance(exc, DownloadCancelled)
+    assert str(exc) == "停止"
+
+
+def test_cancel_exception_falls_back_without_ytdlp(monkeypatch):
+    """yt-dlp 未ロード（テストの代役など）では素の CancelledError に落とす。"""
+    monkeypatch.setattr(core, "_YDL_CANCELLED", None)
+    exc = core._cancelled("停止")
+    assert type(exc) is CancelledError
+
+
+def test_download_tracks_cancel_stops_title_lookups(fake_ydl, tmp_path, monkeypatch):
+    """受信後のタイトル取得ループ（1 本あたり最大 5 秒）でも停止が効く。"""
+    entries = []
+    for name in ("a", "b", "c"):
+        e = entry_for(tmp_path, name)
+        e["id"] = name
+        entries.append(e)
+    fake_ydl.info = {"entries": entries}
+    cancel = threading.Event()
+    calls = []
+
+    def fetch(video_id, *a, **k):
+        calls.append(video_id)
+        cancel.set()  # 1 本目の取得中に停止ボタンが押された想定
+        return None
+
+    monkeypatch.setattr(core, "_fetch_localized_title", fetch)
+    with pytest.raises(CancelledError):
+        core.download_tracks("u", "mp3", cancel=cancel)
+    assert calls == ["a"]  # 2 本目以降は問い合わせない
+
+
+def test_fetch_metadata_cancel_stops_song_lookups(fake_ydl, monkeypatch):
+    """情報取得の YouTube Music 曲名ループでも停止が効く。"""
+    fake_ydl.info = {
+        "entries": [
+            {"id": "a", "title": "A", "url": "https://music.youtube.com/watch?v=a"},
+            {"id": "b", "title": "B", "url": "https://music.youtube.com/watch?v=b"},
+        ]
+    }
+    cancel = threading.Event()
+    calls = []
+
+    def fetch(video_id, *a, **k):
+        calls.append(video_id)
+        cancel.set()
+        return (None, None)
+
+    monkeypatch.setattr(core, "_fetch_ytmusic_song", fetch)
+    with pytest.raises(CancelledError):
+        core.fetch_metadata("https://music.youtube.com/playlist?list=x", cancel=cancel)
+    assert calls == ["a"]
 
 
 def test_download_tracks_empty_raises(fake_ydl, tmp_path):
@@ -548,6 +649,72 @@ def test_fetch_metadata_cancel_and_empty(fake_ydl):
     fake_ydl.info = None
     with pytest.raises(CoreError):
         core.fetch_metadata("u")
+
+
+# ---------------------------------------------------------------------------
+# yt-dlp のエラー文言の引き継ぎ（ignoreerrors で握り潰される理由を CoreError へ）
+# ---------------------------------------------------------------------------
+
+
+PREMIUM_ERROR = (
+    "[youtube] BCQEq6EM_mM: この動画を視聴できるのは、Music Premium のメンバーのみです"
+)
+
+
+def test_download_tracks_raises_ydl_reason(fake_ydl):
+    """DL 失敗時は「URL を確認してください」ではなく yt-dlp の理由を出す。"""
+    fake_ydl.info = None
+    fake_ydl.error_feed = [PREMIUM_ERROR]
+    with pytest.raises(CoreError) as ei:
+        core.download_tracks("https://music.youtube.com/watch?v=BCQEq6EM_mM", "mp3")
+    assert str(ei.value) == PREMIUM_ERROR
+
+
+def test_download_tracks_no_files_raises_ydl_reason(fake_ydl):
+    """entries が全滅した場合も理由を引き継ぐ。"""
+    fake_ydl.info = {"entries": [None]}
+    fake_ydl.error_feed = [PREMIUM_ERROR]
+    with pytest.raises(CoreError) as ei:
+        core.download_tracks("u", "mp3")
+    assert str(ei.value) == PREMIUM_ERROR
+
+
+def test_download_tracks_falls_back_to_generic_message(fake_ydl):
+    """理由が 1 件も報告されなければ従来の汎用文言のまま。"""
+    fake_ydl.info = None
+    with pytest.raises(CoreError) as ei:
+        core.download_tracks("u", "mp3")
+    assert str(ei.value) == core.GENERIC_EXTRACT_ERROR
+
+
+def test_fetch_metadata_raises_ydl_reason(fake_ydl):
+    fake_ydl.info = None
+    fake_ydl.error_feed = [PREMIUM_ERROR]
+    with pytest.raises(CoreError) as ei:
+        core.fetch_metadata("u")
+    assert str(ei.value) == PREMIUM_ERROR
+
+
+def test_ydl_error_message_normalizes_and_dedupes():
+    msgs = [
+        "ERROR: boom" + chr(10) + "You might want to use a VPN.",
+        "boom You might want to use a VPN.",  # 同一 → 1 回だけ
+        "second",
+        "   ",  # 空白のみ → 落とす
+    ]
+    assert core._ydl_error_message(msgs, "fallback") == (
+        "boom You might want to use a VPN. / second"
+    )
+    assert core._ydl_error_message([], "fallback") == "fallback"
+
+
+def test_record_ydl_errors_tolerates_missing_report_error():
+    """report_error を持たない実装でも落ちない（差し替えは諦めて空のまま）。"""
+
+    class Bare:
+        pass
+
+    assert core._record_ydl_errors(Bare()) == []
 
 
 def test_fetch_metadata_logger_injection(fake_ydl):

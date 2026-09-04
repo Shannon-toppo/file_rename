@@ -1045,7 +1045,11 @@ class MainWindow(QMainWindow):
 
     def _on_stop(self) -> None:
         self._cancel.set()
-        self.statusBar().showMessage("停止を要求しました...")
+        # 押されたことを見せる。次の実行で _set_running(True) が戻す。
+        # 停止要求はすぐ効くが、ffmpeg 変換中だけはファイルを中途半端に
+        # 残さないため書き終わりまで待つ（core.download_tracks の pp_hook）
+        self._stop_btn.setEnabled(False)
+        self.statusBar().showMessage("停止を要求しました（変換中の曲は書き終えてから止まります）...")
 
     # -- Excel 風操作: コピー / ペースト / Delete / 編集コマンド化 -----------
 
