@@ -95,6 +95,9 @@ class PipelineWorker(QRunnable):
             core.BITRATE_SOURCE = 取得元と同じ、整数 = kbps 固定）。
         ytmusic_direct: True（既定）なら YouTube Music の URL はタイトル推定を
             行わず、メタデータの曲名をそのまま使う（core.use_metadata_title）。
+        use_schema: True（既定）なら推定リクエストに構造化出力
+            （response_format）を付ける。付けると応答が 1 件目で打ち切られる
+            モデルでは False にする（core.USE_SCHEMA 参照。None なら core 既定）。
     """
 
     def __init__(
@@ -117,6 +120,7 @@ class PipelineWorker(QRunnable):
         best_quality: bool = False,
         audio_bitrate: int | str | None = None,
         ytmusic_direct: bool = True,
+        use_schema: bool | None = None,
     ):
         super().__init__()
         self.signals = WorkerSignals()
@@ -140,6 +144,7 @@ class PipelineWorker(QRunnable):
         self._best_quality = best_quality
         self._audio_bitrate = audio_bitrate
         self._ytmusic_direct = ytmusic_direct
+        self._use_schema = use_schema if use_schema is not None else core.USE_SCHEMA
 
     # -- QRunnable のエントリポイント ---------------------------------------
 
@@ -426,7 +431,11 @@ class PipelineWorker(QRunnable):
             self.signals.track_updated.emit(t)
         try:
             core.infer_titles(
-                targets, client=self._client, batch_size=self._batch_size, force=self._force
+                targets,
+                client=self._client,
+                batch_size=self._batch_size,
+                force=self._force,
+                use_schema=self._use_schema,
             )
         finally:
             # 成否にかかわらず各行の状態を UI へ反映する

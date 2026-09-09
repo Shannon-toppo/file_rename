@@ -11,6 +11,8 @@ yt-dlp で URL の動画から音声をダウンロードし、推測したタ�
     --format を省略した場合は mp3 でダウンロードします。
     --best-quality で取得する音源を音質優先で選び、--bitrate で変換後の
     ビットレート（source = 取得元と同じ / 数値 = kbps 固定）を指定できます。
+    --no-structured-output は曲名推定から構造化出力(response_format)を外します
+    （応答が 1 件目で打ち切られるモデル向け。既定は付ける）。
     opus は YouTube が配信している形式そのものなので、--no-normalize と
     併せると再エンコードなし（無劣化）で保存できます。
     -a / --batch-file にテキストファイルを指定すると、
@@ -40,6 +42,7 @@ def process_url(
     best_quality: bool = False,
     audio_bitrate: int | str | None = None,
     ytmusic_direct: bool = True,
+    use_schema: bool = core.USE_SCHEMA,
 ) -> None:
     """1 件の URL をダウンロードしてメタデータを書き込む。"""
     print(f"Downloading audio ({fmt}) from: {url}")
@@ -69,7 +72,7 @@ def process_url(
     else:
         print("Inferring titles...")
     try:
-        core.infer_titles(tracks)
+        core.infer_titles(tracks, use_schema=use_schema)
     except Exception as e:
         print(f"Error: {e}")
         return
@@ -131,6 +134,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--no-structured-output",
+        action="store_true",
+        help=(
+            "推定リクエストに構造化出力(response_format)を付けない。"
+            "制約付きデコードで応答が 1 件目に打ち切られるモデル向け"
+            "（既定は付ける）"
+        ),
+    )
+    parser.add_argument(
         "--trim-silence",
         action="store_true",
         help="末尾の無音区間を削除する（試験的。-50dB 以下を 1 秒残して削除）",
@@ -172,6 +184,7 @@ def main() -> None:
             best_quality=args.best_quality,
             audio_bitrate=bitrate,
             ytmusic_direct=not args.no_ytmusic_direct,
+            use_schema=not args.no_structured_output,
         )
 
 

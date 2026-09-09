@@ -154,6 +154,18 @@ def test_infer_titles_marks_still_empty_rows(monkeypatch):
     assert t.error == core.EMPTY_TITLE_ERROR
 
 
+def test_infer_titles_passes_use_schema(monkeypatch):
+    """構造化出力の有無は extract_titles(use_schema=...) へそのまま渡る（既定 ON）。"""
+    fake, captured = fake_extract_factory(ok_results)
+    monkeypatch.setattr(core, "extract_titles", fake)
+
+    core.infer_titles([Track(stem="a")], client=object())
+    assert captured["kw"]["use_schema"] is core.USE_SCHEMA is True
+
+    core.infer_titles([Track(stem="a")], client=object(), use_schema=False)
+    assert captured["kw"]["use_schema"] is False
+
+
 def test_infer_titles_calls_extract_titles_once(monkeypatch):
     """core は extract_titles を 1 回しか呼ばない（往復を二重化しない）。
 

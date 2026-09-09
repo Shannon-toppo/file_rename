@@ -57,6 +57,7 @@ class SettingsDialog(QDialog):
         out_dir: Path | None = None,
         fmt: str = "mp3",
         batch_size: int = core.BATCH_SIZE,
+        use_schema: bool = core.USE_SCHEMA,
         max_downloads: int = core.MAX_DOWNLOADS,
         auto_write: bool = True,
         ytmusic_direct: bool = True,
@@ -218,6 +219,19 @@ class SettingsDialog(QDialog):
         self._batch_spin.setRange(1, 50)
         self._batch_spin.setValue(batch_size)
         llm_form.addRow("推定バッチサイズ", self._batch_spin)
+
+        # 構造化出力（response_format=json_schema）。既定は ON
+        self._schema_check = QCheckBox("構造化出力 (JSON スキーマ) を使う")
+        self._schema_check.setChecked(use_schema)
+        self._schema_check.setToolTip(
+            "推定リクエストに response_format=json_schema を付けます。\n"
+            "既定は ON（応答の形が固定されるので解析が安定する）。\n\n"
+            "サーバ／モデルによっては応答が配列の 1 件目だけになります\n"
+            "（実測: LM Studio + gemma-4-e2b）。曲名は問い直しで回収されますが、\n"
+            "1 バッチ目が毎回無駄になり往復が増えるので、\n"
+            "その組み合わせでは OFF にしてください。"
+        )
+        llm_form.addRow("構造化出力", self._schema_check)
 
         # 自動書き込みの既定値
         self._auto_check = QCheckBox("起動時に自動書き込みを ON にする")
@@ -465,6 +479,7 @@ class SettingsDialog(QDialog):
             "out_dir": Path(self._dir_edit.text().strip() or str(core.FILES_DIR)),
             "fmt": self._fmt_combo.currentText(),
             "batch_size": self._batch_spin.value(),
+            "use_schema": self._schema_check.isChecked(),
             "max_downloads": self._max_dl_spin.value(),
             "auto_write": self._auto_check.isChecked(),
             "ytmusic_direct": self._ytmusic_check.isChecked(),

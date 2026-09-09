@@ -40,6 +40,7 @@ def test_settings_dialog_roundtrip(qtbot, tmp_path):
         out_dir=tmp_path,
         fmt="wav",
         batch_size=9,
+        use_schema=False,
         max_downloads=3,
         auto_write=False,
         ytmusic_direct=False,
@@ -59,6 +60,7 @@ def test_settings_dialog_roundtrip(qtbot, tmp_path):
         "out_dir": tmp_path,
         "fmt": "wav",
         "batch_size": 9,
+        "use_schema": False,
         "max_downloads": 3,
         "auto_write": False,
         "ytmusic_direct": False,
@@ -80,6 +82,7 @@ def test_settings_dialog_defaults(qtbot):
     assert v["out_dir"] == core.FILES_DIR
     assert v["fmt"] == "mp3"
     assert v["batch_size"] == core.BATCH_SIZE
+    assert v["use_schema"] is True  # 既定 ON（構造化出力を付ける）
     assert v["max_downloads"] == core.MAX_DOWNLOADS  # 既定 2（DL と変換を重ねる）
     assert v["auto_write"] is True
     assert v["ytmusic_direct"] is True  # 既定 ON（YouTube Music は推定しない）
@@ -170,6 +173,26 @@ def test_apply_settings_updates_window(main_window, tmp_path):
     assert win._normalize is False
     assert win._loudness == -11.0
     assert win._trim_silence is True
+
+
+def test_apply_settings_persists_use_schema(qtbot):
+    """構造化出力の設定が反映され、QSettings へ保存される（既定 ON、キー無しは既定）。"""
+    from gui.main_window import MainWindow
+
+    win = MainWindow(restore_settings=False)
+    qtbot.addWidget(win)
+    saved = {}
+    win._settings = type("S", (), {"setValue": lambda self, k, v: saved.__setitem__(k, v)})()
+    base = {"out_dir": Path(core.FILES_DIR), "fmt": "mp3", "batch_size": 5, "auto_write": True}
+
+    assert win._use_schema is True  # 既定 ON
+    win.apply_settings({**base, "use_schema": False})
+    assert win._use_schema is False
+    assert saved["options/use_schema"] is False
+    # キーが無い呼び出し（旧コード・テスト）は core 既定へ戻す
+    win.apply_settings(base)
+    assert win._use_schema is core.USE_SCHEMA
+    win.close()
 
 
 def test_apply_settings_default_dir_becomes_none(main_window):

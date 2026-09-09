@@ -59,8 +59,8 @@ def fake_infer_factory(monkeypatch, *, raises=None):
     """guessed_title/valid を埋める infer_titles のフェイク。"""
     calls = []
 
-    def fake(tracks, client=None, batch_size=5, force=False):
-        calls.append({"tracks": list(tracks), "force": force})
+    def fake(tracks, client=None, batch_size=5, force=False, use_schema=True):
+        calls.append({"tracks": list(tracks), "force": force, "use_schema": use_schema})
         targets = [t for t in tracks if force or not t.manual]
         if raises is not None:
             for t in targets:
@@ -399,8 +399,9 @@ def test_worker_passes_download_and_infer_options(qtbot, monkeypatch, tmp_path):
         captured["ytmusic_direct"] = ytmusic_direct
         return [Track(stem="a", filepath="a.mp3")]
 
-    def fake_infer(tracks, client=None, batch_size=5, force=False):
+    def fake_infer(tracks, client=None, batch_size=5, force=False, use_schema=True):
         captured["batch_size"] = batch_size
+        captured["use_schema"] = use_schema
         for t in tracks:
             t.guessed_title = "x"
             t.valid = True
@@ -424,11 +425,13 @@ def test_worker_passes_download_and_infer_options(qtbot, monkeypatch, tmp_path):
         best_quality=True,
         audio_bitrate=core.BITRATE_SOURCE,
         ytmusic_direct=False,
+        use_schema=False,
     )
     run_worker(qtbot, worker)
     assert captured == {
         "out_dir": tmp_path,
         "batch_size": 7,
+        "use_schema": False,
         "expand_playlist": True,
         "normalize": False,
         "loudness": -10.0,
@@ -819,7 +822,7 @@ def test_infer_starts_before_all_downloads_finish(qtbot, monkeypatch):
         events.append(f"dl:{url}")
         return [Track(stem=url, filepath=f"{url}.mp3")]
 
-    def fake_infer(tracks, client=None, batch_size=5, force=False):
+    def fake_infer(tracks, client=None, batch_size=5, force=False, use_schema=True):
         events.append("infer")
         infer_started.set()
         for t in tracks:
@@ -882,7 +885,7 @@ def test_infer_failure_stops_later_batches_but_finishes_downloads(qtbot, monkeyp
 
     calls = []
 
-    def fake_infer(tracks, client=None, batch_size=5, force=False):
+    def fake_infer(tracks, client=None, batch_size=5, force=False, use_schema=True):
         calls.append(list(tracks))
         for t in tracks:
             t.status = Status.ERROR
