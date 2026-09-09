@@ -153,10 +153,13 @@ class TrackTableModel(QAbstractTableModel):
         if col == COL_TITLE:
             # 編集時は素の値、表示時は手動行にプレフィックスを付ける。
             # エラー行はホバー（ツールチップ）なしで理由が分かるよう、
-            # 空いているこの列へエラー内容をそのまま表示する
+            # 空いているこの列へエラー内容をそのまま表示する。曲名が空の行も
+            # 同様に扱う — 空欄のままだと「推定を飛ばした」のか「推定できな
+            # かった」のか区別が付かない（core.EMPTY_TITLE_ERROR、および
+            # write_tags のスキップ理由がここに出る）
             if edit:
                 return track.guessed_title
-            if track.status is Status.ERROR and track.error:
+            if track.error and (track.status is Status.ERROR or not track.guessed_title):
                 return track.error
             if track.manual and track.guessed_title:
                 return _MANUAL_PREFIX + track.guessed_title

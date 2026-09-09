@@ -80,6 +80,22 @@ def test_error_row_shows_error_in_title_column():
     assert model.data(_idx(model, 0, COL_TITLE), Qt.ItemDataRole.EditRole) == ""
 
 
+def test_empty_title_row_shows_reason_in_title_column():
+    """曲名が空で理由がある行は、ERROR でなくても理由を表示する。
+
+    推定できなかった行（core.EMPTY_TITLE_ERROR）や書き込みスキップ行が
+    空欄のままだと「推定を飛ばした」のと区別が付かない。
+    """
+    t = Track(stem="x", status=Status.PENDING, valid=False, error="推定できませんでした。")
+    model = TrackTableModel([t])
+    role = Qt.ItemDataRole.DisplayRole
+    assert model.data(_idx(model, 0, COL_TITLE), role) == "推定できませんでした。"
+    assert model.data(_idx(model, 0, COL_TITLE), Qt.ItemDataRole.EditRole) == ""
+    # 曲名が入っている行は従来どおりタイトルを出す（理由で潰さない）
+    t.guessed_title = "曲名"
+    assert model.data(_idx(model, 0, COL_TITLE), role) == "曲名"
+
+
 def test_reset_error_returns_to_queue_or_pending():
     """reset_error: タイトル無し→QUEUED、有り→PENDING、ERROR 以外は不変。"""
     no_title = Track(stem="a", status=Status.ERROR, error="x")
