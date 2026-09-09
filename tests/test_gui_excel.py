@@ -7,8 +7,7 @@ Qt はオフスクリーン（conftest.py で QT_QPA_PLATFORM=offscreen）。
 """
 from pathlib import Path
 
-import pytest
-from PySide6.QtCore import QCoreApplication, QItemSelectionModel, Qt
+from PySide6.QtCore import QItemSelectionModel, Qt
 
 import core
 from core import Status, Track
@@ -25,28 +24,6 @@ from gui.model import (
 
 def _make_model(tracks):
     return TrackTableModel(list(tracks))
-
-
-@pytest.fixture
-def main_window(qtbot):
-    """MainWindow を生成し、テスト後に確実に破棄するフィクスチャ。
-
-    複数テストで MainWindow を作ると、qtbot の遅延破棄だけでは C++ 側の
-    ウィジェットが残り、後続テストの pytest-qt のイベント処理で破棄途中の
-    オブジェクトに触れてアクセス違反することがある。ここで close →
-    deleteLater → イベント処理まで行い、境界で完全に解放する。
-    QSettings は汚さないよう restore_settings=False で作る。
-    """
-    from gui.main_window import MainWindow
-
-    win = MainWindow(restore_settings=False)
-    qtbot.addWidget(win)
-    yield win
-    win.close()
-    win.deleteLater()
-    app = QCoreApplication.instance()
-    if app is not None:
-        app.processEvents()
 
 
 # ---------------------------------------------------------------------------

@@ -381,6 +381,33 @@ class TrackTableModel(QAbstractTableModel):
         t.error = ""
         self._emit_row(row)
 
+    # -- 検索（行の絞り込み）------------------------------------------------
+
+    def row_text(self, row: int) -> str:
+        """行の全列の表示文字列を連結して返す（検索対象の文字列）。
+
+        列ごとに検索対象を選ばず表示中のテキストをそのまま使う。見えている
+        文字列で引っ掛かるのが利用者の期待に一番近く、状態（「エラー」等）や
+        エラー文言・形式も同じ仕組みで検索できるため。
+        """
+        if not (0 <= row < len(self._tracks)):
+            return ""
+        track = self._tracks[row]
+        return " ".join(
+            str(self._display(row, track, col) or "") for col in range(self.columnCount())
+        )
+
+    def matches(self, row: int, query: str) -> bool:
+        """行が検索語に一致するか。空の検索語はすべて一致（＝絞り込み無し）。
+
+        大文字小文字は無視する（casefold）。かなカナや全角半角の正規化は
+        しない（過剰な一致より、打った文字どおりに絞れるほうを採る）。
+        """
+        needle = query.strip().casefold()
+        if not needle:
+            return True
+        return needle in self.row_text(row).casefold()
+
     def tracks(self) -> list[Track]:
         """現在の Track リストのスナップショット（浅いコピー）。"""
         return list(self._tracks)

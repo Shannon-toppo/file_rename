@@ -114,7 +114,8 @@ class SettingsDialog(QDialog):
         self._expand_check.setChecked(expand_playlist)
         self._expand_check.setToolTip(
             "OFF: watch?v=...&list=... はその動画 1 本のみダウンロード（既定）\n"
-            "ON: 含まれる再生リストの全動画を展開してダウンロード"
+            "ON: 含まれる再生リストの全動画を展開してダウンロード\n"
+            "メイン画面の [再生リストを無視] チェックはこの設定の裏返し（連動する）"
         )
         form.addRow("再生リスト", self._expand_check)
 
