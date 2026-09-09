@@ -90,6 +90,9 @@ class PipelineWorker(QRunnable):
         normalize: True（既定）なら DL 時に音量ノーマライズ(loudnorm)を掛ける。
         loudness: ノーマライズの基準値 LUFS（loudnorm の I）。
         trim_silence: True なら DL 時に末尾の無音区間を削除する（試験的）。
+        best_quality: True なら取得するフォーマットを音質優先で選ぶ。
+        audio_bitrate: 再エンコード時のビットレート（None = ffmpeg 既定、
+            core.BITRATE_SOURCE = 取得元と同じ、整数 = kbps 固定）。
         ytmusic_direct: True（既定）なら YouTube Music の URL はタイトル推定を
             行わず、メタデータの曲名をそのまま使う（core.use_metadata_title）。
     """
@@ -111,6 +114,8 @@ class PipelineWorker(QRunnable):
         normalize: bool = True,
         loudness: float = core.NORMALIZE_TARGET_I,
         trim_silence: bool = False,
+        best_quality: bool = False,
+        audio_bitrate: int | str | None = None,
         ytmusic_direct: bool = True,
     ):
         super().__init__()
@@ -132,6 +137,8 @@ class PipelineWorker(QRunnable):
         self._normalize = normalize
         self._loudness = loudness
         self._trim_silence = trim_silence
+        self._best_quality = best_quality
+        self._audio_bitrate = audio_bitrate
         self._ytmusic_direct = ytmusic_direct
 
     # -- QRunnable のエントリポイント ---------------------------------------
@@ -307,6 +314,8 @@ class PipelineWorker(QRunnable):
                 normalize=self._normalize,
                 loudness=self._loudness,
                 trim_silence=self._trim_silence,
+                best_quality=self._best_quality,
+                audio_bitrate=self._audio_bitrate,
                 ytmusic_direct=self._ytmusic_direct,
                 # yt-dlp の出力をログパネルへ流す（GUI 経由の DL は常に
                 # logging 経由）。ハンドラはワーカースレッドから呼ばれるが
