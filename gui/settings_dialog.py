@@ -10,7 +10,8 @@ core.check_connection（timeout 3 秒、UI ブロック許容）で疎通を確�
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QThreadPool
+from PySide6.QtCore import Qt, QThreadPool
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -19,14 +20,17 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
+    QWidget,
 )
 
 import core
@@ -60,6 +64,8 @@ class SettingsDialog(QDialog):
         normalize: bool = True,
         loudness: float = core.NORMALIZE_TARGET_I,
         trim_silence: bool = False,
+        best_quality: bool = False,
+        audio_bitrate: int | str | None = None,
         theme: str = "system",
         log_level: str = "WARNING",
         llm_overrides: dict | None = None,
@@ -71,8 +77,13 @@ class SettingsDialog(QDialog):
         self.setMinimumWidth(560)
 
         # 項目が多いので QGroupBox で「ダウンロード」「タイトル推定 (LLM)」
-        # 「表示」の 3 グループに分ける（ウィジェット名・values() は従来のまま）
-        root = QVBoxLayout(self)
+        # 「表示」の 3 グループに分ける（ウィジェット名・values() は従来のまま）。
+        # 全部を直接並べると縦に長くなり、画面の低いノート PC では OK /
+        # キャンセルが画面外へ出て押せなくなるため、グループ群はスクロール領域
+        # に入れ、ボタン行だけを常に下端へ固定する。
+        content = QWidget()
+        root = QVBoxLayout(content)
+        root.setContentsMargins(0, 0, 0, 0)
         dl_group = QGroupBox("ダウンロード")
         form = QFormLayout(dl_group)
         # mac スタイルの既定はフィールドを sizeHint 幅のまま中央寄せするため、
@@ -93,7 +104,44 @@ class SettingsDialog(QDialog):
         self._fmt_combo.addItems(core.SUPPORTED_FORMATS)
         if fmt in core.SUPPORTED_FORMATS:
             self._fmt_combo.setCurrentText(fmt)
+        self._fmt_combo.setToolTip(
+            "opus は YouTube が配信している形式そのもの。\n"
+            "音量ノーマライズを OFF にすると再エンコードなし（無劣化）で保存できる\n"
+            "（opus 音声を持たない動画では通常どおり変換する）。"
+        )
         form.addRow("既定の音声形式", self._fmt_combo)
+
+        # 取得するフォーマットの選び方（既定は yt-dlp の bestaudio 任せ）
+        self._best_quality_check = QCheckBox("音質を優先してフォーマットを選ぶ")
+        self._best_quality_check.setChecked(best_quality)
+        self._best_quality_check.setToolTip(
+            "ON: コーデックの質 → ビットレート → サンプリングレートの順で\n"
+            "取得するフォーマットを選び直す（可逆音源のあるサイトで効く）\n"
+            "OFF: yt-dlp の bestaudio 任せ（既定）\n"
+            "YouTube はどちらでも opus 約 130kbps になることが多い。"
+        )
+        form.addRow("取得品質", self._best_quality_check)
+
+        # 変換（再エンコード）後のビットレート
+        self._bitrate_combo = QComboBox()
+        self._bitrate_combo.addItem("ffmpeg の既定（ステレオ 128kbps 相当）", "")
+        self._bitrate_combo.addItem("取得元と同じ", core.BITRATE_SOURCE)
+        for kbps in core.BITRATE_CHOICES:
+            self._bitrate_combo.addItem(f"{kbps} kbps 固定", str(kbps))
+        current = "" if audio_bitrate is None else str(audio_bitrate)
+        index = self._bitrate_combo.findData(current)
+        if index < 0:  # 設定ファイルに一覧外の値が入っていた場合
+            self._bitrate_combo.addItem(f"{current} kbps 固定", current)
+            index = self._bitrate_combo.count() - 1
+        self._bitrate_combo.setCurrentIndex(index)
+        self._bitrate_combo.setToolTip(
+            "ffmpeg で再エンコードするときのビットレート。\n"
+            "既定のままだと ffmpeg の既定値（ステレオ 128kbps 相当）になり、\n"
+            "取得元が約 130kbps でもわずかに落として再圧縮する。\n"
+            "「取得元と同じ」は動画ごとの実測値をそのまま目標にする。\n"
+            "wav は非圧縮なのでこの設定は効かない。"
+        )
+        form.addRow("変換ビットレート", self._bitrate_combo)
 
         # 同時ダウンロード数（URL 行を何本まで並列に落とすか）
         self._max_dl_spin = QSpinBox()
@@ -265,12 +313,39 @@ class SettingsDialog(QDialog):
         view_form.addRow("ログレベル", self._log_level_combo)
         root.addWidget(view_group)
 
-        buttons = QDialogButtonBox(
+        # 中身が短いときにグループが間延びしないよう、余白は下に寄せる
+        root.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)  # 幅は追従、縦だけスクロール
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+
+        self._buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+
+        outer = QVBoxLayout(self)
+        outer.addWidget(scroll, stretch=1)
+        outer.addWidget(self._buttons)
+        # 縦に縮められるようにする（スクロール領域の最小高さは中身に引きずられる）
+        scroll.setMinimumHeight(200)
+        self.setSizeGripEnabled(True)
+        self._resize_to_screen(content)
+
+    def _resize_to_screen(self, content: QWidget) -> None:
+        """中身が入りきる高さで開く。ただし画面からはみ出さない大きさに抑える。"""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        available = screen.availableGeometry().height() if screen is not None else 800
+        # 中身 + ボタン行 + 余白。画面の 85% を超えたらスクロールに任せる
+        wanted = content.sizeHint().height() + self._buttons.sizeHint().height() + 48
+        self.resize(
+            max(self.minimumWidth(), self.sizeHint().width()),
+            max(360, min(wanted, int(available * 0.85))),
+        )
 
     # -- yt-dlp -------------------------------------------------------------
 
@@ -394,6 +469,8 @@ class SettingsDialog(QDialog):
             "auto_write": self._auto_check.isChecked(),
             "ytmusic_direct": self._ytmusic_check.isChecked(),
             "expand_playlist": self._expand_check.isChecked(),
+            "best_quality": self._best_quality_check.isChecked(),
+            "audio_bitrate": core.parse_bitrate(self._bitrate_combo.currentData()),
             "normalize": self._normalize_check.isChecked(),
             "loudness": self._loudness_spin.value(),
             "trim_silence": self._trim_check.isChecked(),

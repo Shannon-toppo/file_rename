@@ -26,6 +26,7 @@ from mutagen.id3 import ID3
 from mutagen.id3._frames import TALB, TIT2, TPE1
 from mutagen.id3._util import ID3NoHeaderError
 from mutagen.mp4 import MP4
+from mutagen.oggopus import OggOpus
 from mutagen.wave import WAVE
 from mv2title import Config, LLMClient, TitleInput, extract_titles
 from mv2title.connect import DEFAULT_MODEL  # noqa: F401 - MODEL 未設定時の実効値（GUI の表示用に re-export）
@@ -136,8 +137,8 @@ if _ENV_FILE is not None:
     load_dotenv(_ENV_FILE)
 
 FILES_DIR = app_dir() / "files"
-SUPPORTED_EXTS = (".mp3", ".wav", ".m4a")
-SUPPORTED_FORMATS = ("mp3", "wav", "m4a")
+SUPPORTED_EXTS = (".mp3", ".wav", ".m4a", ".opus")
+SUPPORTED_FORMATS = ("mp3", "wav", "m4a", "opus")
 BATCH_SIZE = 5
 # URL 行を同時に何本ダウンロードするか（GUI の設定で変更可）。yt-dlp は
 # 1 回の呼び出しの中では「受信 → ffmpeg 変換 → 次」を直列に回すので、行を
@@ -173,6 +174,102 @@ TRIM_SILENCE_FILTER = (
 def loudnorm_filter(target_i: float = NORMALIZE_TARGET_I) -> str:
     """基準値 target_i (LUFS) を使った loudnorm の ffmpeg フィルタ文字列を作る。"""
     return f"loudnorm=I={target_i:g}:TP={_NORMALIZE_TP:g}:LRA={_NORMALIZE_LRA:g}"
+
+
+# 変換（再エンコード）時のビットレート指定。download_tracks(audio_bitrate=...)、
+# CLI の --bitrate、設定ダイアログの「変換ビットレート」で使う。
+# None = 指定なし。yt-dlp は preferredquality を渡さないと ffmpeg の既定
+# （音声は 64kbps/ch = ステレオ 128kbps）に任せるため、YouTube の opus 約
+# 129kbps を 128kbps へ落として再圧縮することになる。
+# BITRATE_SOURCE = 取得した音源と同じ値（動画ごとに変わる。source_bitrate_kbps
+# / _source_bitrate_pp_class 参照）。整数 = その kbps 固定。
+BITRATE_SOURCE = "source"
+BITRATE_CHOICES = (128, 192, 256, 320)  # 設定ダイアログに並べる固定値 (kbps)
+_BITRATE_MIN = 8
+_BITRATE_MAX = 512
+# best_quality=True のときに yt-dlp のフォーマット並べ替えへ差し込む優先順。
+# 既定の並びは配信側が申告する quality を先に見るので、音声コーデックの質 →
+# ビットレート → サンプリングレートの順に選び直させる。acodec を先頭に置くのは
+# 意図的で、実測では YouTube に opus 128.9kbps と aac 129.5kbps が並ぶため、
+# ビットレートだけで選ぶと数字がわずかに大きい aac（音質は劣る）を掴む。
+BEST_AUDIO_SORT = ("acodec", "abr", "asr")
+
+# 取得する音声の既定指定。yt-dlp は「取得したコーデック == 出力形式」のときだけ
+# -acodec copy（= 再エンコードなし）を選ぶ。
+DEFAULT_FORMAT_SELECTOR = "bestaudio/best"
+# 出力形式ごとの「そのまま保存できる」音声コーデック。YouTube の acodec は
+# opus が "opus"、AAC が "mp4a.40.2" のような文字列で返る。
+NATIVE_CODECS = {"opus": ("opus",), "m4a": ("mp4a", "aac")}
+# 上のコーデックがあるならそれを選ぶ format 指定（無ければ bestaudio に落ちる）。
+# フィルタ（ノーマライズ / 無音削除）を掛けるときは再エンコードが避けられない
+# ので使わない ＝ その場合は素直に一番音質の良い音源から変換する。
+_COPY_FORMAT_SELECTOR = {
+    "opus": "bestaudio[acodec=opus]/bestaudio/best",
+    "m4a": "bestaudio[acodec^=mp4a]/bestaudio/best",
+}
+# -ar に渡してよいサンプリングレート（対応外を渡すと ffmpeg が変換に失敗する）。
+# 記載の無いエンコーダ（aac / PCM）は制限なしとみなす。libopus は必ず 48kHz へ
+# 変換するので指定しない — 44.1kHz の AAC 音源から opus を作るときに
+# -ar 44100 を付けると "Conversion failed" になる（実測）。
+_ENCODER_SAMPLE_RATES: dict[str, tuple[int, ...]] = {
+    "libopus": (),
+    "libmp3lame": (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000),
+}
+
+
+def is_native_codec(fmt: str, acodec: str | None) -> bool:
+    """取得した音声 acodec が、出力形式 fmt のまま（無変換で）保存できるか。"""
+    prefixes = NATIVE_CODECS.get(fmt)
+    if not prefixes or not acodec or acodec == "none":
+        return False
+    return acodec.lower().startswith(prefixes)
+
+
+def parse_bitrate(value: object) -> int | str | None:
+    """ビットレート指定（CLI 引数 / 設定値）を正規化する。
+
+    受け付ける値は None・""・"default"（= 指定なし）、"source"（= 取得元と
+    同じ）、"192" / "192k" / 192（= その kbps に固定）。
+
+    Raises:
+        ValueError: 解釈できない値、または範囲外の kbps。
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("", "default", "auto"):
+            return None
+        if text == BITRATE_SOURCE:
+            return BITRATE_SOURCE
+        text = text.removesuffix("bps").removesuffix("k")
+        try:
+            value = int(text)
+        except ValueError:
+            raise ValueError(f"ビットレートの指定が不正です: {value}") from None
+    kbps = int(value)
+    if not _BITRATE_MIN <= kbps <= _BITRATE_MAX:
+        raise ValueError(
+            f"ビットレートは {_BITRATE_MIN}〜{_BITRATE_MAX} kbps で指定してください: {kbps}"
+        )
+    return kbps
+
+
+def source_bitrate_kbps(info: dict) -> int | None:
+    """yt-dlp の情報 dict から、取得した音源のビットレート (kbps) を読む。
+
+    abr（音声だけのビットレート）が無ければ tbr（全体）で代用する。
+    yt-dlp の _quality_args は 10 以下を VBR の品質スケールとして解釈するため、
+    それ以下や欠損は None を返して ffmpeg の既定に任せる。
+    """
+    for key in ("abr", "tbr"):
+        try:
+            kbps = round(float(info.get(key)))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if kbps > 10:
+            return kbps
+    return None
 
 
 class CancelledError(Exception):
@@ -238,6 +335,8 @@ class Track:
 # （write_title が書き込む項目と対になる）。
 _ID3_TAG_KEYS = {"title": "TIT2", "artist": "TPE1", "album": "TALB"}
 _MP4_TAG_KEYS = {"title": "\xa9nam", "artist": "\xa9ART", "album": "\xa9alb"}
+# Ogg Opus は Vorbis コメント（キー名そのまま。大文字小文字は区別されない）
+_OGG_TAG_KEYS = {"title": "title", "artist": "artist", "album": "album"}
 # read_tags が返すキー（呼び出し元の参照用）
 TAG_FIELDS = ("title", "artist", "album")
 
@@ -274,6 +373,9 @@ def read_tags(filepath: Path) -> dict[str, str]:
         elif ext == ".m4a":
             tags = MP4(str(filepath)).tags
             keys = _MP4_TAG_KEYS
+        elif ext == ".opus":
+            tags = OggOpus(str(filepath)).tags
+            keys = _OGG_TAG_KEYS
     except Exception as e:  # 壊れたファイル等。読めないだけなので握って空を返す
         _LOG.debug("タグを読めませんでした: %s (%s)", filepath, e)
         tags = None
@@ -431,6 +533,10 @@ _YTDLP_LOCK = threading.Lock()
 # DownloadCancelled の両方を継承する）。ensure_ytdlp() でロード後に作る。
 _YDL_CANCELLED: type[BaseException] | None = None
 
+# 音声抽出の postprocessor クラス（yt-dlp の FFmpegExtractAudioPP を継承する。
+# _extract_audio_pp_class() で初回に作る）。
+_EXTRACT_AUDIO_PP: type | None = None
+
 
 def _cancelled(message: str) -> BaseException:
     """yt-dlp のフックから投げるキャンセル例外を作る。
@@ -486,6 +592,95 @@ def _load_cancel_exception() -> None:
     except ImportError:
         return
     _YDL_CANCELLED = type("_YdlCancelled", (CancelledError, DownloadCancelled), {})
+
+
+def _extract_audio_pp_class() -> type | None:
+    """音声抽出 postprocessor（FFmpegExtractAudioPP の派生）を返す。
+
+    標準の PP に対して 2 点を足す。どちらも「変換する動画ごとの実測値」が
+    要るため、生成時に 1 つしか値を持てない yt-dlp のオプションでは書けない
+    （再生リストではエントリごとに値が変わる）。run() へ渡ってくる情報 dict を
+    見てから ffmpeg 引数を組む。
+
+    - サンプリングレートを取得元に合わせる（-ar）。loudnorm は内部で 192kHz へ
+      アップサンプリングし、その値が出力の交渉結果にそのまま出る（実測: 48kHz の
+      opus から m4a なら 96kHz、wav なら 192kHz。mp3 だけは規格上 48kHz が上限
+      なので露見しない）。容量が倍以上になるだけで音質は上がらないので戻す。
+    - match_source_bitrate=True なら、ビットレートを取得元に合わせる
+      （source_bitrate_kbps。10 より大きい値は yt-dlp 側で "-b:a <値>k" になる。
+      _quality_args 参照）。
+
+    yt-dlp を import できない場合（テストの代役など）は None を返し、呼び出し元は
+    従来どおり opts の postprocessors 指定（= 標準の PP）に落ちる。
+    """
+    global _EXTRACT_AUDIO_PP
+    if _EXTRACT_AUDIO_PP is not None:
+        return _EXTRACT_AUDIO_PP
+    try:
+        from yt_dlp.postprocessor.ffmpeg import FFmpegExtractAudioPP
+    except ImportError:
+        return None
+
+    class ExtractAudioPP(FFmpegExtractAudioPP):  # type: ignore[misc,valid-type]
+        """変換直前に、その音源の実測値から ffmpeg 引数を決める抽出 PP。
+
+        クラス名から取られる pp_key は "ExtractAudio"（標準の PP と同じ）なので、
+        postprocessor_args を {"extractaudio": [...]} で渡せばこの PP だけに
+        届く（download_tracks 参照）。
+        """
+
+        def __init__(
+            self,
+            *args,
+            match_source_bitrate: bool = False,
+            force_encode: bool = False,
+            **kwargs,
+        ):
+            super().__init__(*args, **kwargs)
+            self._match_source_bitrate = match_source_bitrate
+            self._force_encode = force_encode
+            self._source_asr: int | None = None
+
+        def get_audio_codec(self, path):
+            codec = super().get_audio_codec(path)
+            if self._force_encode and codec is not None:
+                # 親の run は「取得したコーデック == 出力形式」なら -acodec copy を
+                # 選ぶが、copy と -af（フィルタ）は同居できず ffmpeg が失敗する。
+                # 一致しない値を返して必ず再エンコード側の分岐へ行かせる
+                # （filecodec は分岐の比較にしか使われない）。
+                return f"{codec}+filtered"
+            return codec
+
+        def run(self, information):
+            # yt-dlp のメタクラスは run を postprocessor_hooks 送出でくるむため、
+            # ここと親の run で started/finished が 2 回ずつ流れる。購読側
+            # （GUI の on_stage → Status.CONVERTING）は同じ状態を入れ直すだけ
+            # なので実害はない。
+            try:
+                self._source_asr = int(information["asr"])
+            except (KeyError, TypeError, ValueError):
+                self._source_asr = None
+            if self._match_source_bitrate:
+                kbps = source_bitrate_kbps(information)
+                if kbps is not None:
+                    self._preferredquality = kbps
+            return super().run(information)
+
+        def run_ffmpeg(self, path, out_path, codec, more_opts):
+            # フィルタ側の内部レートが出力へ漏れないよう、取得元へ固定する
+            # （codec="copy" は再エンコードしないので触らない。エンコーダが
+            # 対応しないレートは指定しない — _ENCODER_SAMPLE_RATES 参照）
+            rates = _ENCODER_SAMPLE_RATES.get(codec)
+            if (
+                self._source_asr
+                and codec != "copy"
+                and (rates is None or self._source_asr in rates)
+            ):
+                more_opts = [*more_opts, "-ar", str(self._source_asr)]
+            return super().run_ffmpeg(path, out_path, codec, more_opts)
+
+    _EXTRACT_AUDIO_PP = ExtractAudioPP
+    return _EXTRACT_AUDIO_PP
 
 
 def _fetch_localized_title(
@@ -755,6 +950,8 @@ def download_tracks(
     normalize: bool = True,
     loudness: float = NORMALIZE_TARGET_I,
     trim_silence: bool = False,
+    best_quality: bool = False,
+    audio_bitrate: int | str | None = None,
     ytmusic_direct: bool = True,
     logger: logging.Logger | None = None,
 ) -> list[Track]:
@@ -769,6 +966,20 @@ def download_tracks(
     （基準値は loudness で変更可。loudnorm_filter 参照）。trim_silence=True だと
     末尾の無音区間を削除する（試験的。TRIM_SILENCE_FILTER 参照）。どちらも
     ffmpeg の再エンコード時に適用される。
+    best_quality=True だと取得するフォーマットを音質優先で選び直す
+    （BEST_AUDIO_SORT 参照。既定は yt-dlp の bestaudio 任せ）。
+    audio_bitrate は再エンコード時のビットレート: None（既定）なら ffmpeg の
+    既定値（ステレオ 128kbps 相当）、"source" なら取得した音源と同じ値、
+    整数なら その kbps 固定（parse_bitrate 参照）。wav は非圧縮なので無視し、
+    opus は指定なしのとき "source" 扱いにする（libopus の既定 96kbps は音源より
+    低いため）。
+    サンプリングレートは指定によらず取得元と同じ値に固定する
+    （_extract_audio_pp_class 参照）。
+    normalize / trim_silence をどちらも切っている場合は、出力形式と同じ
+    コーデックの音源（opus 出力なら opus、m4a なら AAC）を優先して取得し、
+    yt-dlp に再エンコードなしで保存させる（_COPY_FORMAT_SELECTOR）。その音源が
+    無い動画では通常どおり最良の音源から変換する（ログに 1 行残す）。
+    フィルタを掛ける場合は再エンコードが必須なので、この優先は行わない。
     ytmusic_direct=True（既定）だと、YouTube Music の URL はタイトル推定を
     行わず、YouTube Music 上の曲名とアーティスト名をそのまま採用する
     （_fetch_ytmusic_song / use_metadata_title）。
@@ -789,6 +1000,15 @@ def download_tracks(
     """
     if fmt not in SUPPORTED_FORMATS:
         raise ValueError(f"unsupported format: {fmt}")
+    bitrate = parse_bitrate(audio_bitrate)
+    if fmt == "wav":
+        bitrate = None  # wav は非圧縮 (PCM) なのでビットレート指定は効かない
+    elif fmt == "opus" and bitrate is None:
+        # libopus の既定は約 96kbps で、YouTube の約 129kbps の音源を再エンコード
+        # すると黙って音質が落ちる（実測 127kbps → 94kbps）。指定が無ければ
+        # 取得元に合わせる（mp3 / AAC は既定 128kbps で音源とほぼ同じなので
+        # そのまま ffmpeg 任せにする）。
+        bitrate = BITRATE_SOURCE
     ensure_ytdlp()
     dest = out_dir if out_dir is not None else FILES_DIR
     dest.mkdir(parents=True, exist_ok=True)
@@ -830,8 +1050,27 @@ def download_tracks(
             raise _cancelled("ダウンロードがキャンセルされました。")
         return None
 
+    filters = []
+    if trim_silence:
+        # 無音を除いた本体でラウドネスを測れるよう、loudnorm より前段に置く
+        filters.append(TRIM_SILENCE_FILTER)
+    if normalize:
+        filters.append(loudnorm_filter(loudness))
+    # フィルタを掛けるなら再エンコードは避けられないので、素直に一番良い音源を
+    # 取る。掛けないなら出力形式と同じコーデックの音源を優先し、yt-dlp に
+    # -acodec copy（無変換）を選ばせる（opus 出力 + opus 音源など）。
+    selector = DEFAULT_FORMAT_SELECTOR
+    if not filters:
+        selector = _COPY_FORMAT_SELECTOR.get(fmt, DEFAULT_FORMAT_SELECTOR)
+    extract_audio: dict = {"key": "FFmpegExtractAudio", "preferredcodec": fmt}
+    if isinstance(bitrate, int):
+        # 10 より大きい値は yt-dlp 側で "-b:a <値>k" になる（_quality_args 参照）
+        extract_audio["preferredquality"] = str(bitrate)
+    # 音声抽出は自前の派生 PP で行う（動画ごとの実測値が要るため。
+    # _extract_audio_pp_class 参照）。ロードできない環境では opts 指定に落とす。
+    pp_class = _extract_audio_pp_class()
     opts = {
-        "format": "bestaudio/best",
+        "format": selector,
         "outtmpl": outtmpl,
         "noplaylist": not expand_playlist,
         "ignoreerrors": True,  # 一部の動画が失敗してもリスト全体を止めない
@@ -844,24 +1083,17 @@ def download_tracks(
         "extractor_args": {"youtube": {"lang": [METADATA_LANG]}},
         # 受信開始前にキャンセルを効かせる（cancel_filter 参照）
         "match_filter": cancel_filter,
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": fmt,
-            }
-        ],
+        "postprocessors": [] if pp_class is not None else [extract_audio],
     }
-    filters = []
-    if trim_silence:
-        # 無音を除いた本体でラウドネスを測れるよう、loudnorm より前段に置く
-        filters.append(TRIM_SILENCE_FILTER)
-    if normalize:
-        filters.append(loudnorm_filter(loudness))
+    if best_quality:
+        # 音質優先でフォーマットを選び直す（先頭に足した項目が最優先になる）
+        opts["format_sort"] = list(BEST_AUDIO_SORT)
     if filters:
-        # ffmpeg 音声フィルタとして FFmpegExtractAudio へ渡す。フラットな list は
-        # 全 ffmpeg 系ポストプロセッサに適用される（ここでは抽出のみ）。
-        # 二重掛けを避けるため、両方 OFF のときは付けない。
-        opts["postprocessor_args"] = ["-af", ",".join(filters)]
+        # ffmpeg 音声フィルタとして音声抽出の PP にだけ渡す。フラットな list に
+        # すると **全 ffmpeg 系ポストプロセッサ** に適用され、コンテナを直す
+        # FixupM4a（-c copy）とぶつかって "Error opening output files" で
+        # 実行ごと落ちる（AAC 音源しか無い動画で実測）。キーは PP 名。
+        opts["postprocessor_args"] = {"extractaudio": ["-af", ",".join(filters)]}
     if logger is not None:
         # yt-dlp の出力を logging 経由へ切り替える（quiet=True で stdout を止め、
         # logger へ渡した Python ロガーに info/warning/error/debug を流す）
@@ -871,6 +1103,18 @@ def download_tracks(
     tracks: list[Track] = []
     ydl_errors: list[str] = []
     with YoutubeDL(opts) as ydl:
+        if pp_class is not None:
+            # downloader は add_post_processor が set_downloader で入れる
+            ydl.add_post_processor(
+                pp_class(
+                    preferredcodec=fmt,
+                    preferredquality=extract_audio.get("preferredquality"),
+                    match_source_bitrate=bitrate == BITRATE_SOURCE,
+                    # フィルタを掛ける行は copy ではなく必ず再エンコードさせる
+                    force_encode=bool(filters),
+                ),
+                when="post_process",
+            )
         # 失敗理由は握り潰されるので、CoreError に載せるため控えておく
         ydl_errors = _record_ydl_errors(ydl)
         try:
@@ -911,6 +1155,16 @@ def download_tracks(
             # 推定の入力(stem)には、可能なら watch 画面の日本語タイトルを使う。
             # yt-dlp のタイトル(= ファイル名)は player API 由来で翻訳されない
             # ため、翻訳付き動画では英語のままになる(_fetch_localized_title 参照)。
+            if not filters and not is_native_codec(fmt, entry.get("acodec")):
+                # 無変換で保存できる音源が無かった動画（例: opus を持たない）。
+                # 再エンコードになるので、ログにだけ残しておく
+                if fmt in NATIVE_CODECS:
+                    _LOG.info(
+                        "%s: %s 音声が無いため %s から変換します",
+                        entry.get("title") or entry.get("id") or url,
+                        fmt,
+                        entry.get("acodec") or "不明なコーデック",
+                    )
             video_id = entry.get("id")
             localized = _fetch_localized_title(video_id) if video_id else None
             track = Track(
@@ -1112,7 +1366,8 @@ def write_title(
     """ファイル形式に応じたタイトル（と任意で作者・アルバム名）タグを書き込む。
 
     タイトルは .mp3 / .wav が ID3 の TIT2 フレーム、.m4a が MP4 の \xa9nam
-    アトム。アーティストは TPE1 / \xa9ART、アルバム名は TALB / \xa9alb。
+    アトム、.opus が Vorbis コメントの TITLE。アーティストは TPE1 / \xa9ART /
+    ARTIST、アルバム名は TALB / \xa9alb / ALBUM。
     3 項目とも **空なら書き込まない**（ファイル側の既存値をそのまま残す）ので、
     title="" で呼べば作者・アルバム名だけを更新できる（write_tags 参照）。
     """
@@ -1152,6 +1407,16 @@ def write_title(
             audio.tags["\xa9ART"] = [artist]
         if album:
             audio.tags["\xa9alb"] = [album]
+        audio.save()
+    elif ext == ".opus":
+        audio = OggOpus(str(filepath))
+        # Ogg Opus のタグは Vorbis コメント。値は常にリストで持つ
+        if title:
+            audio["title"] = [title]
+        if artist:
+            audio["artist"] = [artist]
+        if album:
+            audio["album"] = [album]
         audio.save()
     else:
         raise ValueError(f"unsupported extension: {ext}")

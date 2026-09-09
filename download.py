@@ -5,16 +5,20 @@ yt-dlp で URL の動画から音声をダウンロードし、推測したタ�
 メタデータに書き込む CLI。
 
 使い方:
-    python download.py <URL> [--format mp3|wav|m4a]
-    python download.py -a urls.txt [--format mp3|wav|m4a]
+    python download.py <URL> [--format mp3|wav|m4a|opus]
+    python download.py -a urls.txt [--format mp3|wav|m4a|opus]
 
     --format を省略した場合は mp3 でダウンロードします。
+    --best-quality で取得する音源を音質優先で選び、--bitrate で変換後の
+    ビットレート（source = 取得元と同じ / 数値 = kbps 固定）を指定できます。
+    opus は YouTube が配信している形式そのものなので、--no-normalize と
+    併せると再エンコードなし（無劣化）で保存できます。
     -a / --batch-file にテキストファイルを指定すると、
     記入された URL を 1 行ずつ順に処理します
     （空行と # で始まる行は無視します）。
 
 注意:
-    mp3 / wav への変換には ffmpeg が PATH 上に必要です。
+    音声形式の変換（および opus のコンテナ変換）には ffmpeg が PATH 上に必要です。
     （見つからない場合は yt-dlp が変換時にエラーを出します）
 
 実処理（DL・推定・書き込み・スキップ方針）は core.py に共通化されている。
@@ -33,6 +37,8 @@ def process_url(
     normalize: bool = True,
     loudness: float = core.NORMALIZE_TARGET_I,
     trim_silence: bool = False,
+    best_quality: bool = False,
+    audio_bitrate: int | str | None = None,
     ytmusic_direct: bool = True,
 ) -> None:
     """1 件の URL をダウンロードしてメタデータを書き込む。"""
@@ -44,6 +50,8 @@ def process_url(
             normalize=normalize,
             loudness=loudness,
             trim_silence=trim_silence,
+            best_quality=best_quality,
+            audio_bitrate=audio_bitrate,
             ytmusic_direct=ytmusic_direct,
         )
     except Exception as e:
@@ -107,6 +115,22 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--best-quality",
+        action="store_true",
+        help=(
+            "取得するフォーマットを音質優先で選ぶ"
+            "（コーデックの質 → ビットレート → サンプリングレートの順）"
+        ),
+    )
+    parser.add_argument(
+        "--bitrate",
+        help=(
+            "変換後のビットレート。source = 取得元と同じ、数値 = その kbps に固定"
+            f"（例: {core.BITRATE_CHOICES[-1]}）。"
+            "既定は ffmpeg 任せでステレオ 128kbps 相当。wav では無視"
+        ),
+    )
+    parser.add_argument(
         "--trim-silence",
         action="store_true",
         help="末尾の無音区間を削除する（試験的。-50dB 以下を 1 秒残して削除）",
@@ -115,6 +139,12 @@ def main() -> None:
 
     if bool(args.url) == bool(args.batch_file):
         parser.error("URL または -a/--batch-file のどちらか一方を指定してください。")
+
+    try:
+        # DL 前に弾く（1 件目の変換まで走ってから怒られるのを避ける）
+        bitrate = core.parse_bitrate(args.bitrate)
+    except ValueError as e:
+        parser.error(str(e))
 
     if args.batch_file:
         try:
@@ -139,6 +169,8 @@ def main() -> None:
             normalize=not args.no_normalize,
             loudness=args.loudness,
             trim_silence=args.trim_silence,
+            best_quality=args.best_quality,
+            audio_bitrate=bitrate,
             ytmusic_direct=not args.no_ytmusic_direct,
         )
 

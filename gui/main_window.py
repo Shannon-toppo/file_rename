@@ -183,6 +183,10 @@ class MainWindow(QMainWindow):
         self._normalize: bool = True  # DL 時に音量ノーマライズを掛けるか（既定 ON）
         self._loudness: float = core.NORMALIZE_TARGET_I  # ノーマライズ基準値 (LUFS)
         self._trim_silence: bool = False  # 末尾の無音削除（試験的、既定 OFF）
+        self._best_quality: bool = False  # 取得フォーマットを音質優先で選ぶか
+        # 変換後のビットレート（None = ffmpeg 既定 / "source" = 取得元と同じ /
+        # 整数 = kbps 固定。core.parse_bitrate 参照）
+        self._audio_bitrate: int | str | None = None
         # YouTube Music の URL は推定を挟まずメタデータの曲名をそのまま使う
         self._ytmusic_direct: bool = True
         self._theme: str = "system"  # "system" / "light" / "dark"
@@ -290,7 +294,9 @@ class MainWindow(QMainWindow):
         self._fmt_combo.addItems(core.SUPPORTED_FORMATS)
         self._fmt_combo.setCurrentText("mp3")
         self._fmt_combo.setToolTip(
-            "ダウンロード時に変換する音声形式（既にあるローカルファイル行には影響しない）"
+            "ダウンロード時に変換する音声形式（既にあるローカルファイル行には影響しない）\n"
+            "opus は YouTube が配信している形式そのもの。音量ノーマライズを OFF に\n"
+            "すると再エンコードなし（無劣化）で保存できる。"
         )
         bar.addWidget(self._fmt_combo)
         self._auto_write = QCheckBox("自動書き込み")
@@ -937,6 +943,8 @@ class MainWindow(QMainWindow):
             normalize=self._normalize,
             loudness=self._loudness,
             trim_silence=self._trim_silence,
+            best_quality=self._best_quality,
+            audio_bitrate=self._audio_bitrate,
             ytmusic_direct=self._ytmusic_direct,
         )
         self._start(worker, "実行中...")
@@ -1061,6 +1069,8 @@ class MainWindow(QMainWindow):
             normalize=self._normalize,
             loudness=self._loudness,
             trim_silence=self._trim_silence,
+            best_quality=self._best_quality,
+            audio_bitrate=self._audio_bitrate,
             theme=self._theme,
             log_level=self._log_level,
             llm_overrides=dict(self._llm_overrides),
@@ -1093,6 +1103,8 @@ class MainWindow(QMainWindow):
         self._normalize = bool(values.get("normalize", True))
         self._loudness = float(values.get("loudness", core.NORMALIZE_TARGET_I))
         self._trim_silence = bool(values.get("trim_silence", False))
+        self._best_quality = bool(values.get("best_quality", False))
+        self._audio_bitrate = core.parse_bitrate(values.get("audio_bitrate"))
         new_theme = str(values.get("theme", "system"))
         if new_theme != self._theme:
             self._theme = new_theme
@@ -1118,6 +1130,12 @@ class MainWindow(QMainWindow):
             self._settings.setValue("options/normalize", self._normalize)
             self._settings.setValue("options/loudness", self._loudness)
             self._settings.setValue("options/trim_silence", self._trim_silence)
+            self._settings.setValue("options/best_quality", self._best_quality)
+            # None は空文字で保存する（QSettings に None を入れると型が揺れる）
+            self._settings.setValue(
+                "options/audio_bitrate",
+                "" if self._audio_bitrate is None else str(self._audio_bitrate),
+            )
             self._settings.setValue("options/theme", self._theme)
             self._settings.setValue("options/log_level", self._log_level)
             # 接続設定の上書き（API キーも QSettings に平文で入る。個人利用前提）
@@ -1562,6 +1580,15 @@ class MainWindow(QMainWindow):
         trim = s.value("options/trim_silence")
         if trim is not None:
             self._trim_silence = _as_bool(trim)
+        best_quality = s.value("options/best_quality")
+        if best_quality is not None:
+            self._best_quality = _as_bool(best_quality)
+        bitrate = s.value("options/audio_bitrate")
+        if bitrate is not None:
+            try:
+                self._audio_bitrate = core.parse_bitrate(bitrate)
+            except ValueError:
+                pass  # 壊れた値は既定（ffmpeg 任せ）のまま
         theme = s.value("options/theme")
         if theme in ("system", "light", "dark"):
             self._theme = theme

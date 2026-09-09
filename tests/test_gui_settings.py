@@ -4,7 +4,8 @@ import logging
 from pathlib import Path
 
 import pytest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtWidgets import QApplication, QScrollArea
 
 import core
 from gui.settings_dialog import SettingsDialog
@@ -46,6 +47,8 @@ def test_settings_dialog_roundtrip(qtbot, tmp_path):
         normalize=False,
         loudness=-16.5,
         trim_silence=True,
+        best_quality=True,
+        audio_bitrate=320,
         theme="dark",
         log_level="DEBUG",
         llm_overrides=llm,
@@ -63,6 +66,8 @@ def test_settings_dialog_roundtrip(qtbot, tmp_path):
         "normalize": False,
         "loudness": -16.5,
         "trim_silence": True,
+        "best_quality": True,
+        "audio_bitrate": 320,
         "theme": "dark",
         "log_level": "DEBUG",
     }
@@ -82,6 +87,8 @@ def test_settings_dialog_defaults(qtbot):
     assert v["normalize"] is True  # 既定で音量ノーマライズ ON
     assert v["loudness"] == core.NORMALIZE_TARGET_I  # 既定の基準値 -14 LUFS
     assert v["trim_silence"] is False  # 無音削除は試験的機能なので既定 OFF
+    assert v["best_quality"] is False  # 既定は yt-dlp の bestaudio 任せ
+    assert v["audio_bitrate"] is None  # 既定は ffmpeg 任せ（128kbps 相当）
     assert v["theme"] == "system"  # 既定は OS テーマに追従
     assert v["log_level"] == "WARNING"  # 既定は警告レベル
     # 接続設定の上書きは既定ですべて空（= .env の値を使う）
@@ -95,6 +102,37 @@ def test_settings_dialog_loudness_follows_normalize_toggle(qtbot):
     assert not dlg._loudness_spin.isEnabled()
     dlg._normalize_check.setChecked(True)
     assert dlg._loudness_spin.isEnabled()
+
+
+def test_settings_dialog_scrolls_and_keeps_buttons(qtbot):
+    """項目が縦に長くても OK / キャンセルが画面外へ出ない（スクロールで吸収）。"""
+    dlg = SettingsDialog()
+    qtbot.addWidget(dlg)
+    area = dlg.findChild(QScrollArea)
+    assert area is not None and area.widgetResizable()
+    # 画面の高さを超えない大きさで開く
+    screen = dlg.screen() or QGuiApplication.primaryScreen()
+    assert dlg.height() <= screen.availableGeometry().height()
+    # 低い画面向けに縮められる（従来は中身の高さがそのまま下限だった）
+    assert dlg.minimumSizeHint().height() <= 400
+    dlg.resize(600, 380)
+    dlg.show()
+    dlg.layout().activate()
+    buttons = dlg._buttons
+    assert buttons.y() + buttons.height() <= dlg.height()  # ボタンは常に窓の中
+
+
+def test_settings_dialog_bitrate_choices(qtbot):
+    """ビットレート欄は「既定 / 取得元と同じ / 固定 kbps」を data で返す。"""
+    dlg = SettingsDialog(audio_bitrate=core.BITRATE_SOURCE)
+    qtbot.addWidget(dlg)
+    assert dlg.values()["audio_bitrate"] == core.BITRATE_SOURCE
+    dlg._bitrate_combo.setCurrentIndex(0)
+    assert dlg.values()["audio_bitrate"] is None
+    # 一覧に無い値（CLI や手書き設定由来）も選択肢として復元される
+    other = SettingsDialog(audio_bitrate=112)
+    qtbot.addWidget(other)
+    assert other.values()["audio_bitrate"] == 112
 
 
 def test_settings_dialog_connection_test(qtbot, monkeypatch):

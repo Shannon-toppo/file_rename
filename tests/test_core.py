@@ -24,6 +24,18 @@ def make_mp3(tmp_path: Path, name: str) -> Path:
     return p
 
 
+# 実物の Ogg Opus（無音 0.2 秒 / 242 バイト）。mutagen は正しい Ogg ストリームで
+# ないとタグを書けないため、ダミーではなく本物を置いている
+OPUS_FIXTURE = Path(__file__).parent / "data" / "silence.opus"
+
+
+def make_opus(tmp_path: Path, name: str = "a.opus") -> Path:
+    """テスト用に Ogg Opus のコピーを作る（元のフィクスチャは汚さない）。"""
+    p = tmp_path / name
+    p.write_bytes(OPUS_FIXTURE.read_bytes())
+    return p
+
+
 def read_tit2(path: Path) -> str | None:
     try:
         frame = ID3(str(path)).get("TIT2")
@@ -309,10 +321,17 @@ class FakeYDL:
     error_feed: list[str] = []  # report_error へ流す文言（ignoreerrors 時の失敗）
     last_opts: dict | None = None  # 直近に渡された yt-dlp オプション（検査用）
     last_download: bool | None = None  # extract_info の download 引数（検査用）
+    last_pps: list | None = None  # add_post_processor で足された PP（検査用）
 
     def __init__(self, opts):
         self.opts = opts
         FakeYDL.last_opts = opts
+        FakeYDL.last_pps = []
+
+    def add_post_processor(self, pp, when="post_process"):
+        # 本物は set_downloader も呼ぶが、ここでは登録されたことだけ見る
+        assert FakeYDL.last_pps is not None
+        FakeYDL.last_pps.append((pp, when))
 
     def __enter__(self):
         return self
@@ -357,6 +376,7 @@ def fake_ydl(monkeypatch, tmp_path):
     FakeYDL.error_feed = []
     FakeYDL.last_opts = None
     FakeYDL.last_download = None
+    FakeYDL.last_pps = None
     return FakeYDL
 
 
@@ -633,7 +653,11 @@ def test_download_tracks_normalize_option(fake_ydl, tmp_path):
     """normalize=True（既定）で loudnorm フィルタが postprocessor_args に入る。"""
     fake_ydl.info = entry_for(tmp_path, "a")
     core.download_tracks("u", "mp3")  # 既定 ON
-    assert fake_ydl.last_opts["postprocessor_args"] == ["-af", core.loudnorm_filter()]
+    # キー付きで渡す（フラットな list だと FixupM4a など他の ffmpeg PP にも
+    # 適用され、-c copy とぶつかって実行ごと落ちる）
+    assert fake_ydl.last_opts["postprocessor_args"] == {
+        "extractaudio": ["-af", core.loudnorm_filter()]
+    }
     core.download_tracks("u", "mp3", normalize=False)
     assert "postprocessor_args" not in fake_ydl.last_opts  # OFF なら付けない
 
@@ -642,23 +666,251 @@ def test_download_tracks_loudness_option(fake_ydl, tmp_path):
     """loudness で loudnorm の基準値 (I) を変えられる（TP / LRA は固定）。"""
     fake_ydl.info = entry_for(tmp_path, "a")
     core.download_tracks("u", "mp3", loudness=-9.5)
-    assert fake_ydl.last_opts["postprocessor_args"] == [
-        "-af",
-        "loudnorm=I=-9.5:TP=-1.5:LRA=11",
-    ]
+    assert fake_ydl.last_opts["postprocessor_args"] == {
+        "extractaudio": ["-af", "loudnorm=I=-9.5:TP=-1.5:LRA=11"]
+    }
 
 
 def test_download_tracks_trim_silence_option(fake_ydl, tmp_path):
     """trim_silence=True で末尾無音削除フィルタが loudnorm の前段に入る（既定 OFF）。"""
     fake_ydl.info = entry_for(tmp_path, "a")
     core.download_tracks("u", "mp3", trim_silence=True)
-    assert fake_ydl.last_opts["postprocessor_args"] == [
-        "-af",
-        core.TRIM_SILENCE_FILTER + "," + core.loudnorm_filter(),
-    ]
+    assert fake_ydl.last_opts["postprocessor_args"] == {
+        "extractaudio": ["-af", core.TRIM_SILENCE_FILTER + "," + core.loudnorm_filter()]
+    }
     # ノーマライズ OFF でも無音削除は単独で使える
     core.download_tracks("u", "mp3", normalize=False, trim_silence=True)
-    assert fake_ydl.last_opts["postprocessor_args"] == ["-af", core.TRIM_SILENCE_FILTER]
+    assert fake_ydl.last_opts["postprocessor_args"] == {
+        "extractaudio": ["-af", core.TRIM_SILENCE_FILTER]
+    }
+
+
+def test_parse_bitrate():
+    """CLI / 設定の値を正規化する（既定 None・取得元と同じ・固定 kbps）。"""
+    assert core.parse_bitrate(None) is None
+    assert core.parse_bitrate("") is None
+    assert core.parse_bitrate("default") is None
+    assert core.parse_bitrate("source") == core.BITRATE_SOURCE
+    assert core.parse_bitrate(" SOURCE ") == core.BITRATE_SOURCE
+    assert core.parse_bitrate("192") == 192
+    assert core.parse_bitrate("192k") == 192
+    assert core.parse_bitrate("192kbps") == 192
+    assert core.parse_bitrate(320) == 320
+    with pytest.raises(ValueError):
+        core.parse_bitrate("high")
+    with pytest.raises(ValueError):
+        core.parse_bitrate(9999)  # 範囲外
+
+
+def test_source_bitrate_kbps():
+    """abr を四捨五入して返す。無い / 小さすぎる場合は None（= ffmpeg 既定）。"""
+    assert core.source_bitrate_kbps({"abr": 128.93}) == 129
+    assert core.source_bitrate_kbps({"abr": None, "tbr": 130.4}) == 130  # 代用
+    assert core.source_bitrate_kbps({}) is None
+    # 10 以下は yt-dlp が VBR 品質スケールとして解釈してしまうので使わない
+    assert core.source_bitrate_kbps({"abr": 8}) is None
+
+
+def only_pp(fake_ydl):
+    """add_post_processor で足された音声抽出 PP を 1 つだけ取り出す。"""
+    assert fake_ydl.last_pps is not None and len(fake_ydl.last_pps) == 1
+    pp, when = fake_ydl.last_pps[0]
+    assert when == "post_process"
+    return pp
+
+
+def run_pp(pp, monkeypatch, info):
+    """PP の run() を、親（ffmpeg / ffprobe を起動する）を止めて呼ぶ。"""
+    monkeypatch.setattr(type(pp).__mro__[1], "run", lambda self, i: None, raising=True)
+    pp.run(info)
+
+
+def test_download_tracks_bitrate_fixed(fake_ydl, tmp_path, monkeypatch):
+    """audio_bitrate=数値 が PP の目標ビットレート(preferredquality)になる。"""
+    fake_ydl.info = entry_for(tmp_path, "a")
+    core.download_tracks("u", "mp3")  # 既定は指定なし（ffmpeg 任せ）
+    assert only_pp(fake_ydl)._preferredquality is None
+    core.download_tracks("u", "mp3", audio_bitrate=320)
+    pp = only_pp(fake_ydl)
+    assert pp._preferredquality == 320
+    assert pp._quality_args("libmp3lame") == ["-b:a", "320.0k"]
+    # 文字列でも同じ（CLI からはそのまま渡ってくる）
+    core.download_tracks("u", "mp3", audio_bitrate="192k")
+    assert only_pp(fake_ydl)._preferredquality == 192
+
+
+def test_download_tracks_bitrate_ignored_for_wav(fake_ydl, tmp_path):
+    """wav は非圧縮なのでビットレート指定は捨てる（PCM に -b:a は効かない）。"""
+    fake_ydl.info = entry_for(tmp_path, "a")
+    (tmp_path / "a.wav").write_bytes(b"\x00")  # 変換後のファイル
+    core.download_tracks("u", "wav", audio_bitrate=320)
+    pp = only_pp(fake_ydl)
+    assert pp._preferredquality is None
+    assert pp._match_source_bitrate is False
+    core.download_tracks("u", "wav", audio_bitrate=core.BITRATE_SOURCE)
+    assert only_pp(fake_ydl)._match_source_bitrate is False  # 「取得元と同じ」も同様
+
+
+def test_download_tracks_bitrate_source_reads_abr(fake_ydl, tmp_path, monkeypatch):
+    """audio_bitrate="source" は変換直前に情報 dict の abr を目標値へ移す。"""
+    fake_ydl.info = entry_for(tmp_path, "a")
+    core.download_tracks("u", "mp3", audio_bitrate=core.BITRATE_SOURCE)
+    pp = only_pp(fake_ydl)
+    assert pp._match_source_bitrate is True
+    run_pp(pp, monkeypatch, {"abr": 128.93, "asr": 48000})
+    assert pp._preferredquality == 129
+    assert pp._quality_args("libmp3lame") == ["-b:a", "129k"]
+
+
+def test_extract_audio_pp_pins_source_sample_rate(fake_ydl, tmp_path, monkeypatch):
+    """変換後のサンプリングレートは取得元に固定する（loudnorm の 192kHz 対策）。"""
+    fake_ydl.info = entry_for(tmp_path, "a")
+    (tmp_path / "a.m4a").write_bytes(b"\x00")  # 変換後のファイル
+    core.download_tracks("u", "m4a")
+    pp = only_pp(fake_ydl)
+    run_pp(pp, monkeypatch, {"asr": 48000})
+    calls = []
+    monkeypatch.setattr(
+        type(pp).__mro__[1],
+        "run_ffmpeg",
+        lambda self, path, out, codec, opts: calls.append((codec, opts)),
+        raising=True,
+    )
+    pp.run_ffmpeg("in.webm", "out.m4a", "aac", ["-x"])
+    assert calls[-1] == ("aac", ["-x", "-ar", "48000"])
+    # 再エンコードしない(copy)ときは触らない
+    pp.run_ffmpeg("in.m4a", "out.m4a", "copy", [])
+    assert calls[-1] == ("copy", [])
+    # asr が取れない音源では従来どおり ffmpeg 任せ
+    run_pp(pp, monkeypatch, {})
+    pp.run_ffmpeg("in.webm", "out.m4a", "aac", [])
+    assert calls[-1] == ("aac", [])
+
+
+def test_download_tracks_falls_back_to_opts_postprocessor(fake_ydl, tmp_path, monkeypatch):
+    """派生 PP を作れない環境では opts の postprocessors 指定に落ちる。"""
+    monkeypatch.setattr(core, "_extract_audio_pp_class", lambda: None)
+    fake_ydl.info = entry_for(tmp_path, "a")
+    core.download_tracks("u", "mp3", audio_bitrate=320)
+    assert fake_ydl.last_pps == []
+    assert fake_ydl.last_opts["postprocessors"] == [
+        {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "320"}
+    ]
+
+
+def test_download_tracks_best_quality_option(fake_ydl, tmp_path):
+    """best_quality=True でフォーマットの並べ替え順を音質優先へ差し替える。"""
+    fake_ydl.info = entry_for(tmp_path, "a")
+    core.download_tracks("u", "mp3")
+    assert "format_sort" not in fake_ydl.last_opts  # 既定は yt-dlp 任せ
+    core.download_tracks("u", "mp3", best_quality=True)
+    assert fake_ydl.last_opts["format_sort"] == list(core.BEST_AUDIO_SORT)
+
+
+def test_write_and_read_tags_opus(tmp_path):
+    """opus は Vorbis コメント（TITLE / ARTIST / ALBUM）に読み書きする。"""
+    p = make_opus(tmp_path)
+    core.write_title(p, "曲名", artist="作者", album="アルバム")
+    assert core.read_tags(p) == {"title": "曲名", "artist": "作者", "album": "アルバム"}
+    # 空文字の項目は既存値を残す（他形式と同じ方針）
+    core.write_title(p, "", artist="作者2")
+    assert core.read_tags(p) == {"title": "曲名", "artist": "作者2", "album": "アルバム"}
+
+
+def test_track_from_file_opus(tmp_path):
+    """取り込み時も opus の既存タグを読む（推定をスキップした PENDING 行）。"""
+    p = make_opus(tmp_path)
+    core.write_title(p, "既存曲名", artist="既存作者")
+    track = core.track_from_file(p)
+    assert track.guessed_title == "既存曲名"
+    assert track.artist == "既存作者"
+    assert track.skip_infer is True and track.status is core.Status.PENDING
+
+
+def test_is_native_codec():
+    """出力形式のまま保存できるコーデックか（YouTube の acodec 表記に合わせる）。"""
+    assert core.is_native_codec("opus", "opus") is True
+    assert core.is_native_codec("m4a", "mp4a.40.2") is True
+    assert core.is_native_codec("opus", "mp4a.40.2") is False
+    assert core.is_native_codec("mp3", "opus") is False  # mp3 は常に変換
+    assert core.is_native_codec("opus", None) is False
+    assert core.is_native_codec("opus", "none") is False
+
+
+def test_download_tracks_opus_defaults_to_source_bitrate(fake_ydl, tmp_path):
+    """opus は指定なしでも取得元のビットレートに合わせる（libopus 既定は 96kbps）。"""
+    fake_ydl.info = entry_for(tmp_path, "a")
+    (tmp_path / "a.opus").write_bytes(b"\x00")
+    core.download_tracks("u", "opus")
+    assert only_pp(fake_ydl)._match_source_bitrate is True
+    # 明示した値はそのまま優先される
+    core.download_tracks("u", "opus", audio_bitrate=192)
+    pp = only_pp(fake_ydl)
+    assert pp._match_source_bitrate is False and pp._preferredquality == 192
+    # 他形式の既定は従来どおり ffmpeg 任せ
+    core.download_tracks("u", "mp3")
+    assert only_pp(fake_ydl)._match_source_bitrate is False
+
+
+def test_download_tracks_prefers_copyable_format_without_filters(fake_ydl, tmp_path):
+    """フィルタ無しなら出力形式と同じコーデックの音源を優先して取る。"""
+    fake_ydl.info = entry_for(tmp_path, "a")
+    (tmp_path / "a.opus").write_bytes(b"\x00")
+    core.download_tracks("u", "opus", normalize=False)
+    assert fake_ydl.last_opts["format"] == core._COPY_FORMAT_SELECTOR["opus"]
+    # ノーマライズ ON では再エンコードが必須なので、素直に最良の音源を取る
+    core.download_tracks("u", "opus")
+    assert fake_ydl.last_opts["format"] == core.DEFAULT_FORMAT_SELECTOR
+    # mp3 / wav はどのみち変換なので既定のまま
+    core.download_tracks("u", "mp3", normalize=False)
+    assert fake_ydl.last_opts["format"] == core.DEFAULT_FORMAT_SELECTOR
+
+
+def test_download_tracks_force_encode_with_filters(fake_ydl, tmp_path, monkeypatch):
+    """フィルタを掛ける行の PP は copy を選ばせない（-af と同居できないため）。"""
+    fake_ydl.info = entry_for(tmp_path, "a")
+    (tmp_path / "a.opus").write_bytes(b"\x00")
+    # 親の get_audio_codec は ffprobe を起動するので差し替える
+    monkeypatch.setattr(
+        core._extract_audio_pp_class().__mro__[1],
+        "get_audio_codec",
+        lambda self, path: "opus",
+        raising=True,
+    )
+    core.download_tracks("u", "opus")  # ノーマライズ ON
+    forced = only_pp(fake_ydl)
+    assert forced._force_encode is True
+    # 出力形式と一致しない値を返す = 親の run が再エンコード側の分岐へ行く
+    assert forced.get_audio_codec("x.webm") != "opus"
+    core.download_tracks("u", "opus", normalize=False)
+    plain = only_pp(fake_ydl)
+    assert plain._force_encode is False
+    assert plain.get_audio_codec("x.webm") == "opus"  # そのまま = copy が選ばれる
+
+
+def test_extract_audio_pp_skips_ar_for_opus(fake_ydl, tmp_path, monkeypatch):
+    """libopus は 48kHz 固定。-ar を渡すと変換が落ちるので付けない。"""
+    fake_ydl.info = entry_for(tmp_path, "a")
+    (tmp_path / "a.opus").write_bytes(b"\x00")
+    core.download_tracks("u", "opus", normalize=False)
+    pp = only_pp(fake_ydl)
+    run_pp(pp, monkeypatch, {"asr": 44100})
+    calls = []
+    monkeypatch.setattr(
+        type(pp).__mro__[1],
+        "run_ffmpeg",
+        lambda self, path, out, codec, opts: calls.append((codec, opts)),
+        raising=True,
+    )
+    pp.run_ffmpeg("in.m4a", "out.opus", "libopus", [])
+    assert calls[-1] == ("libopus", [])  # -ar は付かない
+    # mp3 が対応するレートなら付ける
+    pp.run_ffmpeg("in.webm", "out.mp3", "libmp3lame", [])
+    assert calls[-1] == ("libmp3lame", ["-ar", "44100"])
+    # 対応外のレート（96kHz を mp3 へ）は付けない
+    run_pp(pp, monkeypatch, {"asr": 96000})
+    pp.run_ffmpeg("in.webm", "out.mp3", "libmp3lame", [])
+    assert calls[-1] == ("libmp3lame", [])
 
 
 def test_download_tracks_out_dir(fake_ydl, tmp_path):

@@ -384,6 +384,8 @@ def test_worker_passes_download_and_infer_options(qtbot, monkeypatch, tmp_path):
         normalize=True,
         loudness=core.NORMALIZE_TARGET_I,
         trim_silence=False,
+        best_quality=False,
+        audio_bitrate=None,
         ytmusic_direct=True,
         logger=None,
     ):
@@ -392,6 +394,8 @@ def test_worker_passes_download_and_infer_options(qtbot, monkeypatch, tmp_path):
         captured["normalize"] = normalize
         captured["loudness"] = loudness
         captured["trim_silence"] = trim_silence
+        captured["best_quality"] = best_quality
+        captured["audio_bitrate"] = audio_bitrate
         captured["ytmusic_direct"] = ytmusic_direct
         return [Track(stem="a", filepath="a.mp3")]
 
@@ -417,6 +421,8 @@ def test_worker_passes_download_and_infer_options(qtbot, monkeypatch, tmp_path):
         normalize=False,
         loudness=-10.0,
         trim_silence=True,
+        best_quality=True,
+        audio_bitrate=core.BITRATE_SOURCE,
         ytmusic_direct=False,
     )
     run_worker(qtbot, worker)
@@ -427,6 +433,8 @@ def test_worker_passes_download_and_infer_options(qtbot, monkeypatch, tmp_path):
         "normalize": False,
         "loudness": -10.0,
         "trim_silence": True,
+        "best_quality": True,
+        "audio_bitrate": core.BITRATE_SOURCE,
         "ytmusic_direct": False,
     }
 
