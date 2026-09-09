@@ -135,6 +135,49 @@ def test_infer_titles_no_targets_is_noop(monkeypatch):
     core.infer_titles([Track(stem="m", manual=True)], client=object())
 
 
+def test_infer_titles_marks_still_empty_rows(monkeypatch):
+    """再問い合わせでも空なら、空欄のままにせず理由を error に残す。"""
+
+    def fake(inputs, client, **kw):
+        return [
+            TitleResult(index=i + 1, original=t.title, title="", valid=False)
+            for i, t in enumerate(inputs)
+        ]
+
+    monkeypatch.setattr(core, "extract_titles", fake)
+    t = Track(stem="a")
+    core.infer_titles([t], client=object())
+
+    # 手入力・再推定・作者/アルバムのみの書き込みを従来どおり効かせるため
+    # 状態は PENDING のまま（ERROR にはしない）
+    assert t.status is Status.PENDING
+    assert t.error == core.EMPTY_TITLE_ERROR
+
+
+def test_infer_titles_calls_extract_titles_once(monkeypatch):
+    """core は extract_titles を 1 回しか呼ばない（往復を二重化しない）。
+
+    空で返った項目の拾い直しは mv2title 0.4.0 側の責務になった。core にも
+    同じ処理があったが、失敗時に mv2title と同条件のリクエストを送り直す
+    無駄な 1 往復になるため無効化してある（core._retry_missing_titles 参照）。
+    """
+    calls = []
+
+    def fake(inputs, client, **kw):
+        calls.append(kw)
+        # 2 件目が空で返っても、core からの再問い合わせは起こさない
+        return [
+            TitleResult(
+                index=i + 1, original=t.title, title="song0" if i == 0 else "", valid=i == 0
+            )
+            for i, t in enumerate(inputs)
+        ]
+
+    monkeypatch.setattr(core, "extract_titles", fake)
+    core.infer_titles([Track(stem="a"), Track(stem="b")], client=object())
+    assert len(calls) == 1
+
+
 # ---------------------------------------------------------------------------
 # write_tags / write_title / describe_result
 # ---------------------------------------------------------------------------

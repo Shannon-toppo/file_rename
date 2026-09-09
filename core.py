@@ -1295,6 +1295,79 @@ def fetch_metadata(
 # タイトル推定
 # ---------------------------------------------------------------------------
 
+# 応答に該当項目が無く曲名が空のまま返った行に載せる理由。
+# 空欄のままだと「推定を飛ばした」のか「推定に失敗した」のか区別が付かない。
+EMPTY_TITLE_ERROR = "タイトルを推定できませんでした（LLM の応答にこの行の項目がありません）。"
+
+
+# --- 空で返った項目の拾い直し（mv2title 0.4.0 で不要になったため無効）---------
+#
+# 症状: 2 件以上を一度に推定すると、1 件目以外の曲名が空欄になる。
+#
+# 原因は 2 つの合わせ技だった。
+#  ① 構造化出力（mv2title の strict な json_schema）を付けて送ると、モデルに
+#     よっては **配列の 1 件目だけを出力して停止する**。実測（LM Studio +
+#     gemma-4-e2b）で finish_reason=stop / completion_tokens 37 /
+#     reasoning_tokens 0 と、入力が何件でも決定的にこうなる。同じ入力を
+#     response_format 無しで送ると全件返る（同条件で reasoning_tokens 555）。
+#     制約付きデコードだと思考する余地が無く、その場で打ち切られるため。
+#  ② mv2title の check_results は応答が入力より短くても **件数を合わせて**
+#     返す（不足分は title="" / valid=False のプレースホルダ）。このため
+#     infer_titles の「件数が合わなければ CoreError」は素通りし、該当行だけが
+#     黙って空欄になる。
+#
+# 恒久対応は mv2title 0.4.0 で入った（bypass_check と retry_invalid を分離し、
+# bypass_check=True でも部分リトライが走る。欠けた項目は use_schema=False で
+# 問い合わせ直し、打ち切りを検出したら以降のバッチも構造化出力なしに落とす）。
+# こちらのリトライは no-op になるだけでなく、失敗時は **mv2title が直前に
+# 送ったのと同じ条件（schema なし・温度 0.0）を送り直す無駄な 1 往復**に
+# なるため、呼び出しごと止めてある。
+#
+# 残してあるのは、mv2title 0.3.0 以前で動かす場合と、別のモデル・別の
+# エンドポイントで同種の「応答が入力より短い」症状に当たった場合の備え。
+# 復活させるなら下の関数と infer_titles 内の呼び出し（同じ理由のコメント付き）
+# の両方を戻し、tests/test_core.py にリトライのテストを足すこと。
+#
+# def _retry_missing_titles(
+#     inputs: list[TitleInput],
+#     results: list,
+#     client: LLMClient,
+#     batch_size: int,
+# ) -> list:
+#     """曲名が空で返った項目だけ、構造化出力を使わずに 1 回だけ問い合わせ直す。
+#
+#     再問い合わせも失敗した行はそのまま（空 / valid=False）返す。呼び出し元が
+#     EMPTY_TITLE_ERROR を載せるので、行は空欄のまま放置されない。
+#     """
+#     missing = [i for i, r in enumerate(results) if not (r.title or "").strip()]
+#     if not missing:
+#         return results
+#     _LOG.info(
+#         "%d/%d 件が空で返ったため、構造化出力なしで問い合わせ直します",
+#         len(missing),
+#         len(results),
+#     )
+#     retry = extract_titles(
+#         [inputs[i] for i in missing],
+#         client,
+#         batch_size=batch_size,
+#         bypass_check=True,
+#         use_schema=False,
+#     )
+#     if len(retry) != len(missing):
+#         # 件数が合わない再問い合わせは誤対応の元なので丸ごと捨てる
+#         return results
+#     filled = 0
+#     for pos, res in zip(missing, retry):
+#         if not (res.title or "").strip():
+#             continue
+#         # サブセット内の通し番号を、リスト全体での位置へ戻す
+#         res.index = pos + 1
+#         results[pos] = res
+#         filled += 1
+#     _LOG.info("再問い合わせで %d/%d 件を回収しました", filled, len(missing))
+#     return results
+
 
 def infer_titles(
     tracks: Sequence[Track],
@@ -1309,6 +1382,9 @@ def infer_titles(
     メタデータで確定している行）は保護してスキップする
     （force=True で明示的に上書き）。
     成功した行は Status.PENDING になる（書き込みは write_tags で行う）。
+    応答に載らなかった（曲名が空で返った）行の拾い直しは mv2title 0.4.0 が
+    行う。それでも空のまま返った行は PENDING のまま error に
+    EMPTY_TITLE_ERROR を載せる（空欄だけを残さないため）。
 
     Raises:
         CoreError: 応答件数が対象件数と一致しない場合（全対象行を ERROR にした上で）。
@@ -1325,7 +1401,11 @@ def infer_titles(
     if client is None:
         client = make_client()
     try:
+        # 応答に載らなかった項目の拾い直しは mv2title 0.4.0 側で行われる
+        # （bypass_check=True でも部分リトライが走る）。0.3.0 以前で動かすなら
+        # 下の 1 行を戻す（_retry_missing_titles の上のコメント参照）
         results = extract_titles(inputs, client, batch_size=batch_size, bypass_check=True)
+        # results = _retry_missing_titles(inputs, list(results), client, batch_size)
     except Exception as e:
         for t in targets:
             t.status = Status.ERROR
@@ -1350,6 +1430,10 @@ def infer_titles(
         t.manual = False
         t.skip_infer = False  # force で推定し直した行は以降も推定対象に戻す
         t.status = Status.PENDING
+        # 再問い合わせでも曲名が取れなかった行。PENDING のままにして手入力・
+        # 再推定・作者/アルバムのみの書き込みは従来どおり効かせつつ、理由を
+        # 残して「空欄なだけ」の状態にしない（GUI は推定タイトル列に出す）
+        t.error = "" if (res.title or "").strip() else EMPTY_TITLE_ERROR
 
 
 # ---------------------------------------------------------------------------
