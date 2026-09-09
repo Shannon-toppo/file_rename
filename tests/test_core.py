@@ -181,6 +181,101 @@ def test_write_tags_writes_artist(tmp_path):
     assert str(ID3(str(t.filepath)).get("TPE1")) == "Ch"
 
 
+def test_write_title_with_album_mp3(tmp_path):
+    """アルバム名指定時は TALB も書き込む（未指定なら書かない）。"""
+    p = make_mp3(tmp_path, "a.mp3")
+    core.write_title(p, "song", artist="A", album="Album1")
+    tags = ID3(str(p))
+    assert str(tags.get("TALB")) == "Album1"
+
+    p2 = make_mp3(tmp_path, "b.mp3")
+    core.write_title(p2, "song")
+    assert ID3(str(p2)).get("TALB") is None
+
+
+def test_write_tags_writes_album(tmp_path):
+    t = Track(
+        stem="s",
+        filepath=make_mp3(tmp_path, "s.mp3"),
+        guessed_title="song",
+        artist="Ch",
+        album="Alb",
+        valid=True,
+    )
+    core.write_tags([t])
+    assert t.status is Status.DONE
+    assert str(ID3(str(t.filepath)).get("TALB")) == "Alb"
+
+
+def test_write_tags_partial_when_title_missing(tmp_path):
+    """曲名が空でも、作者・アルバム名の編集は書き込まれる（行は確認待ちのまま）。"""
+    t = Track(stem="s", filepath=make_mp3(tmp_path, "s.mp3"), album="Alb", artist="A")
+    core.write_tags([t])
+    assert t.status is Status.PENDING  # 曲名は未確定なので完了にしない
+    assert "作者・アルバム名のみ" in t.error
+    tags = ID3(str(t.filepath))
+    assert str(tags.get("TALB")) == "Alb" and str(tags.get("TPE1")) == "A"
+    assert tags.get("TIT2") is None  # 空の曲名は書かない
+
+
+def test_write_tags_skips_when_nothing_to_write(tmp_path):
+    """曲名も作者もアルバムも空なら、従来どおり何も書かずスキップする。"""
+    t = Track(stem="s", filepath=make_mp3(tmp_path, "s.mp3"))
+    core.write_tags([t])
+    assert t.status is Status.PENDING and "スキップ" in t.error
+    assert read_tit2(t.filepath) is None
+
+
+# ---------------------------------------------------------------------------
+# タグ読み込み（保存先から取り込み）
+# ---------------------------------------------------------------------------
+
+
+def test_read_tags_roundtrip_mp3(tmp_path):
+    """書き込んだ曲名 / 作者 / アルバム名がそのまま読み戻せる。"""
+    p = make_mp3(tmp_path, "a.mp3")
+    core.write_title(p, "曲名", artist="作者", album="アルバム")
+    assert core.read_tags(p) == {"title": "曲名", "artist": "作者", "album": "アルバム"}
+
+
+def test_read_tags_missing_or_broken(tmp_path):
+    """タグ無し・未対応拡張子・存在しないファイルでも例外を投げず空を返す。"""
+    empty = {"title": "", "artist": "", "album": ""}
+    assert core.read_tags(make_mp3(tmp_path, "notag.mp3")) == empty  # ID3 ヘッダ無し
+    assert core.read_tags(tmp_path / "none.mp3") == empty  # 存在しない
+    assert core.read_tags(tmp_path / "x.flac") == empty  # 未対応拡張子
+    broken = tmp_path / "broken.m4a"
+    broken.write_bytes(b"not an mp4")
+    assert core.read_tags(broken) == empty
+
+
+def test_track_from_file_loads_metadata(tmp_path):
+    """既存タグが行の初期値になり、曲名があれば推定から保護される。"""
+    p = make_mp3(tmp_path, "a.mp3")
+    core.write_title(p, "曲名", artist="作者", album="アルバム")
+
+    t = core.track_from_file(p)
+    assert (t.guessed_title, t.artist, t.album) == ("曲名", "作者", "アルバム")
+    assert t.skip_infer and t.valid is True and t.status is Status.PENDING
+    # skip_infer 行は再推定の対象外（force=True でのみ上書きされる）
+    core.infer_titles([t], client=object(), batch_size=5)
+    assert t.guessed_title == "曲名"
+
+
+def test_track_from_file_without_tags(tmp_path):
+    """タグが無いファイルは従来どおり空・QUEUED（推定対象）のまま。"""
+    t = core.track_from_file(make_mp3(tmp_path, "a.mp3"))
+    assert t.guessed_title == "" and t.artist == "" and t.album == ""
+    assert not t.skip_infer and t.status is Status.QUEUED
+
+
+def test_track_from_file_can_skip_metadata(tmp_path):
+    p = make_mp3(tmp_path, "a.mp3")
+    core.write_title(p, "曲名", album="アルバム")
+    t = core.track_from_file(p, read_metadata=False)
+    assert t.guessed_title == "" and t.album == "" and t.status is Status.QUEUED
+
+
 def test_write_tags_failure_does_not_stop_others(tmp_path):
     bad = Track(
         stem="bad", filepath=tmp_path / "bad.flac", guessed_title="x", valid=True

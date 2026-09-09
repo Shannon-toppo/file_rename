@@ -6,9 +6,9 @@
   編集デリゲート確定（closeEditor）やキーボード操作（Delete）・ペーストを拾い、
   コマンド化してから model を触る。これで「stack 経由」と「直接 setData」の
   二重適用を防ぐ。
-- old/new は model.title_state() のタプル (guessed_title, artist, manual,
-  skip_infer, valid, status, error) を丸ごと保存し、restore で完全復元する
-  （manual/status も戻る）。
+- old/new は model.title_state() のタプル (guessed_title, artist, album,
+  manual, skip_infer, valid, status, error) を丸ごと保存し、restore で完全
+  復元する（manual/status も戻る）。
 - ペーストは複数セル分のコマンドを 1 つの macro にまとめる（beginMacro/endMacro）
   ので、1 回の undo で貼り付け全体が戻る。行削除の undo はスコープ外。
 """
@@ -19,7 +19,7 @@ class _StateCommand(QUndoCommand):
     """行のタイトル状態タプルを old/new で入れ替えるコマンドの基底。
 
     redo で new 状態、undo で old 状態を復元する。old/new は
-    model.title_state() が返す 7 要素タプル。
+    model.title_state() が返す 8 要素タプル。
     """
 
     def __init__(self, model, row: int, old_state: tuple, new_state: tuple, text: str):
@@ -58,6 +58,16 @@ class EditArtistCommand(_StateCommand):
         model.set_artist(row, new_artist)
         new_state = model.title_state(row)
         super().__init__(model, row, old_state, new_state, "アーティスト編集")
+
+
+class EditAlbumCommand(_StateCommand):
+    """アルバム名欄の編集を undo/redo するコマンド（生成時点で適用済み）。"""
+
+    def __init__(self, model, row: int, new_album: str):
+        old_state = model.title_state(row)
+        model.set_album(row, new_album)
+        new_state = model.title_state(row)
+        super().__init__(model, row, old_state, new_state, "アルバム名編集")
 
 
 class ClearTitleCommand(_StateCommand):

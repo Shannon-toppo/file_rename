@@ -11,6 +11,7 @@ from PySide6.QtGui import QColor
 
 from core import Status, Track
 from gui.model import (
+    COL_ALBUM,
     COL_ARTIST,
     COL_CHANNEL,
     COL_FORMAT,
@@ -32,12 +33,21 @@ def _idx(model, row, col):
 
 def test_columns_and_headers():
     model = TrackTableModel()
-    assert model.columnCount() == 6
+    assert model.columnCount() == 7
     headers = [
         model.headerData(c, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole)
-        for c in range(6)
+        for c in range(7)
     ]
-    assert headers == ["元タイトル", "チャンネル", "推定タイトル", "アーティスト", "状態", "形式"]
+    # メタデータ 3 項目は「曲名 → 作者 → アルバム名」の順
+    assert headers == [
+        "元タイトル",
+        "チャンネル",
+        "推定タイトル",
+        "アーティスト",
+        "アルバム",
+        "状態",
+        "形式",
+    ]
 
 
 def test_display_values():
@@ -239,6 +249,36 @@ def test_artist_column_editable_and_setdata():
     assert model.data(_idx(model, 0, COL_ARTIST), Qt.ItemDataRole.DisplayRole) == "ArtistName"
 
 
+def test_album_column_editable_and_setdata():
+    """アルバム列も編集可。manual は触らず、DONE 行は確認待ちへ戻す。"""
+    done = Track(stem="a", guessed_title="song", valid=True, status=Status.DONE)
+    queued = Track(stem="b")
+    model = TrackTableModel([done, queued])
+
+    assert model.flags(_idx(model, 0, COL_ALBUM)) & Qt.ItemFlag.ItemIsEditable
+    assert model.setData(_idx(model, 0, COL_ALBUM), "  Album1 ", Qt.ItemDataRole.EditRole)
+    assert done.album == "Album1"  # strip される
+    assert done.manual is False
+    assert done.status is Status.PENDING
+
+    model.setData(_idx(model, 1, COL_ALBUM), "X", Qt.ItemDataRole.EditRole)
+    assert queued.album == "X"
+    assert queued.status is Status.QUEUED
+
+    assert model.data(_idx(model, 0, COL_ALBUM), Qt.ItemDataRole.DisplayRole) == "Album1"
+
+
+def test_title_state_restores_album():
+    """undo 用の状態タプルはアルバム名も含めて復元する。"""
+    t = Track(stem="a", artist="A", album="Alb")
+    model = TrackTableModel([t])
+    before = model.title_state(0)
+    model.set_album(0, "Other")
+    assert t.album == "Other"
+    model.restore_title_state(0, before)
+    assert t.album == "Alb" and t.artist == "A"
+
+
 def test_percent_role_for_progress_delegate():
     """PERCENT_ROLE は DL 中かつ進捗既知のときだけ数値を返す（進捗バー用）。"""
     from gui.model import PERCENT_ROLE
@@ -350,6 +390,25 @@ def test_main_window_add_urls_and_files(qtbot, tmp_path):
     assert win.add_files([f]) == 1
     assert win._model.rowCount() == 3
     assert win._model.track_at(2).filepath == f
+
+
+def test_main_window_add_files_reads_metadata(qtbot, tmp_path):
+    """[保存先から取り込み] は既存のメタデータを読み込んで行に表示する。"""
+    import core
+    from gui.main_window import MainWindow
+
+    f = tmp_path / "song.mp3"
+    f.write_bytes(b"\x00" * 128)
+    core.write_title(f, "曲名", artist="作者", album="アルバム")
+
+    win = MainWindow(restore_settings=False)
+    qtbot.addWidget(win)
+    assert win.add_files([f]) == 1
+    model = win._model
+    assert model.data(_idx(model, 0, COL_TITLE), Qt.ItemDataRole.DisplayRole) == "曲名"
+    assert model.data(_idx(model, 0, COL_ARTIST), Qt.ItemDataRole.DisplayRole) == "作者"
+    assert model.data(_idx(model, 0, COL_ALBUM), Qt.ItemDataRole.DisplayRole) == "アルバム"
+    assert win._last_tagged == 1
 
 
 def test_main_window_add_files_skips_duplicates(qtbot, tmp_path):
