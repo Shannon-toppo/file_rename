@@ -23,7 +23,7 @@ from pathlib import Path
 
 from dotenv import dotenv_values, load_dotenv
 from mutagen.id3 import ID3
-from mutagen.id3._frames import TIT2, TPE1
+from mutagen.id3._frames import TALB, TIT2, TPE1
 from mutagen.id3._util import ID3NoHeaderError
 from mutagen.mp4 import MP4
 from mutagen.wave import WAVE
@@ -207,8 +207,10 @@ class Track:
         filepath: 音声ファイルのパス（DL 完了後 or ローカル追加時に設定）。
         channel: チャンネル名。アーティスト名のヒントとして推定に渡す。
         guessed_title: 推定（または手動入力）された曲名。
-        artist: アーティスト欄に書き込む値。推定はしない（手動入力または
-            チャンネル名のコピー）。空文字なら書き込まない。
+        artist: アーティスト欄（作者）に書き込む値。推定はしない（手動入力・
+            チャンネル名のコピー・既存タグの読み込み）。空文字なら書き込まない。
+        album: アルバム名に書き込む値。推定はしない（手動入力または既存タグの
+            読み込み）。空文字なら書き込まない。
         valid: mv2title の検証結果。未推定なら None。
         manual: True なら guessed_title は手動編集済み（再推定で上書きしない）。
         skip_infer: True ならタイトル推定を行わず、取得済みのメタデータ上の
@@ -224,6 +226,7 @@ class Track:
     channel: str | None = None
     guessed_title: str = ""
     artist: str = ""
+    album: str = ""
     valid: bool | None = None
     manual: bool = False
     skip_infer: bool = False
@@ -231,9 +234,81 @@ class Track:
     error: str = ""
 
 
-def track_from_file(path: Path) -> Track:
-    """ローカルの音声ファイルから Track を作る（DL 段はスキップ）。"""
-    return Track(stem=path.stem, filepath=path)
+# タグ名 → 各形式のキー。曲名 / 作者(アーティスト) / アルバム名の 3 項目だけ扱う
+# （write_title が書き込む項目と対になる）。
+_ID3_TAG_KEYS = {"title": "TIT2", "artist": "TPE1", "album": "TALB"}
+_MP4_TAG_KEYS = {"title": "\xa9nam", "artist": "\xa9ART", "album": "\xa9alb"}
+# read_tags が返すキー（呼び出し元の参照用）
+TAG_FIELDS = ("title", "artist", "album")
+
+
+def _first_text(value) -> str:
+    """タグの値（ID3 フレーム / MP4 のリスト / 素の文字列）を 1 行の文字列にする。"""
+    if value is None:
+        return ""
+    text = getattr(value, "text", value)  # ID3 フレームは .text がリスト
+    if isinstance(text, (list, tuple)):
+        text = text[0] if text else ""
+    return str(text).strip()
+
+
+def read_tags(filepath: Path) -> dict[str, str]:
+    """音声ファイルから曲名 / 作者 / アルバム名を読み取る（best effort）。
+
+    「できるだけ読む」ためのヘルパなので **例外を投げない**: タグ無し・
+    壊れたファイル・未対応拡張子はすべて空文字の辞書として返す（取り込み時に
+    1 ファイルの不備でリスト全体が止まらないようにするため）。
+    戻り値のキーは TAG_FIELDS。
+    """
+    tags = None
+    keys = _ID3_TAG_KEYS
+    ext = filepath.suffix.lower()
+    try:
+        if ext == ".mp3":
+            try:
+                tags = ID3(str(filepath))
+            except ID3NoHeaderError:
+                tags = None
+        elif ext == ".wav":
+            tags = WAVE(str(filepath)).tags
+        elif ext == ".m4a":
+            tags = MP4(str(filepath)).tags
+            keys = _MP4_TAG_KEYS
+    except Exception as e:  # 壊れたファイル等。読めないだけなので握って空を返す
+        _LOG.debug("タグを読めませんでした: %s (%s)", filepath, e)
+        tags = None
+    if tags is None:
+        return dict.fromkeys(TAG_FIELDS, "")
+    result = {}
+    for name in TAG_FIELDS:
+        try:
+            result[name] = _first_text(tags.get(keys[name]))
+        except Exception:  # 個別フレームの破損も他の項目を巻き込まない
+            result[name] = ""
+    return result
+
+
+def track_from_file(path: Path, read_metadata: bool = True) -> Track:
+    """ローカルの音声ファイルから Track を作る（DL 段はスキップ）。
+
+    read_metadata=True なら既存のタグ（曲名 / 作者 / アルバム名）を読み込んで
+    初期値にする。曲名が既に入っているファイルは skip_infer=True / PENDING に
+    して推定から保護する（YouTube Music 行と同じ扱い。use_metadata_title 参照）
+    ——取り込み直後に見えている曲名が [実行] で勝手に置き換わらないようにする
+    ためで、推定し直したい場合は「選択行を再推定」または行のクリアで戻せる。
+    """
+    track = Track(stem=path.stem, filepath=path)
+    if not read_metadata:
+        return track
+    tags = read_tags(path)
+    track.artist = tags["artist"]
+    track.album = tags["album"]
+    if tags["title"]:
+        track.guessed_title = tags["title"]
+        track.skip_infer = True
+        track.valid = True
+        track.status = Status.PENDING
+    return track
 
 
 def list_music_files(directory: Path = FILES_DIR) -> list[Path]:
@@ -1028,11 +1103,18 @@ def infer_titles(
 # ---------------------------------------------------------------------------
 
 
-def write_title(filepath: Path, title: str, artist: str | None = None) -> None:
-    """ファイル形式に応じたタイトル（と任意でアーティスト）タグを書き込む。
+def write_title(
+    filepath: Path,
+    title: str,
+    artist: str | None = None,
+    album: str | None = None,
+) -> None:
+    """ファイル形式に応じたタイトル（と任意で作者・アルバム名）タグを書き込む。
 
     タイトルは .mp3 / .wav が ID3 の TIT2 フレーム、.m4a が MP4 の \xa9nam
-    アトム。アーティストは TPE1 / \xa9ART（None・空文字なら書き込まない）。
+    アトム。アーティストは TPE1 / \xa9ART、アルバム名は TALB / \xa9alb。
+    3 項目とも **空なら書き込まない**（ファイル側の既存値をそのまま残す）ので、
+    title="" で呼べば作者・アルバム名だけを更新できる（write_tags 参照）。
     """
     ext = filepath.suffix.lower()
     if ext == ".mp3":
@@ -1040,27 +1122,36 @@ def write_title(filepath: Path, title: str, artist: str | None = None) -> None:
             tags = ID3(str(filepath))
         except ID3NoHeaderError:
             tags = ID3()
-        tags.add(TIT2(encoding=3, text=title))
+        if title:
+            tags.add(TIT2(encoding=3, text=title))
         if artist:
             tags.add(TPE1(encoding=3, text=artist))
+        if album:
+            tags.add(TALB(encoding=3, text=album))
         tags.save(str(filepath))
     elif ext == ".wav":
         audio = WAVE(str(filepath))
         if audio.tags is None:
             audio.add_tags()
         assert audio.tags is not None
-        audio.tags["TIT2"] = TIT2(encoding=3, text=title)
+        if title:
+            audio.tags["TIT2"] = TIT2(encoding=3, text=title)
         if artist:
             audio.tags["TPE1"] = TPE1(encoding=3, text=artist)
+        if album:
+            audio.tags["TALB"] = TALB(encoding=3, text=album)
         audio.save(str(filepath))
     elif ext == ".m4a":
         audio = MP4(str(filepath))
         if audio.tags is None:
             audio.add_tags()
         assert audio.tags is not None
-        audio.tags["\xa9nam"] = [title]
+        if title:
+            audio.tags["\xa9nam"] = [title]
         if artist:
             audio.tags["\xa9ART"] = [artist]
+        if album:
+            audio.tags["\xa9alb"] = [album]
         audio.save()
     else:
         raise ValueError(f"unsupported extension: {ext}")
@@ -1070,13 +1161,16 @@ def write_tags(
     tracks: Sequence[Track],
     on_result: Callable[[Track], None] | None = None,
 ) -> None:
-    """各 Track の guessed_title をメタデータへ書き込む。
+    """各 Track の guessed_title（と artist / album）をメタデータへ書き込む。
 
     スキップ方針（CLI / GUI 共通のポリシーをここに集約）:
-    - guessed_title が空 → PENDING のまま（error に理由）
-    - valid=False かつ手動編集されていない → PENDING のまま（error に理由）。
-      手動編集済み(manual=True)ならユーザーの意思なので書き込む。
-    - 書き込み失敗 → ERROR / 成功 → DONE
+    - guessed_title が空 → 曲名は書かない（PENDING のまま、error に理由）
+    - valid=False かつ手動編集されていない → 同上。手動編集済み(manual=True)
+      ならユーザーの意思なので書き込む。
+    - ただし曲名を書かない行でも、artist / album が入っていればその 2 項目
+      だけは書き込む（取り込んだファイルの作者・アルバム名を直す編集を、
+      曲名が未確定というだけで捨てないため）。行は PENDING のまま残る。
+    - 書き込み失敗 → ERROR / 曲名まで書けたら DONE
 
     1 行の失敗は他の行を止めない。on_result は各行の処理直後に呼ばれる。
     """
@@ -1084,22 +1178,36 @@ def write_tags(
         if t.filepath is None:
             t.status = Status.ERROR
             t.error = "ファイルパスが未設定です。"
-        elif not t.guessed_title:
-            t.status = Status.PENDING
-            t.error = "曲名が空のためスキップしました。"
+            if on_result is not None:
+                on_result(t)
+            continue
+
+        # 曲名を書かない理由（空文字なら曲名も書く）
+        if not t.guessed_title:
+            skip = "曲名が空"
         elif t.valid is False and not t.manual:
+            skip = "検証失敗（元タイトルに含まれない曲名）"
+        else:
+            skip = ""
+
+        if skip and not (t.artist or t.album):
             t.status = Status.PENDING
-            t.error = "検証失敗（元タイトルに含まれない曲名）のためスキップしました。"
+            t.error = f"{skip}のためスキップしました。"
         else:
             t.status = Status.WRITING
             try:
-                write_title(t.filepath, t.guessed_title, artist=t.artist or None)
+                write_title(
+                    t.filepath,
+                    "" if skip else t.guessed_title,  # 空文字は書き込まれない
+                    artist=t.artist or None,
+                    album=t.album or None,
+                )
             except Exception as e:
                 t.status = Status.ERROR
                 t.error = f"書き込みに失敗しました: {e}"
             else:
-                t.status = Status.DONE
-                t.error = ""
+                t.status = Status.PENDING if skip else Status.DONE
+                t.error = f"{skip}のため、作者・アルバム名のみ書き込みました。" if skip else ""
         if on_result is not None:
             on_result(t)
 

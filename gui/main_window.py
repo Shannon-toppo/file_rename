@@ -50,9 +50,15 @@ import ytdlp_runtime
 from core import Status, Track
 
 from .clipboard import resolve_paste_targets, selection_to_tsv
-from .commands import ClearTitleCommand, EditArtistCommand, EditTitleCommand
+from .commands import (
+    ClearTitleCommand,
+    EditAlbumCommand,
+    EditArtistCommand,
+    EditTitleCommand,
+)
 from .logpanel import LogPanel, QtLogHandler, attach_handler, detach_handler
 from .model import (
+    COL_ALBUM,
     COL_ARTIST,
     COL_STATUS,
     COL_STEM,
@@ -132,6 +138,8 @@ class MainWindow(QMainWindow):
         self._pool = QThreadPool.globalInstance()
         self._cancel = threading.Event()
         self._running = False
+        # 直近の add_files でタグを読めた件数（ステータスバーの文言用）
+        self._last_tagged = 0
         # タイトル編集・ペースト・Delete クリアの undo/redo
         self._undo = QUndoStack(self)
         # 設定ダイアログで変更できる動作設定（QSettings で永続化）
@@ -205,7 +213,9 @@ class MainWindow(QMainWindow):
         import_btn = QPushButton("保存先から取り込み")
         import_btn.setToolTip(
             "保存先フォルダ（[設定] で変更可。既定は files/）にある音声ファイルを"
-            "まとめて追加する（追加済みの行は増えない）"
+            "まとめて追加する（追加済みの行は増えない）。\n"
+            "既存のメタデータ（曲名 / アーティスト / アルバム）を読み込んで表示し、"
+            "そのまま編集できる"
         )
         import_btn.clicked.connect(self._on_import_dir)
         # 2×2 グリッド（縦 4 段だと URL 欄より背が高くなり、小さいウィンドウで
@@ -311,6 +321,7 @@ class MainWindow(QMainWindow):
         self._view.setColumnWidth(COL_STEM, 240)
         self._view.setColumnWidth(COL_TITLE, 200)
         self._view.setColumnWidth(COL_ARTIST, 140)
+        self._view.setColumnWidth(COL_ALBUM, 140)
         # Excel 風: F2 / 直接タイプ / ダブルクリック / 選択セルクリックで編集開始
         # （実行中は _set_running が NoEditTriggers に切り替える）
         self._edit_triggers = (
@@ -324,6 +335,7 @@ class MainWindow(QMainWindow):
         # setModelData で model.setData を直接呼ばず、コマンド経由にする）
         self._view.setItemDelegateForColumn(COL_TITLE, _UndoEditDelegate(self))
         self._view.setItemDelegateForColumn(COL_ARTIST, _UndoEditDelegate(self))
+        self._view.setItemDelegateForColumn(COL_ALBUM, _UndoEditDelegate(self))
         # 元タイトルは編集不可だが、本文の部分コピーのため読み取り専用エディタを開く
         self._view.setItemDelegateForColumn(COL_STEM, _ReadOnlyCopyDelegate(self))
         # 状態列: DL 中は進捗バーを描画（テキストの % だけでは視認しづらいため）
@@ -470,6 +482,9 @@ class MainWindow(QMainWindow):
 
         既にリストへ入っているファイル（filepath が同じ行）はスキップする
         （[files/ 取り込み] を押すたびに同じ行が増えないように）。
+        行の初期値には既存のタグ（曲名 / 作者 / アルバム名）を読み込む
+        （core.track_from_file 参照）。うち何件でタグが読めたかは
+        _last_tagged に残し、ステータスバーの文言に使う。
         """
         existing = {
             t.filepath.resolve() for t in self._model.tracks() if t.filepath is not None
@@ -481,6 +496,9 @@ class MainWindow(QMainWindow):
                 continue
             existing.add(key)
             tracks.append(core.track_from_file(p))
+        self._last_tagged = sum(
+            1 for t in tracks if t.guessed_title or t.artist or t.album
+        )
         self._model.add_tracks(tracks)
         self.select_all_rows()
         return len(tracks)
@@ -536,6 +554,8 @@ class MainWindow(QMainWindow):
         n = self.add_files([Path(p) for p in paths])
         skipped = len(paths) - n
         msg = f"{n} 件のファイルを追加しました"
+        if self._last_tagged:
+            msg += f"（うち {self._last_tagged} 件はメタデータを読み込み）"
         if skipped:
             msg += f"（追加済み {skipped} 件はスキップ）"
         self.statusBar().showMessage(msg)
@@ -550,7 +570,10 @@ class MainWindow(QMainWindow):
             return
         n = self.add_files(files)
         if n:
-            self.statusBar().showMessage(f"{target.name}/ から {n} 件を取り込みました")
+            msg = f"{target.name}/ から {n} 件を取り込みました"
+            if self._last_tagged:
+                msg += f"（うち {self._last_tagged} 件はメタデータを読み込み）"
+            self.statusBar().showMessage(msg)
         else:
             self.statusBar().showMessage(f"{target.name}/ のファイルはすべて取り込み済みです")
 
@@ -1096,6 +1119,8 @@ class MainWindow(QMainWindow):
         """デリゲート確定を列に応じた Edit 系コマンドとしてスタックへ積む。"""
         if col == COL_ARTIST:
             self._undo.push(EditArtistCommand(self._model, row, value))
+        elif col == COL_ALBUM:
+            self._undo.push(EditAlbumCommand(self._model, row, value))
         else:
             self._undo.push(EditTitleCommand(self._model, row, value))
 

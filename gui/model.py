@@ -13,19 +13,30 @@ from core import Status, Track
 # カラム定義（順序が表示順）
 COL_STEM = 0  # 元タイトル（ファイル名 stem / URL）
 COL_CHANNEL = 1  # チャンネル
-COL_TITLE = 2  # 推定タイトル（編集可）
-COL_ARTIST = 3  # アーティスト（編集可。推定はしない）
-COL_STATUS = 4  # 状態
-COL_FORMAT = 5  # 形式（拡張子）
+# メタデータ 3 項目は「曲名 → 作者 → アルバム名」の順に並べる
+COL_TITLE = 2  # 推定タイトル = 曲名（編集可）
+COL_ARTIST = 3  # アーティスト = 作者（編集可。推定はしない）
+COL_ALBUM = 4  # アルバム名（編集可。推定はしない）
+COL_STATUS = 5  # 状態
+COL_FORMAT = 6  # 形式（拡張子）
 # 行番号は Qt 標準の縦ヘッダ（headerData の Vertical）が担うため、専用の # 列は持たない
-_HEADERS = ("元タイトル", "チャンネル", "推定タイトル", "アーティスト", "状態", "形式")
+_HEADERS = (
+    "元タイトル",
+    "チャンネル",
+    "推定タイトル",
+    "アーティスト",
+    "アルバム",
+    "状態",
+    "形式",
+)
 # 編集可能な列（クリップボード貼り付け・デリゲートで共用）
-EDITABLE_COLUMNS = (COL_TITLE, COL_ARTIST)
+EDITABLE_COLUMNS = (COL_TITLE, COL_ARTIST, COL_ALBUM)
 # 列ヘッダのツールチップ（編集可能列だけ。フィルハンドルの操作案内を兼ねる）
 _FILL_TIP = "セル右下の■を上下にドラッグすると、その範囲へ値をコピーできます（Excel と同じ）"
 _HEADER_TIPS = {
     COL_TITLE: f"推定タイトル（ダブルクリックで編集）。{_FILL_TIP}",
-    COL_ARTIST: f"アーティスト（推定はしない。ダブルクリックで編集）。{_FILL_TIP}",
+    COL_ARTIST: f"アーティスト（作者。推定はしない。ダブルクリックで編集）。{_FILL_TIP}",
+    COL_ALBUM: f"アルバム名（推定はしない。ダブルクリックで編集）。{_FILL_TIP}",
 }
 # 値は書き換えないが、読み取り専用エディタを開いて本文の部分選択・コピーを許す列。
 # EDITABLE_COLUMNS とは別扱い（貼り付け対象にはしない）。
@@ -88,7 +99,7 @@ class TrackTableModel(QAbstractTableModel):
         if not index.isValid():
             return Qt.ItemFlag.NoItemFlags
         base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-        # 推定タイトル・アーティストは編集可。元タイトルは本文コピー用に
+        # 推定タイトル・アーティスト・アルバムは編集可。元タイトルは本文コピー用に
         # 読み取り専用エディタを開けるよう、同じく ItemIsEditable を付ける
         # （実際に書き換わるかはデリゲート側で決まる）。
         if index.column() in EDITABLE_COLUMNS or index.column() in COPYABLE_COLUMNS:
@@ -117,7 +128,7 @@ class TrackTableModel(QAbstractTableModel):
         return None
 
     def setData(self, index: QModelIndex, value, role: int = Qt.ItemDataRole.EditRole) -> bool:
-        """推定タイトル / アーティスト列の編集。"""
+        """推定タイトル / アーティスト / アルバム列の編集。"""
         if role != Qt.ItemDataRole.EditRole:
             return False
         if index.column() == COL_TITLE:
@@ -126,6 +137,9 @@ class TrackTableModel(QAbstractTableModel):
             return True
         if index.column() == COL_ARTIST:
             self.set_artist(index.row(), str(value))
+            return True
+        if index.column() == COL_ALBUM:
+            self.set_album(index.row(), str(value))
             return True
         return False
 
@@ -149,6 +163,8 @@ class TrackTableModel(QAbstractTableModel):
             return track.guessed_title
         if col == COL_ARTIST:
             return track.artist
+        if col == COL_ALBUM:
+            return track.album
         if col == COL_STATUS:
             return self._status_text(row, track)
         if col == COL_FORMAT:
@@ -256,13 +272,14 @@ class TrackTableModel(QAbstractTableModel):
         """タイトル/アーティスト編集に関わる状態を undo 用タプルで取り出す。
 
         タプルの並び:
-        (guessed_title, artist, manual, skip_infer, valid, status, error)。
+        (guessed_title, artist, album, manual, skip_infer, valid, status, error)。
         Edit 系コマンドが old/new を丸ごと保存し restore で復元する。
         """
         t = self._tracks[row]
         return (
             t.guessed_title,
             t.artist,
+            t.album,
             t.manual,
             t.skip_infer,
             t.valid,
@@ -278,6 +295,7 @@ class TrackTableModel(QAbstractTableModel):
         (
             t.guessed_title,
             t.artist,
+            t.album,
             t.manual,
             t.skip_infer,
             t.valid,
@@ -309,6 +327,21 @@ class TrackTableModel(QAbstractTableModel):
             return
         t = self._tracks[row]
         t.artist = artist.strip()
+        if t.status is Status.DONE:
+            t.status = Status.PENDING
+            t.error = ""
+        self._emit_row(row)
+
+    def set_album(self, row: int, album: str) -> None:
+        """アルバム名欄を設定する（推定はしないので manual フラグは触らない）。
+
+        set_artist と同じく、書き込み済み（DONE）の行は再書き込みのため
+        確認待ちへ戻す。
+        """
+        if not (0 <= row < len(self._tracks)):
+            return
+        t = self._tracks[row]
+        t.album = album.strip()
         if t.status is Status.DONE:
             t.status = Status.PENDING
             t.error = ""
@@ -385,6 +418,8 @@ class TrackTableModel(QAbstractTableModel):
             return track.guessed_title
         if column == COL_ARTIST:
             return track.artist
+        if column == COL_ALBUM:
+            return track.album
         if column == COL_STATUS:
             return track.status.value
         if column == COL_FORMAT:
