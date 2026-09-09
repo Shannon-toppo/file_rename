@@ -7,12 +7,14 @@
 """
 import logging
 import shutil
+import subprocess
 import sys
 import threading
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QItemSelectionModel, QRect, QSettings, Qt, QThreadPool, QUrl
 from PySide6.QtGui import (
+    QAction,
     QColor,
     QDesktopServices,
     QDropEvent,
@@ -119,6 +121,37 @@ def _deno_install_hint() -> str:
     return "winget の場合: winget install DenoLand.Deno（インストール後はアプリを再起動）"
 
 
+def file_manager_name() -> str:
+    """OS 標準のファイルマネージャー名（メニュー文言用）。"""
+    if sys.platform == "darwin":
+        return "Finder"
+    if sys.platform == "win32":
+        return "エクスプローラー"
+    return "ファイルマネージャー"
+
+
+def reveal_in_file_manager(path: Path) -> bool:
+    """ファイルをファイルマネージャーで「選択した状態」で表示する。成否を返す。
+
+    親フォルダを開くだけだと、同じフォルダに似た名前の曲が並んでいるときに
+    どれか分からない。mac の `open -R` / Windows の `explorer /select,` は
+    どちらも対象ファイルを選択して開くので、それを使う（Linux 等には相当が
+    無いので親フォルダを開くだけにする）。
+    """
+    path = Path(path)
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", "-R", str(path)], check=True)
+            return True
+        if sys.platform == "win32":
+            # explorer は成功しても終了コード 1 を返すため check はしない
+            subprocess.run(["explorer", f"/select,{path}"])
+            return True
+        return bool(QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent))))
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _ffmpeg_install_hint() -> str:
     """OS 別の ffmpeg インストール案内（警告ダイアログ用）。"""
     if sys.platform == "darwin":
@@ -158,6 +191,10 @@ class MainWindow(QMainWindow):
         self._log_level: str = "WARNING"
         # LLM 接続設定の上書き（キーは core.ENV_KEYS。空文字 = .env の値を使う）
         self._llm_overrides: dict[str, str] = {}
+        # 検索（行の絞り込み）の状態。_filter_active は「今どれかの行を隠して
+        # いるか」で、隠していないときに再適用を丸ごと省くために持つ
+        self._search_text: str = ""
+        self._filter_active: bool = False
 
         self._build_ui()
         # 試聴プレーヤ（ノーマライズ・無音削除の結果確認用）。QtMultimedia の
@@ -263,15 +300,34 @@ class MainWindow(QMainWindow):
             "OFF: 「確認待ち」で止まり、確認・修正後に [選択行を書き込み] で書き込む"
         )
         bar.addWidget(self._auto_write)
+        # 再生リスト付きの動画 URL（watch?v=...&list=...）をどう扱うか。
+        # [設定] の「再生リスト付き動画 URL はリスト全体を展開する」と同じ設定を
+        # 裏返して出したもの（実行のたびに切り替えたい設定なので、ダイアログを
+        # 開かずに触れる場所に置く）。両者は _on_noplaylist_toggled /
+        # apply_settings で同期する
+        self._noplaylist_check = QCheckBox("再生リストを無視")
+        self._noplaylist_check.setChecked(not self._expand_playlist)
+        self._noplaylist_check.setToolTip(
+            "ON: watch?v=...&list=... のような再生リスト付き URL でも、"
+            "その動画 1 本だけを対象にする（既定）\n"
+            "OFF: URL に含まれる再生リスト全体を展開して処理する\n"
+            "（[設定] の「再生リスト」と同じ設定）"
+        )
+        self._noplaylist_check.toggled.connect(self._on_noplaylist_toggled)
+        bar.addWidget(self._noplaylist_check)
         bar.addStretch(1)
+        search_btn = QPushButton("検索")
+        search_btn.setToolTip("キーワードで行を絞り込む（Ctrl+F）")
+        search_btn.clicked.connect(self.open_search)
+        bar.addWidget(search_btn)
         settings_btn = QPushButton("設定")
         settings_btn.clicked.connect(self._on_settings)
         bar.addWidget(settings_btn)
         root.addLayout(bar)
 
-        # 上段の追加系ボタンと [設定] の幅を統一する（最長ラベル基準。
-        # グリッドの列幅を揃え、別レイアウトの [設定] も同じ幅にする）
-        same_width = (add_btn, list_btn, file_btn, import_btn, settings_btn)
+        # 上段の追加系ボタンと [検索]/[設定] の幅を統一する（最長ラベル基準。
+        # グリッドの列幅を揃え、別レイアウトのボタンも同じ幅にする）
+        same_width = (add_btn, list_btn, file_btn, import_btn, search_btn, settings_btn)
         width = max(b.sizeHint().width() for b in same_width)
         for b in same_width:
             b.setFixedWidth(width)
@@ -300,6 +356,37 @@ class MainWindow(QMainWindow):
         banner_lay.addWidget(self._banner_label, stretch=1)
         banner_lay.addWidget(banner_close)
         root.addWidget(self._banner)
+
+        # 検索バー（行数が多いときの絞り込み用。既定は非表示で、[検索]
+        # ボタンか Ctrl+F で開く）。一致しない行は QTableView 側で隠す
+        # （QSortFilterProxyModel を使わない理由は _apply_filter を参照）
+        self._search_bar = QWidget()
+        self._search_bar.setVisible(False)
+        search_lay = QHBoxLayout(self._search_bar)
+        search_lay.setContentsMargins(0, 0, 0, 0)
+        search_lay.addWidget(QLabel("検索:"))
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText(
+            "キーワードを入力すると一致する行だけ表示（Enter で表へ / Esc で解除）"
+        )
+        self._search_edit.setClearButtonEnabled(True)
+        self._search_edit.setToolTip(
+            "元タイトル・チャンネル・推定タイトル・アーティスト・アルバム・状態・"
+            "形式のいずれかに含まれる行を表示する（大文字小文字は区別しない）。\n"
+            "表示の絞り込みだけで、[▶ 実行] の対象は全行のまま"
+        )
+        self._search_edit.textChanged.connect(self._on_search_changed)
+        # Esc で解除 / Enter でテーブルへフォーカス（eventFilter を参照）
+        self._search_edit.installEventFilter(self)
+        search_lay.addWidget(self._search_edit, stretch=1)
+        self._search_label = QLabel("")
+        search_lay.addWidget(self._search_label)
+        search_close = QPushButton("✕")
+        search_close.setFixedWidth(28)
+        search_close.setToolTip("絞り込みを解除して検索欄を閉じる")
+        search_close.clicked.connect(self.close_search)
+        search_lay.addWidget(search_close)
+        root.addWidget(self._search_bar)
 
         # 中央: テーブル
         self._view = _DropTableView(self)
@@ -432,12 +519,27 @@ class MainWindow(QMainWindow):
         self.addAction(undo_action)
         self.addAction(redo_action)
 
+        # 検索（Ctrl+F、mac は ⌘F）。ウィンドウのアクションにしておくと
+        # テーブル・URL 欄どちらにフォーカスがあっても効く
+        find_action = QAction("検索", self)
+        find_action.setShortcut(QKeySequence.StandardKey.Find)
+        find_action.triggered.connect(self.open_search)
+        self.addAction(find_action)
+
         # undo コマンドは行番号(int)を保持するため、行の並び・構成が変わったら
         # 過去のコマンドは無効（別の行に復元されてしまう）。行削除・差し替え
         # （rowsRemoved）とソート（layoutChanged）でスタックを破棄する。
         # 末尾への行追加(rowsInserted のみ)は既存行がずれないので対象外。
         self._model.rowsRemoved.connect(lambda *_: self._clear_undo_history())
         self._model.layoutChanged.connect(lambda *_: self._clear_undo_history())
+
+        # 絞り込みは行番号で「隠す/表示する」ため、行の増減・並べ替え・内容変更で
+        # 追従させる（行内容が変わると一致・不一致も変わる）。dataChanged は
+        # DL 中に頻繁に飛ぶので、変化した行だけ評価し直す
+        self._model.rowsInserted.connect(lambda *_: self._apply_filter())
+        self._model.rowsRemoved.connect(lambda *_: self._apply_filter())
+        self._model.layoutChanged.connect(lambda *_: self._apply_filter())
+        self._model.dataChanged.connect(self._on_data_changed)
 
     def _clear_undo_history(self) -> None:
         """行の並び・構成の変化で無効になった undo 履歴を破棄する。
@@ -454,16 +556,91 @@ class MainWindow(QMainWindow):
             )
 
     def eventFilter(self, obj, event) -> bool:
-        """URL 欄の Ctrl+Enter（mac は ⌘+Enter）で [追加] を実行する。"""
+        """URL 欄と検索欄のキー操作を拾う。
+
+        - URL 欄の Ctrl+Enter（mac は ⌘+Enter）で [追加] を実行
+        - 検索欄の Esc で絞り込み解除、Enter でテーブルへフォーカス移動
+        """
+        if event.type() != QEvent.Type.KeyPress:
+            return super().eventFilter(obj, event)
+        key = event.key()
         if (
             obj is self._url_edit
-            and event.type() == QEvent.Type.KeyPress
-            and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
             and event.modifiers() & Qt.KeyboardModifier.ControlModifier
         ):
             self._on_add_urls()
             return True
+        if obj is self._search_edit:
+            if key == Qt.Key.Key_Escape:
+                self.close_search()
+                return True
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                # 絞り込んだ行をそのまま操作できるようテーブルへ移る
+                self._view.setFocus()
+                return True
         return super().eventFilter(obj, event)
+
+    # -- 検索（行の絞り込み）------------------------------------------------
+
+    def open_search(self) -> None:
+        """検索欄を開いてフォーカスする（[検索] ボタン / Ctrl+F）。"""
+        self._search_bar.setVisible(True)
+        self._search_edit.setFocus()
+        self._search_edit.selectAll()
+
+    def close_search(self) -> None:
+        """絞り込みを解除して検索欄を閉じる（✕ / Esc）。
+
+        隠したまま閉じると「行が消えた」ように見えるため、必ず解除してから
+        閉じる（clear → textChanged → _apply_filter で全行が戻る）。
+        """
+        self._search_edit.clear()
+        self._search_bar.setVisible(False)
+        self._view.setFocus()
+
+    def _on_search_changed(self, text: str) -> None:
+        self._search_text = text
+        self._apply_filter()
+
+    def _on_data_changed(self, top_left, bottom_right, roles=None) -> None:
+        """行の内容が変わったら、その行だけ絞り込みを評価し直す。"""
+        if self._filter_active or self._search_text.strip():
+            self._apply_filter(top_left.row(), bottom_right.row())
+
+    def _apply_filter(self, first: int | None = None, last: int | None = None) -> None:
+        """検索語に一致しない行を隠す（first..last 指定でその範囲だけ再評価）。
+
+        QSortFilterProxyModel は使わない。ワーカーは行を同一性(is)で探し、
+        進捗 dict を行番号で持つため、proxy の行マッピングと噛み合わない
+        （model.sort と同じ理由）。ビュー側で行を隠すだけなら行番号は一切
+        変わらないので、実行中に絞り込んでも安全。
+        """
+        active = bool(self._search_text.strip())
+        if not active and not self._filter_active:
+            return  # 何も隠していない状態が続くだけなら触らない
+        row_count = self._model.rowCount()
+        if first is None:
+            rows = range(row_count)
+        else:
+            rows = range(max(0, first), min(last, row_count - 1) + 1)
+        for row in rows:
+            self._view.setRowHidden(row, not self._model.matches(row, self._search_text))
+        self._filter_active = active
+        self._update_search_label()
+
+    def _update_search_label(self) -> None:
+        """検索欄の右側に「表示 / 全体」の件数を出す（0 件のときは明示する）。"""
+        if not self._search_text.strip():
+            self._search_label.setText("")
+            return
+        total = self._model.rowCount()
+        shown = len(self._visible_rows())
+        self._search_label.setText(f"{shown} / {total} 件" if shown else "一致なし")
+
+    def _visible_rows(self) -> list[int]:
+        """絞り込みで隠れていない行の行番号。"""
+        return [r for r in range(self._model.rowCount()) if not self._view.isRowHidden(r)]
 
     # -- 行追加系 ------------------------------------------------------------
 
@@ -892,6 +1069,16 @@ class MainWindow(QMainWindow):
             return
         self.apply_settings(dlg.values())
 
+    def _on_noplaylist_toggled(self, checked: bool) -> None:
+        """[再生リストを無視] トグル。設定ダイアログの「展開する」と表裏の値を持つ。
+
+        ダイアログを開かずに切り替えた場合もそのまま残ってほしいので、
+        ここで QSettings へ書く（キーは設定ダイアログ側と同じ）。
+        """
+        self._expand_playlist = not checked
+        if self._settings is not None:
+            self._settings.setValue("options/expand_playlist", self._expand_playlist)
+
     def apply_settings(self, values: dict) -> None:
         """設定ダイアログの値を反映し、QSettings へ保存する。"""
         out_dir = values["out_dir"]
@@ -901,6 +1088,8 @@ class MainWindow(QMainWindow):
         self._max_downloads = max(1, int(values.get("max_downloads", core.MAX_DOWNLOADS)))
         self._ytmusic_direct = bool(values.get("ytmusic_direct", True))
         self._expand_playlist = bool(values.get("expand_playlist", False))
+        # ツールバーのチェックボックスは同じ設定の裏返し。ここで揃える
+        self._noplaylist_check.setChecked(not self._expand_playlist)
         self._normalize = bool(values.get("normalize", True))
         self._loudness = float(values.get("loudness", core.NORMALIZE_TARGET_I))
         self._trim_silence = bool(values.get("trim_silence", False))
@@ -1039,7 +1228,19 @@ class MainWindow(QMainWindow):
     # -- 補助 ---------------------------------------------------------------
 
     def _selected_rows(self) -> list[int]:
-        return sorted({idx.row() for idx in self._view.selectionModel().selectedRows()})
+        """選択行の行番号（昇順）。検索で隠れている行は除く。
+
+        絞り込み中でも選択自体は残る（選択は行番号で持たれ、隠しても解除
+        されない）ため、除かないと「画面に出ていない行」まで書き込み・削除の
+        対象になってしまう。見えている行だけを操作対象にする。
+        """
+        return sorted(
+            {
+                idx.row()
+                for idx in self._view.selectionModel().selectedRows()
+                if not self._view.isRowHidden(idx.row())
+            }
+        )
 
     def _reset_cancel(self) -> threading.Event:
         self._cancel = threading.Event()
@@ -1173,7 +1374,8 @@ class MainWindow(QMainWindow):
         """
         if self._running:
             return
-        rows = self._selected_rows() or list(range(self._model.rowCount()))
+        # 未選択なら全行が対象（絞り込み中は見えている行だけ）
+        rows = self._selected_rows() or self._visible_rows()
         targets = [r for r in rows if self._model.track_at(r).channel]
         if not targets:
             self.statusBar().showMessage("チャンネル名を持つ行がありません")
@@ -1238,6 +1440,8 @@ class MainWindow(QMainWindow):
         retry = menu.addAction("エラー行を再試行待ちに戻す")
         retry.triggered.connect(self._on_reset_errors)
         menu.addSeparator()
+        reveal = menu.addAction(f"ファイルを {file_manager_name()} で開く")
+        reveal.triggered.connect(self._on_reveal_file)
         open_url = menu.addAction("URL をブラウザで開く")
         open_url.triggered.connect(self._on_open_urls)
 
@@ -1250,6 +1454,9 @@ class MainWindow(QMainWindow):
         # url を持つ選択行が 1 つでもあれば有効
         has_url = any(self._model.track_at(r).url for r in rows)
         open_url.setEnabled(has_url)
+        # ファイルを持つ選択行（DL 済み / 取り込んだローカル行）があれば有効
+        has_file = any(self._model.track_at(r).filepath is not None for r in rows)
+        reveal.setEnabled(has_file)
         return menu
 
     def _on_reset_errors(self) -> None:
@@ -1265,6 +1472,33 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"{len(rows)} 行を再試行待ちに戻しました（[▶ 実行] で再処理されます）"
             )
+
+    def _on_reveal_file(self) -> None:
+        """選択行のファイルをファイルマネージャーで表示する。
+
+        対象は選択行のうちファイルを持つ最初の 1 行（試聴の _preview_target と
+        同じ考え方）。複数行を選んだまま実行してウィンドウが選択数だけ開く、
+        という事故を避ける。
+        """
+        track = next(
+            (
+                self._model.track_at(r)
+                for r in self._selected_rows()
+                if self._model.track_at(r).filepath is not None
+            ),
+            None,
+        )
+        if track is None:
+            self.statusBar().showMessage("ファイルを持つ行が選択されていません")
+            return
+        path = Path(track.filepath)
+        if not path.exists():
+            self.statusBar().showMessage(f"ファイルが見つかりません: {path}")
+            return
+        if reveal_in_file_manager(path):
+            self.statusBar().showMessage(f"{file_manager_name()} で表示: {path.name}")
+        else:
+            self.statusBar().showMessage(f"{file_manager_name()} で開けませんでした: {path}")
 
     def _on_open_urls(self) -> None:
         """選択行の url をブラウザで開く。"""
@@ -1315,6 +1549,7 @@ class MainWindow(QMainWindow):
         expand = s.value("options/expand_playlist")
         if expand is not None:
             self._expand_playlist = _as_bool(expand)
+            self._noplaylist_check.setChecked(not self._expand_playlist)
         normalize = s.value("options/normalize")
         if normalize is not None:
             self._normalize = _as_bool(normalize)
