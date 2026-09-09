@@ -140,6 +140,14 @@ FILES_DIR = app_dir() / "files"
 SUPPORTED_EXTS = (".mp3", ".wav", ".m4a", ".opus")
 SUPPORTED_FORMATS = ("mp3", "wav", "m4a", "opus")
 BATCH_SIZE = 5
+# タイトル推定で構造化出力（OpenAI 互換の response_format=json_schema）を使うか。
+# 既定は True（スキーマで縛るほうが解析は安定する）。ただしサーバ／モデルに
+# よっては制約付きデコード下で応答が配列の 1 件目だけになり（実測: LM Studio +
+# gemma-4-e2b）、毎回 1 バッチ目を捨てて部分リトライで拾い直すぶんの往復が
+# 増える（曲名自体は mv2title のフォールバックが回収する）。その組み合わせでは
+# False にする
+# （infer_titles(use_schema=False) → extract_titles へそのまま渡る）。
+USE_SCHEMA = True
 # URL 行を同時に何本ダウンロードするか（GUI の設定で変更可）。yt-dlp は
 # 1 回の呼び出しの中では「受信 → ffmpeg 変換 → 次」を直列に回すので、行を
 # またいで並べないと変換中は回線が空く。増やしすぎると YouTube 側の制限
@@ -1374,6 +1382,7 @@ def infer_titles(
     client: LLMClient | None = None,
     batch_size: int = BATCH_SIZE,
     force: bool = False,
+    use_schema: bool = USE_SCHEMA,
 ) -> None:
     """各 Track の曲名を mv2title で推定し、guessed_title / valid を更新する。
 
@@ -1385,6 +1394,10 @@ def infer_titles(
     応答に載らなかった（曲名が空で返った）行の拾い直しは mv2title 0.4.0 が
     行う。それでも空のまま返った行は PENDING のまま error に
     EMPTY_TITLE_ERROR を載せる（空欄だけを残さないため）。
+    use_schema=False にすると構造化出力（response_format）を付けずに送る。
+    制約付きデコードで応答が 1 件目だけに打ち切られるモデルでは、これを
+    切ったほうが 1 バッチ目の捨て呼び出しと部分リトライぶんの往復が減る
+    （USE_SCHEMA 参照）。
 
     Raises:
         CoreError: 応答件数が対象件数と一致しない場合（全対象行を ERROR にした上で）。
@@ -1404,7 +1417,9 @@ def infer_titles(
         # 応答に載らなかった項目の拾い直しは mv2title 0.4.0 側で行われる
         # （bypass_check=True でも部分リトライが走る）。0.3.0 以前で動かすなら
         # 下の 1 行を戻す（_retry_missing_titles の上のコメント参照）
-        results = extract_titles(inputs, client, batch_size=batch_size, bypass_check=True)
+        results = extract_titles(
+            inputs, client, batch_size=batch_size, bypass_check=True, use_schema=use_schema
+        )
         # results = _retry_missing_titles(inputs, list(results), client, batch_size)
     except Exception as e:
         for t in targets:

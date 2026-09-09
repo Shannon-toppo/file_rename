@@ -178,6 +178,8 @@ class MainWindow(QMainWindow):
         # 設定ダイアログで変更できる動作設定（QSettings で永続化）
         self._out_dir: Path | None = None  # None = core.FILES_DIR
         self._batch_size: int = core.BATCH_SIZE
+        # 推定リクエストに構造化出力(response_format)を付けるか（既定 ON）
+        self._use_schema: bool = core.USE_SCHEMA
         self._max_downloads: int = core.MAX_DOWNLOADS  # URL 行の同時 DL 本数
         self._expand_playlist: bool = False  # 混在 URL をリスト展開するか
         self._normalize: bool = True  # DL 時に音量ノーマライズを掛けるか（既定 ON）
@@ -946,6 +948,7 @@ class MainWindow(QMainWindow):
             best_quality=self._best_quality,
             audio_bitrate=self._audio_bitrate,
             ytmusic_direct=self._ytmusic_direct,
+            use_schema=self._use_schema,
         )
         self._start(worker, "実行中...")
 
@@ -961,6 +964,7 @@ class MainWindow(QMainWindow):
             force=True,
             cancel=self._reset_cancel(),
             batch_size=self._batch_size,
+            use_schema=self._use_schema,
         )
         self._start(worker, "再推定中...")
 
@@ -1062,6 +1066,7 @@ class MainWindow(QMainWindow):
             out_dir=self._out_dir,
             fmt=self._fmt_combo.currentText(),
             batch_size=self._batch_size,
+            use_schema=self._use_schema,
             max_downloads=self._max_downloads,
             auto_write=self._auto_write.isChecked(),
             ytmusic_direct=self._ytmusic_direct,
@@ -1095,6 +1100,7 @@ class MainWindow(QMainWindow):
         # 既定の FILES_DIR と同じなら None（=core 既定）として扱う
         self._out_dir = None if out_dir == core.FILES_DIR else out_dir
         self._batch_size = int(values["batch_size"])
+        self._use_schema = bool(values.get("use_schema", core.USE_SCHEMA))
         self._max_downloads = max(1, int(values.get("max_downloads", core.MAX_DOWNLOADS)))
         self._ytmusic_direct = bool(values.get("ytmusic_direct", True))
         self._expand_playlist = bool(values.get("expand_playlist", False))
@@ -1124,6 +1130,7 @@ class MainWindow(QMainWindow):
                 "options/out_dir", str(self._out_dir) if self._out_dir else ""
             )
             self._settings.setValue("options/batch_size", self._batch_size)
+            self._settings.setValue("options/use_schema", self._use_schema)
             self._settings.setValue("options/max_downloads", self._max_downloads)
             self._settings.setValue("options/ytmusic_direct", self._ytmusic_direct)
             self._settings.setValue("options/expand_playlist", self._expand_playlist)
@@ -1555,6 +1562,9 @@ class MainWindow(QMainWindow):
                 self._batch_size = max(1, int(batch))
             except (TypeError, ValueError):
                 pass
+        use_schema = s.value("options/use_schema")
+        if use_schema is not None:
+            self._use_schema = _as_bool(use_schema)
         max_dl = s.value("options/max_downloads")
         if max_dl is not None:
             try:
