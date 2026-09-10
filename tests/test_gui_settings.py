@@ -25,6 +25,70 @@ def main_window(qtbot):
 
 
 # ---------------------------------------------------------------------------
+# 所有権（終了時クラッシュの再発防止）
+# ---------------------------------------------------------------------------
+
+
+def _python_owned_children(root):
+    """C++ の親が付いているのに Python 所有のままの子ウィジェット。
+
+    こうした部品は終了時に PySide の後始末と親の両方から delete され得て、
+    macOS で SIGSEGV した（QFormLayout.addRow(QLayout) が所有権を移さない）。
+
+    列挙に findChildren は使えない: PySide の findChildren は返す子を親へ
+    紐付け直す（所有権を移す）副作用があり、調べた時点で直ってしまう。
+    gc から既存のラッパーを拾い、parent() を辿って root の子孫か判定する。
+    """
+    import gc
+
+    import shiboken6
+    from PySide6.QtWidgets import QWidget
+
+    def under_root(w):
+        p = w.parent()
+        while p is not None:
+            if p is root:
+                return True
+            p = p.parent()
+        return False
+
+    return [
+        f"{type(w).__name__} {getattr(w, 'text', lambda: '')()!r}"
+        for w in gc.get_objects()
+        if isinstance(w, QWidget)
+        and shiboken6.isValid(w)
+        and shiboken6.ownedByPython(w)
+        and under_root(w)
+    ]
+
+
+def test_settings_dialog_children_are_cpp_owned(qtbot):
+    from PySide6.QtWidgets import QWidget
+
+    # 親付きで作る（_on_settings と同じ）。親なしだと addRow(QLayout) の
+    # 部品も Python 所有にならず、この検査をすり抜けていた
+    parent = QWidget()
+    qtbot.addWidget(parent)
+    dlg = SettingsDialog(parent)
+    assert _python_owned_children(dlg) == []
+
+
+def test_main_window_children_are_cpp_owned(main_window):
+    assert _python_owned_children(main_window) == []
+
+
+def test_on_settings_deletes_dialog(main_window, monkeypatch):
+    """設定ダイアログは閉じたら破棄する（窓の子として溜め込まない）。"""
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    monkeypatch.setattr(SettingsDialog, "exec", lambda self: 0)
+    main_window._on_settings()
+    main_window._on_settings()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    assert main_window.findChildren(SettingsDialog) == []
+
+
+# ---------------------------------------------------------------------------
 # SettingsDialog
 # ---------------------------------------------------------------------------
 

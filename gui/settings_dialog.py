@@ -47,6 +47,22 @@ THEMES = (
 )
 
 
+def _row_widget() -> tuple[QWidget, QHBoxLayout]:
+    """フォームの 1 行に横並びの部品を置くための入れ物（QWidget + 横レイアウト）。
+
+    QFormLayout.addRow(QLayout) は使わない: PySide6 はこの形で渡したレイアウト
+    内の部品の所有権を移さず、C++ 側の親が付いたまま Python 所有で残る。
+    すると終了時に PySide の後始末（destroyQCoreApplication）が親より先に
+    その部品を delete し得て、親側の delete と二重解放になり macOS で
+    SIGSEGV した（QPushButtonWrapper::~ で落ちるクラッシュレポート）。
+    先に親付きのレイアウトを作ってから部品を足せば、通常どおり C++ 所有になる。
+    """
+    container = QWidget()
+    row = QHBoxLayout(container)
+    row.setContentsMargins(0, 0, 0, 0)
+    return container, row
+
+
 class SettingsDialog(QDialog):
     """GUI の動作設定を編集するモーダルダイアログ。values() で結果を取り出す。"""
 
@@ -88,13 +104,13 @@ class SettingsDialog(QDialog):
         audio_form = self._add_page("音質・加工")
 
         # 保存先フォルダ（参照ボタン付き）
-        dir_row = QHBoxLayout()
+        dir_box, dir_row = _row_widget()
         self._dir_edit = QLineEdit(str(out_dir if out_dir is not None else core.FILES_DIR))
         browse = QPushButton("参照...")
         browse.clicked.connect(self._on_browse)
         dir_row.addWidget(self._dir_edit, stretch=1)
         dir_row.addWidget(browse)
-        form.addRow("保存先フォルダ", dir_row)
+        form.addRow("保存先フォルダ", dir_box)
 
         # 既定形式
         self._fmt_combo = QComboBox()
@@ -284,14 +300,14 @@ class SettingsDialog(QDialog):
         llm_form.addRow(info)
 
         # 接続テスト
-        test_row = QHBoxLayout()
+        test_box, test_row = _row_widget()
         test_btn = QPushButton("接続テスト")
         test_btn.clicked.connect(self._on_test_connection)
         self._test_result = QLabel("")
         self._test_result.setWordWrap(True)
         test_row.addWidget(test_btn)
         test_row.addWidget(self._test_result, stretch=1)
-        llm_form.addRow(test_row)
+        llm_form.addRow(test_box)
 
         self._build_ytdlp_page(self._add_page("yt-dlp"))
 
@@ -394,7 +410,7 @@ class SettingsDialog(QDialog):
         self._ytdlp_version_label.setWordWrap(True)
         form.addRow("バージョン", self._ytdlp_version_label)
 
-        row = QHBoxLayout()
+        box, row = _row_widget()
         self._ytdlp_check_btn = QPushButton("更新を確認")
         self._ytdlp_check_btn.clicked.connect(lambda: self._start_ytdlp_job(check_only=True))
         self._ytdlp_update_btn = QPushButton("更新")
@@ -404,7 +420,7 @@ class SettingsDialog(QDialog):
         row.addWidget(self._ytdlp_check_btn)
         row.addWidget(self._ytdlp_update_btn)
         row.addWidget(self._ytdlp_status, stretch=1)
-        form.addRow(row)
+        form.addRow(box)
 
         note = QLabel(
             "yt-dlp はダウンロードを実行する部品です。"

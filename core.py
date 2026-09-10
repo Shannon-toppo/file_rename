@@ -8,6 +8,7 @@
 （Config.from_env() が読む前に載せておく必要があるため）。
 新しいスクリプトでも env 設定を重複させず、このモジュールを import すること。
 """
+import dataclasses
 import logging
 import json
 import os
@@ -288,6 +289,10 @@ class CoreError(Exception):
     """パイプラインの継続不能なエラー（件数不一致など）。"""
 
 
+class ModelMismatchError(CoreError):
+    """指定したモデルとは別のモデルが応答した（サーバー側の差し替え）。"""
+
+
 class Status(Enum):
     """Track の状態。value は GUI の状態列にそのまま表示する。"""
 
@@ -440,17 +445,34 @@ def read_url_list(path: Path) -> list[str]:
 
 
 def make_client() -> LLMClient:
-    """接続設定（.env / GUI の上書き済み環境変数）で LLMClient を作る。"""
-    return LLMClient(Config.from_env())
+    """接続設定（.env / GUI の上書き済み環境変数）で LLMClient を作る。
+
+    MODEL はサーバーの /models にある完全な id へ解決してから使い
+    （resolve_model）、指定と違うモデルが応答したら止めるクライアントを返す
+    （_ModelCheckedClient）。LM Studio は一覧の id と完全一致しない名前を
+    受けると、エラーにせずロード中の別モデルで黙って答えるため。実測:
+    e4b をロード中に "gemma-4-e2b" を指定 → google/gemma-4-e4b が応答、
+    "google/gemma-4-e2b" を指定 → e2b が JIT ロードされて応答した。
+    """
+    config = Config.from_env()
+    try:
+        ids = _fetch_model_ids(config, timeout=3.0)
+    except CoreError:
+        ids = []  # 一覧が取れなければ解決しない（失敗理由は推論の呼び出しで出る）
+    model = resolve_model(config.model or "", ids)
+    if model and model != config.model:
+        config = dataclasses.replace(config, model=model)
+    return _ModelCheckedClient(config)
 
 
 def _model_aliases(model_id: str) -> set[str]:
-    """LM Studio が同一モデルとして解決する表記ゆれを列挙する。
+    """モデル名の表記ゆれ（publisher 有無・量子化サフィックス・大小文字）を列挙する。
 
     /models が返す id は publisher 付き（例: "google/gemma-4-e2b"）だが、
-    LM Studio は publisher を省いた "gemma-4-e2b" や量子化サフィックス付きの
-    "...@q4_k_m" でも同じモデルに解決する。素朴な完全一致で比べると、
-    実際には推論できる設定でも「一覧にありません」と誤警告になる。
+    LM Studio の画面や設定では publisher を省いた "gemma-4-e2b" と書かれる。
+    これは「同じモデルを指しているか」を比べるためのもので、サーバーへ送る
+    名前には使わない: LM Studio は省略形を同じモデルに解決するとは限らず、
+    別のモデルがロード中だとそちらで答える（make_client 参照）。
     """
     base = model_id.strip().lower().split("@", 1)[0]
     aliases = {base}
@@ -459,23 +481,64 @@ def _model_aliases(model_id: str) -> set[str]:
     return {a for a in aliases if a}
 
 
-def check_connection(timeout: float = 3.0) -> tuple[bool, str]:
-    """LLM エンドポイントの疎通を確認する（補完呼び出しはしない軽量チェック）。
+def resolve_model(model: str, server_ids: Sequence[str]) -> str:
+    """設定のモデル名を、サーバーの一覧にある完全な id へ解決する。
 
-    OpenAI 互換の GET {base_url}/models を短い timeout で叩く。
-    LLM の推論を伴わないため、サーバの生死確認としては十分軽い。
+    大小文字違いを除いた完全一致を最優先し、無ければ表記ゆれ（_model_aliases）
+    で一致する id が 1 つだけのときにそれを返す。候補が複数（量子化違いが
+    並んでいる等）や一覧に無いときは決めつけず、指定をそのまま返す。
+    """
+    wanted = model.strip()
+    for sid in server_ids:
+        if sid.lower() == wanted.lower():
+            return sid
+    aliases = _model_aliases(wanted)
+    matches = [sid for sid in server_ids if _model_aliases(sid) & aliases]
+    return matches[0] if len(matches) == 1 else wanted
+
+
+class _ModelCheckedClient(LLMClient):
+    """応答の model 欄を確かめ、指定と違うモデルが答えたら止める LLMClient。
+
+    resolve_model で解決できなかった名前（一覧に無い・候補が複数）でも、
+    サーバーが黙って別のモデルで推論した結果をタイトルとして使わないための
+    最後の砦。一度不一致を見たら以降はリクエストを送らずに同じ例外を投げる:
+    mv2title は送信時の例外を構造化出力の拒否とみなしてプレーンで再送する
+    ため、そのままだと違うモデルでもう一度推論させてしまう。
+    """
+
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        self._mismatch: ModelMismatchError | None = None
+
+    def send_message(self, prompt, system_prompt=None, model_name=None, **kwargs):
+        if self._mismatch is not None:
+            raise self._mismatch
+        res = super().send_message(prompt, system_prompt, model_name, **kwargs)
+        requested = model_name if model_name is not None else self.config.model
+        answered = getattr(res, "model", None)
+        if isinstance(answered, str) and answered and requested:
+            if not (_model_aliases(requested) & _model_aliases(answered)):
+                self._mismatch = ModelMismatchError(
+                    f"指定したモデル '{requested}' ではなく '{answered}' が応答しました"
+                    "（サーバーが別のモデルに差し替えています）。"
+                    f"LM Studio で '{requested}' をロードするか、[設定] の MODEL を"
+                    "サーバーのモデル一覧にある名前にしてください。"
+                )
+                raise self._mismatch
+        return res
+
+
+def _fetch_model_ids(config: Config, timeout: float) -> list[str]:
+    """GET {base_url}/models でサーバーのモデル id 一覧を取る。
+
     ステータスコードだけでは判定しない: LM Studio は存在しないパスにも
     HTTP 200 でエラー JSON を返すため（例: BASE_URL の /v1 抜け）、
     ボディが /models 応答の形（"data" リスト）であることまで確認する。
 
-    Returns:
-        (成功可否, 人間向けメッセージ)。例外は投げず、失敗理由を文字列で返す。
+    Raises:
+        CoreError: 接続できない・エラー応答・/models 形式でない（文言は利用者向け）。
     """
-    try:
-        config = Config.from_env()
-    except ValueError as e:
-        # BASE_URL 未設定
-        return False, str(e)
     url = config.base_url.rstrip("/") + "/models"
     req = urllib.request.Request(
         url,
@@ -485,32 +548,57 @@ def check_connection(timeout: float = 3.0) -> tuple[bool, str]:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status = getattr(resp, "status", 200)
             if not 200 <= status < 300:
-                return False, f"エンドポイントがエラーを返しました (HTTP {status})"
+                raise CoreError(f"エンドポイントがエラーを返しました (HTTP {status})")
             body = resp.read(65536)
+    except CoreError:
+        raise
     except Exception as e:
-        return False, f"接続できません ({config.base_url}): {e}"
+        raise CoreError(f"接続できません ({config.base_url}): {e}") from e
     try:
         payload = json.loads(body)
     except ValueError:
         payload = None
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-        return False, (
+        raise CoreError(
             f"応答が OpenAI 互換の /models 形式ではありません ({url})。"
             "BASE_URL のパス（例: 末尾の /v1）が正しいか確認してください。"
         )
-    # 使用するモデル名がサーバーの一覧に無ければ注意を添える。MODEL 未設定の
-    # まま既定値で推論だけ失敗する事故に気付けるように。比較は _model_aliases
-    # 経由（publisher 省略・量子化サフィックスの表記ゆれを吸収）。それでも
-    # LM Studio 側で解決できることはあるため、NG（接続失敗）にはしない
-    ids: set[str] = set()
-    for m in payload["data"]:
-        if isinstance(m, dict) and isinstance(m.get("id"), str):
-            ids |= _model_aliases(m["id"])
-    if ids and not (_model_aliases(config.model or "") & ids):
+    return [
+        m["id"] for m in payload["data"] if isinstance(m, dict) and isinstance(m.get("id"), str)
+    ]
+
+
+def check_connection(timeout: float = 3.0) -> tuple[bool, str]:
+    """LLM エンドポイントの疎通を確認する（補完呼び出しはしない軽量チェック）。
+
+    OpenAI 互換の GET {base_url}/models を短い timeout で叩く（_fetch_model_ids）。
+    LLM の推論を伴わないため、サーバの生死確認としては十分軽い。
+
+    Returns:
+        (成功可否, 人間向けメッセージ)。例外は投げず、失敗理由を文字列で返す。
+    """
+    try:
+        config = Config.from_env()
+    except ValueError as e:
+        # BASE_URL 未設定
+        return False, str(e)
+    try:
+        ids = _fetch_model_ids(config, timeout)
+    except CoreError as e:
+        return False, str(e)
+    # 使用するモデル名がサーバーの一覧に無ければ注意を添える（MODEL 未設定の
+    # まま既定値になっている事故などに気付けるように）。LM Studio はその場合
+    # ロード中の別モデルで答えようとし、推論は _ModelCheckedClient が止める。
+    # 一覧に無くても通るサーバーはあり得るので NG（接続失敗）にはしない
+    model = config.model or ""
+    if ids and not any(_model_aliases(model) & _model_aliases(i) for i in ids):
         return True, (
-            f"接続 OK: {config.base_url}（注意: モデル '{config.model}' は"
-            "サーバーのモデル一覧にありません。[設定] の MODEL を確認してください）"
+            f"接続 OK: {config.base_url}（注意: モデル '{model}' は"
+            "サーバーのモデル一覧にありません。[設定] の MODEL を一覧にある名前にしてください）"
         )
+    resolved = resolve_model(model, ids)
+    if resolved != model:
+        return True, f"接続 OK: {config.base_url}（モデル: {model} → {resolved}）"
     return True, f"接続 OK: {config.base_url}"
 
 

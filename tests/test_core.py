@@ -1570,3 +1570,112 @@ def test_check_connection_no_baseurl(monkeypatch):
     ok, msg = core.check_connection()
     assert not ok
     assert "BASE_URL" in msg
+
+
+def test_check_connection_shows_resolved_model(monkeypatch):
+    """publisher 省略の MODEL は、一覧の完全な id に解決して使うことを表示する。"""
+    _fake_config(monkeypatch, model="gemma-4-e2b")
+    _fake_urlopen(
+        monkeypatch, b'{"data": [{"id": "google/gemma-4-e4b"}, {"id": "google/gemma-4-e2b"}]}'
+    )
+    ok, msg = core.check_connection()
+    assert ok
+    assert "gemma-4-e2b → google/gemma-4-e2b" in msg
+    assert "注意" not in msg
+
+
+# ---------------------------------------------------------------------------
+# モデル名の解決と応答モデルの確認
+# （LM Studio は一覧と完全一致しない名前だとロード中の別モデルで黙って答える）
+# ---------------------------------------------------------------------------
+
+_SERVER_IDS = ["google/gemma-4-e4b", "google/gemma-4-e2b", "hy-mt2-1.8b@bf16", "hy-mt2-1.8b@8bit"]
+_SERVER_BODY = (
+    b'{"data": [{"id": "google/gemma-4-e4b"}, {"id": "google/gemma-4-e2b"},'
+    b' {"id": "hy-mt2-1.8b@bf16"}, {"id": "hy-mt2-1.8b@8bit"}]}'
+)
+
+
+@pytest.mark.parametrize(
+    "model, expected",
+    [
+        ("gemma-4-e2b", "google/gemma-4-e2b"),  # publisher 省略 → 完全な id
+        ("Gemma-4-E2B", "google/gemma-4-e2b"),  # 大小文字の揺れ
+        ("google/gemma-4-e2b", "google/gemma-4-e2b"),  # 完全一致
+        ("hy-mt2-1.8b@8bit", "hy-mt2-1.8b@8bit"),  # 完全一致は量子化違いより優先
+        ("hy-mt2-1.8b", "hy-mt2-1.8b"),  # 候補が複数なら決めつけない
+        ("gemma-4-e2b-it", "gemma-4-e2b-it"),  # 一覧に無ければそのまま
+    ],
+)
+def test_resolve_model(model, expected):
+    assert core.resolve_model(model, _SERVER_IDS) == expected
+
+
+def test_resolve_model_without_list():
+    assert core.resolve_model("gemma-4-e2b", []) == "gemma-4-e2b"
+
+
+def test_make_client_resolves_model(monkeypatch):
+    monkeypatch.setenv("BASE_URL", "http://127.0.0.1:1234/v1/")
+    monkeypatch.setenv("MODEL", "gemma-4-e2b")
+    _fake_urlopen(monkeypatch, _SERVER_BODY)
+    client = core.make_client()
+    assert client.config.model == "google/gemma-4-e2b"
+    assert isinstance(client, core._ModelCheckedClient)
+
+
+def test_make_client_keeps_model_when_list_unavailable(monkeypatch):
+    monkeypatch.setenv("BASE_URL", "http://127.0.0.1:1234/v1/")
+    monkeypatch.setenv("MODEL", "gemma-4-e2b")
+
+    def boom(req, timeout=0):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    assert core.make_client().config.model == "gemma-4-e2b"
+
+
+def _checked_client(monkeypatch, answered, model="google/gemma-4-e2b"):
+    """応答の model 欄が answered になる _ModelCheckedClient と、送信の記録。"""
+    sent = []
+
+    def fake_send(self, prompt, system_prompt=None, model_name=None, **kwargs):
+        sent.append(kwargs)
+        message = types.SimpleNamespace(content='{"results": [{"id": 1, "title": "Song"}]}')
+        return types.SimpleNamespace(
+            model=answered, choices=[types.SimpleNamespace(message=message)]
+        )
+
+    monkeypatch.setattr(core.LLMClient, "send_message", fake_send)
+    config = core.Config(base_url="http://127.0.0.1:1234/v1/", model=model)
+    return core._ModelCheckedClient(config), sent
+
+
+def test_checked_client_rejects_substituted_model(monkeypatch):
+    client, sent = _checked_client(monkeypatch, answered="google/gemma-4-e4b")
+    with pytest.raises(core.ModelMismatchError) as exc:
+        client.send_message("p")
+    assert "google/gemma-4-e2b" in str(exc.value) and "google/gemma-4-e4b" in str(exc.value)
+    # 2 回目以降は送らずに同じ理由で止める（違うモデルで推論させない）
+    with pytest.raises(core.ModelMismatchError):
+        client.send_message("p")
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize("answered", ["google/gemma-4-e2b", "gemma-4-e2b", None, ""])
+def test_checked_client_accepts_same_model(monkeypatch, answered):
+    """表記ゆれの範囲の一致と、model 欄を返さないサーバーは通す。"""
+    client, sent = _checked_client(monkeypatch, answered=answered)
+    client.send_message("p")
+    assert len(sent) == 1
+
+
+def test_infer_titles_errors_on_substituted_model(monkeypatch):
+    """違うモデルが答えたら行を ERROR にし、mv2title の再送でも推論させない。"""
+    client, sent = _checked_client(monkeypatch, answered="google/gemma-4-e4b")
+    tracks = [Track(stem="MIMI『 Pale 』feat. 初音ミク")]
+    with pytest.raises(core.ModelMismatchError):
+        core.infer_titles(tracks, client=client)
+    assert tracks[0].status == Status.ERROR
+    assert "google/gemma-4-e4b" in tracks[0].error
+    assert len(sent) == 1

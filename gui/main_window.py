@@ -1395,9 +1395,14 @@ class MainWindow(QMainWindow):
             log_level=self._log_level,
             llm_overrides=dict(self._llm_overrides),
         )
-        if not dlg.exec():
-            return
-        self.apply_settings(dlg.values())
+        # 親（self）付きで作るため、放っておくと開くたびにダイアログが
+        # 窓の子として溜まり、終了時の後始末まで生き残る。使い終えたら消す
+        try:
+            if not dlg.exec():
+                return
+            self.apply_settings(dlg.values())
+        finally:
+            dlg.deleteLater()
 
     def _on_noplaylist_toggled(self, checked: bool) -> None:
         """[再生リストを無視] トグル。設定ダイアログの「展開する」と表裏の値を持つ。
