@@ -21,7 +21,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -29,6 +28,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -77,19 +77,15 @@ class SettingsDialog(QDialog):
         # 保存先パスや BASE_URL が途中で切れない程度の最小幅を確保する
         self.setMinimumWidth(560)
 
-        # 項目が多いので QGroupBox で「ダウンロード」「タイトル推定 (LLM)」
-        # 「表示」の 3 グループに分ける（ウィジェット名・values() は従来のまま）。
-        # 全部を直接並べると縦に長くなり、画面の低いノート PC では OK /
-        # キャンセルが画面外へ出て押せなくなるため、グループ群はスクロール領域
-        # に入れ、ボタン行だけを常に下端へ固定する。
-        content = QWidget()
-        root = QVBoxLayout(content)
-        root.setContentsMargins(0, 0, 0, 0)
-        dl_group = QGroupBox("ダウンロード")
-        form = QFormLayout(dl_group)
-        # mac スタイルの既定はフィールドを sizeHint 幅のまま中央寄せするため、
-        # パスや URL の欄が狭く切れる。行いっぱいまで伸ばす
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        # 項目別のタブに分ける（ウィジェット名・values() は従来のまま）。
+        # 1 枚に並べると縦に長くなり、目当ての項目を探しにくいうえ、画面の
+        # 低いノート PC では OK / キャンセルが画面外へ出て押せなくなった。
+        # 各タブのページはスクロール領域に入れ（_add_page）、ボタン行はタブの
+        # 外で常に下端へ固定する。タブの並びは addTab 順 = ここで作る順
+        self._tabs = QTabWidget()
+        self._pages: list[QWidget] = []  # 各ページの中身（_resize_to_screen 用）
+        form = self._add_page("ダウンロード")
+        audio_form = self._add_page("音質・加工")
 
         # 保存先フォルダ（参照ボタン付き）
         dir_row = QHBoxLayout()
@@ -121,7 +117,7 @@ class SettingsDialog(QDialog):
             "OFF: yt-dlp の bestaudio 任せ（既定）\n"
             "YouTube はどちらでも opus 約 130kbps になることが多い。"
         )
-        form.addRow("取得品質", self._best_quality_check)
+        audio_form.addRow("取得品質", self._best_quality_check)
 
         # 変換（再エンコード）後のビットレート
         self._bitrate_combo = QComboBox()
@@ -142,7 +138,7 @@ class SettingsDialog(QDialog):
             "「取得元と同じ」は動画ごとの実測値をそのまま目標にする。\n"
             "wav は非圧縮なのでこの設定は効かない。"
         )
-        form.addRow("変換ビットレート", self._bitrate_combo)
+        audio_form.addRow("変換ビットレート", self._bitrate_combo)
 
         # 同時ダウンロード数（URL 行を何本まで並列に落とすか）
         self._max_dl_spin = QSpinBox()
@@ -175,7 +171,7 @@ class SettingsDialog(QDialog):
             "ON: ffmpeg の loudnorm で音量を EBU R128 相当へ揃える（既定）\n"
             "OFF: 元の音量のまま変換する"
         )
-        form.addRow("音量ノーマライズ", self._normalize_check)
+        audio_form.addRow("音量ノーマライズ", self._normalize_check)
 
         # ノーマライズの基準値（loudnorm の統合ラウドネス I。TP / LRA は固定）
         self._loudness_spin = QDoubleSpinBox()
@@ -191,7 +187,7 @@ class SettingsDialog(QDialog):
         # ノーマライズ OFF のときは編集不可にする（値自体は保持）
         self._loudness_spin.setEnabled(self._normalize_check.isChecked())
         self._normalize_check.toggled.connect(self._loudness_spin.setEnabled)
-        form.addRow("ノーマライズ基準値", self._loudness_spin)
+        audio_form.addRow("ノーマライズ基準値", self._loudness_spin)
 
         # 末尾の無音削除（試験的。DL 時の変換にのみ適用）
         self._trim_check = QCheckBox("末尾の無音区間を削除する（試験的）")
@@ -201,24 +197,22 @@ class SettingsDialog(QDialog):
             "-50dB 以下だけを無音とみなし、1 秒は残す保守的な設定\n"
             "（フェードアウトや余韻など音楽本体は削らない）。"
         )
-        form.addRow("無音削除", self._trim_check)
-        root.addWidget(dl_group)
+        audio_form.addRow("無音削除", self._trim_check)
 
-        root.addWidget(self._build_ytdlp_group())
-
-        # 推定と接続設定（.env を既定とし、ここで上書きできる。空欄 = .env の値）
-        llm_group = QGroupBox("タイトル推定 (LLM)")
+        # タイトル推定の動作と、LLM の接続設定（.env を既定とし、ここで上書き
+        # できる。空欄 = .env の値）は別タブ。接続設定は初回に一度触るだけの
+        # 項目なので、日常的に切り替える推定の設定と混ぜない
+        infer_form = self._add_page("タイトル推定")
+        llm_form = self._add_page("LLM 接続")
         llm = dict(llm_overrides or {})
         defaults = core.env_defaults()
         env_file = core.find_env_file()
-        llm_form = QFormLayout(llm_group)
-        llm_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         # バッチサイズ（1 回の LLM リクエストに含めるタイトル数）
         self._batch_spin = QSpinBox()
         self._batch_spin.setRange(1, 50)
         self._batch_spin.setValue(batch_size)
-        llm_form.addRow("推定バッチサイズ", self._batch_spin)
+        infer_form.addRow("推定バッチサイズ", self._batch_spin)
 
         # 構造化出力（response_format=json_schema）。既定は ON
         self._schema_check = QCheckBox("構造化出力 (JSON スキーマ) を使う")
@@ -231,12 +225,12 @@ class SettingsDialog(QDialog):
             "1 バッチ目が毎回無駄になり往復が増えるので、\n"
             "その組み合わせでは OFF にしてください。"
         )
-        llm_form.addRow("構造化出力", self._schema_check)
+        infer_form.addRow("構造化出力", self._schema_check)
 
         # 自動書き込みの既定値
         self._auto_check = QCheckBox("起動時に自動書き込みを ON にする")
         self._auto_check.setChecked(auto_write)
-        llm_form.addRow("自動書き込み", self._auto_check)
+        infer_form.addRow("自動書き込み", self._auto_check)
 
         # YouTube Music は曲名がメタデータで確定しているので推定を挟まない
         self._ytmusic_check = QCheckBox("YouTube Music は推定せず曲名をそのまま使う")
@@ -248,7 +242,7 @@ class SettingsDialog(QDialog):
             "問い合わせます（例: 動画『 Pale 』feat. 初音ミク → 曲名 Pale）。\n"
             "行をクリア（Delete）すれば通常どおり推定し直せます。"
         )
-        llm_form.addRow("YouTube Music", self._ytmusic_check)
+        infer_form.addRow("YouTube Music", self._ytmusic_check)
 
         def _placeholder(key: str, secret: bool = False) -> str:
             value = defaults.get(key)
@@ -298,11 +292,11 @@ class SettingsDialog(QDialog):
         test_row.addWidget(test_btn)
         test_row.addWidget(self._test_result, stretch=1)
         llm_form.addRow(test_row)
-        root.addWidget(llm_group)
+
+        self._build_ytdlp_page(self._add_page("yt-dlp"))
 
         # 表示（アプリ全体の見た目とログ出力）
-        view_group = QGroupBox("表示")
-        view_form = QFormLayout(view_group)
+        view_form = self._add_page("表示")
 
         # テーマ（アプリ全体の配色。既定は OS のテーマに追従）
         self._theme_combo = QComboBox()
@@ -325,16 +319,6 @@ class SettingsDialog(QDialog):
             "「詳細（すべて）」は yt-dlp の進捗行も流れるため流量が多い。"
         )
         view_form.addRow("ログレベル", self._log_level_combo)
-        root.addWidget(view_group)
-
-        # 中身が短いときにグループが間延びしないよう、余白は下に寄せる
-        root.addStretch(1)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)  # 幅は追従、縦だけスクロール
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setWidget(content)
 
         self._buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -343,37 +327,69 @@ class SettingsDialog(QDialog):
         self._buttons.rejected.connect(self.reject)
 
         outer = QVBoxLayout(self)
-        outer.addWidget(scroll, stretch=1)
+        outer.addWidget(self._tabs, stretch=1)
         outer.addWidget(self._buttons)
-        # 縦に縮められるようにする（スクロール領域の最小高さは中身に引きずられる）
-        scroll.setMinimumHeight(200)
+        # 縦に縮められるようにする（低い画面ではページ側がスクロールする）
+        self._tabs.setMinimumHeight(200)
         self.setSizeGripEnabled(True)
-        self._resize_to_screen(content)
+        self._resize_to_screen()
 
-    def _resize_to_screen(self, content: QWidget) -> None:
-        """中身が入りきる高さで開く。ただし画面からはみ出さない大きさに抑える。"""
+    def _add_page(self, title: str) -> QFormLayout:
+        """タブを 1 枚足し、その中身のフォームを返す。
+
+        ページはスクロール領域に入れる（画面が低くても OK / キャンセルを
+        押せるように。幅は追従、縦だけスクロール）。
+        """
+        content = QWidget()
+        form = QFormLayout(content)
+        # mac スタイルの既定はフィールドを sizeHint 幅のまま中央寄せするため、
+        # パスや URL の欄が狭く切れる。行いっぱいまで伸ばす
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        # mac の既定はフォーム全体も中央寄せで、項目の短いタブ（表示など）
+        # だけ左端が右へずれ、タブを切り替えるたびに位置が揺れて見える
+        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        # setWidget は中身の背景を塗る設定にするため、タブ面の色と食い違って
+        # 四角く浮いて見える。スクロール領域ごと透過させてタブ面を見せる
+        content.setAutoFillBackground(False)
+        scroll.viewport().setAutoFillBackground(False)
+        self._tabs.addTab(scroll, title)
+        self._pages.append(content)
+        return form
+
+    def _resize_to_screen(self) -> None:
+        """一番背の高いタブが入りきる高さで開く。ただし画面からはみ出さない。
+
+        タブを切り替えるたびに窓の大きさが変わらないよう、全ページの最大に
+        合わせる。
+        """
         screen = self.screen() or QGuiApplication.primaryScreen()
         available = screen.availableGeometry().height() if screen is not None else 800
-        # 中身 + ボタン行 + 余白。画面の 85% を超えたらスクロールに任せる
-        wanted = content.sizeHint().height() + self._buttons.sizeHint().height() + 48
+        # 中身 + タブの見出し + ボタン行 + 余白。画面の 85% を超えたらスクロールに任せる
+        wanted = (
+            max(page.sizeHint().height() for page in self._pages)
+            + self._tabs.tabBar().sizeHint().height()
+            + self._buttons.sizeHint().height()
+            + 64
+        )
         self.resize(
             max(self.minimumWidth(), self.sizeHint().width()),
-            max(360, min(wanted, int(available * 0.85))),
+            max(320, min(wanted, int(available * 0.85))),
         )
 
     # -- yt-dlp -------------------------------------------------------------
 
-    def _build_ytdlp_group(self) -> QGroupBox:
-        """yt-dlp のバージョン表示と更新操作のグループを作る。
+    def _build_ytdlp_page(self, form: QFormLayout) -> None:
+        """yt-dlp タブ（バージョン表示と更新操作）の中身を作る。
 
         yt-dlp は exe に同梱せず実行時に取得する（ytdlp_runtime 参照）ため、
         利用者が版を確認して更新できる口をここに置く。取得は通信を伴うので
         ワーカースレッドへ逃がし、実行中はボタンを無効化する。
         """
-        group = QGroupBox("yt-dlp（ダウンロード実行部）")
-        form = QFormLayout(group)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-
         self._ytdlp_version_label = QLabel("")
         self._ytdlp_version_label.setWordWrap(True)
         form.addRow("バージョン", self._ytdlp_version_label)
@@ -391,6 +407,7 @@ class SettingsDialog(QDialog):
         form.addRow(row)
 
         note = QLabel(
+            "yt-dlp はダウンロードを実行する部品です。"
             "YouTube の仕様変更でダウンロードが失敗するようになったら、ここから更新してください"
             f"（保存先: {ytdlp_runtime.runtime_root()}）。"
             "\nEJS は YouTube の制限を解除するスクリプトで、本体と対になる版を一緒に取得します。"
@@ -399,7 +416,6 @@ class SettingsDialog(QDialog):
         form.addRow(note)
 
         self._refresh_ytdlp_version()
-        return group
 
     def _refresh_ytdlp_version(self) -> None:
         """本体と EJS の版を 1 行で出す。

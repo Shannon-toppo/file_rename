@@ -10,6 +10,8 @@ from PySide6.QtGui import QColor
 
 from core import Status, Track
 
+from .textmatch import compile_pattern, has_match
+
 # カラム定義（順序が表示順）
 COL_STEM = 0  # 元タイトル（ファイル名 stem / URL）
 COL_CHANNEL = 1  # チャンネル
@@ -386,30 +388,37 @@ class TrackTableModel(QAbstractTableModel):
 
     # -- 検索（行の絞り込み）------------------------------------------------
 
-    def row_text(self, row: int) -> str:
-        """行の全列の表示文字列を連結して返す（検索対象の文字列）。
+    def cell_texts(self, row: int) -> list[str]:
+        """行の各列の表示文字列（検索対象の文字列）。
 
         列ごとに検索対象を選ばず表示中のテキストをそのまま使う。見えている
         文字列で引っ掛かるのが利用者の期待に一番近く、状態（「エラー」等）や
         エラー文言・形式も同じ仕組みで検索できるため。
         """
         if not (0 <= row < len(self._tracks)):
-            return ""
+            return []
         track = self._tracks[row]
-        return " ".join(
-            str(self._display(row, track, col) or "") for col in range(self.columnCount())
-        )
+        return [str(self._display(row, track, col) or "") for col in range(self.columnCount())]
 
-    def matches(self, row: int, query: str) -> bool:
+    def row_text(self, row: int) -> str:
+        """行の全列の表示文字列を連結して返す。"""
+        return " ".join(self.cell_texts(row))
+
+    def matches(
+        self, row: int, query: str, *, wildcard: bool = False, case_sensitive: bool = False
+    ) -> bool:
         """行が検索語に一致するか。空の検索語はすべて一致（＝絞り込み無し）。
 
-        大文字小文字は無視する（casefold）。かなカナや全角半角の正規化は
-        しない（過剰な一致より、打った文字どおりに絞れるほうを採る）。
+        一致はセル（列）単位で見る。連結した行文字列に当てるとワイルドカード
+        「a*b」が列の境目をまたいで一致してしまうため。記法は
+        gui/textmatch.py を参照。大文字小文字は既定で無視する。かなカナや
+        全角半角の正規化はしない（過剰な一致より、打った文字どおりに絞れる
+        ほうを採る）。
         """
-        needle = query.strip().casefold()
-        if not needle:
+        pattern = compile_pattern(query.strip(), wildcard, case_sensitive)
+        if pattern is None:
             return True
-        return needle in self.row_text(row).casefold()
+        return any(has_match(text, pattern) for text in self.cell_texts(row))
 
     def tracks(self) -> list[Track]:
         """現在の Track リストのスナップショット（浅いコピー）。"""
