@@ -125,6 +125,34 @@ def test_settings_dialog_scrolls_and_keeps_buttons(qtbot):
     assert buttons.y() + buttons.height() <= dlg.height()  # ボタンは常に窓の中
 
 
+def test_settings_dialog_is_tabbed_by_category(qtbot):
+    """設定は項目別のタブに分かれ、各ページは個別にスクロールする。"""
+    dlg = SettingsDialog()
+    qtbot.addWidget(dlg)
+    tabs = dlg._tabs
+    titles = [tabs.tabText(i) for i in range(tabs.count())]
+    assert titles == ["ダウンロード", "音質・加工", "タイトル推定", "LLM 接続", "yt-dlp", "表示"]
+    assert all(isinstance(tabs.widget(i), QScrollArea) for i in range(tabs.count()))
+
+    def tab_of(widget):
+        return next(
+            tabs.tabText(i) for i in range(tabs.count()) if tabs.widget(i).isAncestorOf(widget)
+        )
+
+    assert tab_of(dlg._dir_edit) == "ダウンロード"
+    assert tab_of(dlg._max_dl_spin) == "ダウンロード"
+    assert tab_of(dlg._expand_check) == "ダウンロード"
+    assert tab_of(dlg._bitrate_combo) == "音質・加工"
+    assert tab_of(dlg._loudness_spin) == "音質・加工"
+    assert tab_of(dlg._trim_check) == "音質・加工"
+    assert tab_of(dlg._schema_check) == "タイトル推定"
+    assert tab_of(dlg._ytmusic_check) == "タイトル推定"
+    assert tab_of(dlg._base_url_edit) == "LLM 接続"
+    assert tab_of(dlg._prompt_edit) == "LLM 接続"
+    assert tab_of(dlg._ytdlp_update_btn) == "yt-dlp"
+    assert tab_of(dlg._log_level_combo) == "表示"
+
+
 def test_settings_dialog_bitrate_choices(qtbot):
     """ビットレート欄は「既定 / 取得元と同じ / 固定 kbps」を data で返す。"""
     dlg = SettingsDialog(audio_bitrate=core.BITRATE_SOURCE)

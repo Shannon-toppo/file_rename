@@ -71,6 +71,7 @@ from .model import (
 )
 from .player import PreviewPlayer, format_time
 from .settings_dialog import SettingsDialog
+from .textmatch import compile_pattern, has_match, replace_in
 from .workers import (
     MODE_FETCH,
     MODE_FULL,
@@ -152,6 +153,30 @@ def reveal_in_file_manager(path: Path) -> bool:
         return False
 
 
+def replace_shortcut() -> QKeySequence:
+    """置換欄へ移るショートカット（Windows は Ctrl+H、mac は ⌃H = Control+H）。
+
+    Qt の "Ctrl" は mac では ⌘ に読み替えられるため、Qt 標準の Replace
+    （Ctrl+H）のままだと mac では ⌘H = OS 予約の「アプリを隠す」になる。
+    mac の Control キーは Qt では "Meta" なので、明示的に Meta+H を使う。
+    なお mac のテキスト欄では ⌃H が Backspace にも割り当てられているが、
+    QLineEdit / QPlainTextEdit は ShortcutOverride で横取りしない（実機の
+    cocoa で確認済み）ので、検索欄にフォーカスがあってもこちらが効く。
+    """
+    if sys.platform == "darwin":
+        return QKeySequence("Meta+H")
+    return QKeySequence(QKeySequence.StandardKey.Replace)
+
+
+# 置換バーの「対象列」コンボの選択肢（表示名, 列番号のタプル）
+_REPLACE_TARGETS = (
+    ("推定タイトル・アーティスト・アルバム", EDITABLE_COLUMNS),
+    ("推定タイトル", (COL_TITLE,)),
+    ("アーティスト", (COL_ARTIST,)),
+    ("アルバム", (COL_ALBUM,)),
+)
+
+
 def _ffmpeg_install_hint() -> str:
     """OS 別の ffmpeg インストール案内（警告ダイアログ用）。"""
     if sys.platform == "darwin":
@@ -201,6 +226,10 @@ class MainWindow(QMainWindow):
         # いるか」で、隠していないときに再適用を丸ごと省くために持つ
         self._search_text: str = ""
         self._filter_active: bool = False
+        # 置換した行は検索語に一致しなくなっても隠さない（置換直後に行が
+        # 消えると削除されたように見えるため）。id(track) → track で持つ
+        # （Track を生かしておき id の再利用を防ぐ）。検索条件が変わったら捨てる
+        self._pinned: dict[int, Track] = {}
 
         self._build_ui()
         # 試聴プレーヤ（ノーマライズ・無音削除の結果確認用）。QtMultimedia の
@@ -324,8 +353,14 @@ class MainWindow(QMainWindow):
         self._noplaylist_check.toggled.connect(self._on_noplaylist_toggled)
         bar.addWidget(self._noplaylist_check)
         bar.addStretch(1)
-        search_btn = QPushButton("検索")
-        search_btn.setToolTip("キーワードで行を絞り込む（Ctrl+F）")
+        search_btn = QPushButton("検索・置換")
+        native = QKeySequence.SequenceFormat.NativeText
+        search_btn.setToolTip(
+            "キーワードで行を絞り込み、推定タイトル・アーティスト・アルバムの"
+            "文字列を置き換える\n"
+            f"（{QKeySequence(QKeySequence.StandardKey.Find).toString(native)} で検索欄、"
+            f"{replace_shortcut().toString(native)} で置換欄へ）"
+        )
         search_btn.clicked.connect(self.open_search)
         bar.addWidget(search_btn)
         settings_btn = QPushButton("設定")
@@ -333,7 +368,7 @@ class MainWindow(QMainWindow):
         bar.addWidget(settings_btn)
         root.addLayout(bar)
 
-        # 上段の追加系ボタンと [検索]/[設定] の幅を統一する（最長ラベル基準。
+        # 上段の追加系ボタンと [検索・置換]/[設定] の幅を統一する（最長ラベル基準。
         # グリッドの列幅を揃え、別レイアウトのボタンも同じ幅にする）
         same_width = (add_btn, list_btn, file_btn, import_btn, search_btn, settings_btn)
         width = max(b.sizeHint().width() for b in same_width)
@@ -370,9 +405,12 @@ class MainWindow(QMainWindow):
         # （QSortFilterProxyModel を使わない理由は _apply_filter を参照）
         self._search_bar = QWidget()
         self._search_bar.setVisible(False)
-        search_lay = QHBoxLayout(self._search_bar)
-        search_lay.setContentsMargins(0, 0, 0, 0)
-        search_lay.addWidget(QLabel("検索:"))
+        search_box = QVBoxLayout(self._search_bar)
+        search_box.setContentsMargins(0, 0, 0, 0)
+        search_box.setSpacing(4)
+        search_lay = QHBoxLayout()
+        search_title = QLabel("検索:")
+        search_lay.addWidget(search_title)
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText(
             "キーワードを入力すると一致する行だけ表示（Enter で表へ / Esc で解除）"
@@ -380,8 +418,9 @@ class MainWindow(QMainWindow):
         self._search_edit.setClearButtonEnabled(True)
         self._search_edit.setToolTip(
             "元タイトル・チャンネル・推定タイトル・アーティスト・アルバム・状態・"
-            "形式のいずれかに含まれる行を表示する（大文字小文字は区別しない）。\n"
-            "表示の絞り込みだけで、[▶ 実行] の対象は全行のまま"
+            "形式のいずれかに含まれる行を表示する。\n"
+            "表示の絞り込みだけで、[▶ 実行] の対象は全行のまま。\n"
+            "下段の置換欄では、この文字列を置き換える"
         )
         self._search_edit.textChanged.connect(self._on_search_changed)
         # Esc で解除 / Enter でテーブルへフォーカス（eventFilter を参照）
@@ -389,11 +428,74 @@ class MainWindow(QMainWindow):
         search_lay.addWidget(self._search_edit, stretch=1)
         self._search_label = QLabel("")
         search_lay.addWidget(self._search_label)
+        self._wildcard_check = QCheckBox("ワイルドカード")
+        self._wildcard_check.setToolTip(
+            "* = 任意の文字列（0 文字以上）、? = 任意の 1 文字（Excel と同じ記法）。\n"
+            "例: 「(*)」で括弧ごと、「feat.*」で feat. 以降を丸ごと指定できる。\n"
+            "* や ? の文字そのものを探すときは ~* / ~? / ~~ と書く"
+        )
+        self._wildcard_check.toggled.connect(self._on_search_option_changed)
+        search_lay.addWidget(self._wildcard_check)
+        self._case_check = QCheckBox("大/小文字を区別")
+        self._case_check.toggled.connect(self._on_search_option_changed)
+        search_lay.addWidget(self._case_check)
         search_close = QPushButton("✕")
         search_close.setFixedWidth(28)
         search_close.setToolTip("絞り込みを解除して検索欄を閉じる")
         search_close.clicked.connect(self.close_search)
         search_lay.addWidget(search_close)
+        search_box.addLayout(search_lay)
+
+        # 置換欄（検索欄の下段。検索欄と常に一緒に出す — open_search 参照）。
+        # 検索語に一致した部分を編集可能列（推定タイトル / アーティスト /
+        # アルバム）で置き換える。Edit 系コマンド経由なので undo（Ctrl+Z）で戻せる
+        replace_lay = QHBoxLayout()
+        replace_title = QLabel("置換後:")
+        replace_lay.addWidget(replace_title)
+        self._replace_edit = QLineEdit()
+        self._replace_edit.setPlaceholderText(
+            "置換後の文字列（空欄なら削除）。Enter で 1 件ずつ / Ctrl+Enter ですべて置換"
+        )
+        self._replace_edit.installEventFilter(self)
+        replace_lay.addWidget(self._replace_edit, stretch=1)
+        self._replace_label = QLabel("")
+        replace_lay.addWidget(self._replace_label)
+        replace_lay.addWidget(QLabel("対象:"))
+        self._replace_target = QComboBox()
+        for label, cols in _REPLACE_TARGETS:
+            self._replace_target.addItem(label, cols)
+        self._replace_target.setToolTip(
+            "置き換える列（元タイトル・チャンネルなどは書き込み対象でないため置換しない）"
+        )
+        self._replace_target.currentIndexChanged.connect(lambda *_: self._update_replace_label())
+        replace_lay.addWidget(self._replace_target)
+        next_keys = QKeySequence.keyBindings(QKeySequence.StandardKey.FindNext)[0].toString(native)
+        self._find_next_btn = QPushButton("次へ")
+        self._find_next_btn.setToolTip(
+            f"次の一致セルへ移動する（置換はしない）。{next_keys}、Shift を足すと前へ"
+        )
+        self._find_next_btn.clicked.connect(lambda: self.find_next())
+        replace_lay.addWidget(self._find_next_btn)
+        self._replace_one_btn = QPushButton("置換して次へ")
+        self._replace_one_btn.setToolTip(
+            "選択中のセルが一致していれば置き換えて、次の一致セルへ移動する\n"
+            "（一致していなければ、置き換えずに次の一致セルへ移動するだけ）。"
+            "置換欄で Enter"
+        )
+        self._replace_one_btn.clicked.connect(self.replace_current)
+        replace_lay.addWidget(self._replace_one_btn)
+        self._replace_all_btn = QPushButton("すべて置換")
+        self._replace_all_btn.setToolTip(
+            "表示中の行の一致をすべて置き換える（Ctrl+Z で一括して元に戻せる）。"
+            "置換欄で Ctrl+Enter"
+        )
+        self._replace_all_btn.clicked.connect(self.replace_all)
+        replace_lay.addWidget(self._replace_all_btn)
+        search_box.addLayout(replace_lay)
+        # 「検索:」「置換:」の幅を揃えて入力欄の左端を合わせる
+        label_width = max(search_title.sizeHint().width(), replace_title.sizeHint().width())
+        search_title.setFixedWidth(label_width)
+        replace_title.setFixedWidth(label_width)
         root.addWidget(self._search_bar)
 
         # 中央: テーブル
@@ -517,6 +619,9 @@ class MainWindow(QMainWindow):
             del_btn,
             self._play_btn,
             self._tail_btn,
+            # 置換はセル編集と同じ扱い（実行中はワーカーが Track を書き換える）
+            self._replace_one_btn,
+            self._replace_all_btn,
         ]
 
         # undo/redo（Ctrl+Z / Ctrl+Y）。ウィンドウにアクションを載せる
@@ -533,6 +638,20 @@ class MainWindow(QMainWindow):
         find_action.setShortcut(QKeySequence.StandardKey.Find)
         find_action.triggered.connect(self.open_search)
         self.addAction(find_action)
+        # 置換（Ctrl+H、mac は ⌘⌥F。replace_shortcut 参照）
+        replace_action = QAction("置換", self)
+        replace_action.setShortcut(replace_shortcut())
+        replace_action.triggered.connect(self.open_replace)
+        self.addAction(replace_action)
+        # 次 / 前の一致セルへ（F3・Shift+F3、mac は ⌘G・⌘⇧G）
+        find_next_action = QAction("次を検索", self)
+        find_next_action.setShortcuts(QKeySequence.StandardKey.FindNext)
+        find_next_action.triggered.connect(lambda: self.find_next())
+        self.addAction(find_next_action)
+        find_prev_action = QAction("前を検索", self)
+        find_prev_action.setShortcuts(QKeySequence.StandardKey.FindPrevious)
+        find_prev_action.triggered.connect(lambda: self.find_next(backward=True))
+        self.addAction(find_prev_action)
 
         # undo コマンドは行番号(int)を保持するため、行の並び・構成が変わったら
         # 過去のコマンドは無効（別の行に復元されてしまう）。行削除・差し替え
@@ -564,41 +683,60 @@ class MainWindow(QMainWindow):
             )
 
     def eventFilter(self, obj, event) -> bool:
-        """URL 欄と検索欄のキー操作を拾う。
+        """URL 欄・検索欄・置換欄のキー操作を拾う。
 
         - URL 欄の Ctrl+Enter（mac は ⌘+Enter）で [追加] を実行
         - 検索欄の Esc で絞り込み解除、Enter でテーブルへフォーカス移動
+        - 置換欄の Enter で 1 件置換、Ctrl+Enter ですべて置換、Esc で閉じる
         """
         if event.type() != QEvent.Type.KeyPress:
             return super().eventFilter(obj, event)
         key = event.key()
-        if (
-            obj is self._url_edit
-            and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
-            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
-        ):
+        is_enter = key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+        mods = event.modifiers()
+        if obj is self._url_edit and is_enter and mods & Qt.KeyboardModifier.ControlModifier:
             self._on_add_urls()
             return True
-        if obj is self._search_edit:
-            if key == Qt.Key.Key_Escape:
-                self.close_search()
-                return True
-            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                # 絞り込んだ行をそのまま操作できるようテーブルへ移る
-                self._view.setFocus()
-                return True
+        if obj in (self._search_edit, self._replace_edit) and key == Qt.Key.Key_Escape:
+            self.close_search()
+            return True
+        if obj is self._search_edit and is_enter:
+            # 絞り込んだ行をそのまま操作できるようテーブルへ移る
+            self._view.setFocus()
+            return True
+        if obj is self._replace_edit and is_enter:
+            if mods & Qt.KeyboardModifier.ControlModifier:
+                self.replace_all()
+            else:
+                self.replace_current()
+            return True
         return super().eventFilter(obj, event)
 
     # -- 検索（行の絞り込み）------------------------------------------------
 
     def open_search(self) -> None:
-        """検索欄を開いてフォーカスする（[検索] ボタン / Ctrl+F）。"""
+        """検索・置換バーを開いて検索欄へフォーカスする（[検索・置換] / Ctrl+F）。
+
+        置換欄は検索欄と常に一緒に出す（検索だけのモードは持たない）。モードを
+        分けると置換欄の開閉ボタンが要り、「置換」と書かれたボタンが並んで
+        どれが何か分かりにくくなるため。置換欄は 1 行ぶんの高さしか取らない。
+        """
+        self._open_bar(self._search_edit)
+
+    def open_replace(self) -> None:
+        """検索・置換バーを開く（Ctrl+H、mac は ⌃H）。
+
+        検索語が未入力なら検索欄に、入力済みなら置換欄にフォーカスする。
+        """
+        self._open_bar(self._replace_edit if self._search_text else self._search_edit)
+
+    def _open_bar(self, edit: QLineEdit) -> None:
         self._search_bar.setVisible(True)
-        self._search_edit.setFocus()
-        self._search_edit.selectAll()
+        edit.setFocus()
+        edit.selectAll()
 
     def close_search(self) -> None:
-        """絞り込みを解除して検索欄を閉じる（✕ / Esc）。
+        """絞り込みを解除して検索・置換バーを閉じる（✕ / Esc）。
 
         隠したまま閉じると「行が消えた」ように見えるため、必ず解除してから
         閉じる（clear → textChanged → _apply_filter で全行が戻る）。
@@ -609,7 +747,17 @@ class MainWindow(QMainWindow):
 
     def _on_search_changed(self, text: str) -> None:
         self._search_text = text
+        self._pinned.clear()  # 検索条件が変わったら「置換済みで残す行」は解除
         self._apply_filter()
+        self._update_replace_label()
+
+    def _on_search_option_changed(self, *_) -> None:
+        """ワイルドカード / 大小文字の切り替え。絞り込みを掛け直す。"""
+        self._pinned.clear()
+        # 何も隠していなくても、新しい条件で隠す行が出るので必ず評価する
+        self._filter_active = True
+        self._apply_filter()
+        self._update_replace_label()
 
     def _on_data_changed(self, top_left, bottom_right, roles=None) -> None:
         """行の内容が変わったら、その行だけ絞り込みを評価し直す。"""
@@ -633,7 +781,16 @@ class MainWindow(QMainWindow):
         else:
             rows = range(max(0, first), min(last, row_count - 1) + 1)
         for row in rows:
-            self._view.setRowHidden(row, not self._model.matches(row, self._search_text))
+            hidden = (
+                not self._model.matches(
+                    row,
+                    self._search_text,
+                    wildcard=self._wildcard_check.isChecked(),
+                    case_sensitive=self._case_check.isChecked(),
+                )
+                and id(self._model.track_at(row)) not in self._pinned
+            )
+            self._view.setRowHidden(row, hidden)
         self._filter_active = active
         self._update_search_label()
 
@@ -649,6 +806,164 @@ class MainWindow(QMainWindow):
     def _visible_rows(self) -> list[int]:
         """絞り込みで隠れていない行の行番号。"""
         return [r for r in range(self._model.rowCount()) if not self._view.isRowHidden(r)]
+
+    # -- 置換 / 一致セルへの移動 ----------------------------------------------
+
+    def _find_pattern(self):
+        """置換・一致セル移動用のパターンを作る（検索語が空なら None）。
+
+        絞り込みは前後の空白を落とした語で行うが、置換は打ったとおりの語を
+        使う（「 (Official)」の先頭の空白ごと消したい、二重スペースを 1 つに
+        したい、など空白自体が置換の対象になるため）。空白を落とした語の
+        一致は元の語の一致を必ず含むので、置換対象が隠れた行に残ることはない。
+        """
+        return compile_pattern(
+            self._search_text, self._wildcard_check.isChecked(), self._case_check.isChecked()
+        )
+
+    def _replace_columns(self) -> tuple[int, ...]:
+        return self._replace_target.currentData() or EDITABLE_COLUMNS
+
+    def _cell_value(self, row: int, col: int) -> str:
+        """セルの編集値（✎ やエラー表示を含まない素の値）。置換はこれに当てる。"""
+        index = self._model.index(row, col)
+        return str(self._model.data(index, Qt.ItemDataRole.EditRole) or "")
+
+    def _matching_cells(self) -> list[tuple[int, int]]:
+        """表示中の行で、置換対象の列のうち検索語に一致するセル (行, 列) を
+        表の並び順で返す（[次へ] / [置換して次へ] の移動先）。"""
+        pattern = self._find_pattern()
+        if pattern is None:
+            return []
+        return [
+            (row, col)
+            for row in self._visible_rows()
+            for col in self._replace_columns()
+            if has_match(self._cell_value(row, col), pattern)
+        ]
+
+    def find_next(self, backward: bool = False) -> bool:
+        """現在セルの次（backward=True なら前）の一致セルへ移動する。
+
+        末尾まで行ったら先頭へ回り込む。一致が 1 つも無ければ False。
+        検索欄が閉じていれば開く（F3 / ⌘G を押しても何も起きないと戸惑うため）。
+        """
+        if self._search_bar.isHidden():
+            self.open_search()
+        cells = self._matching_cells()
+        if not cells:
+            self.statusBar().showMessage(
+                "一致するセルはありません" if self._search_text else "検索する文字列を入力してください"
+            )
+            return False
+        cur = self._view.currentIndex()
+        if backward:
+            pos = (cur.row(), cur.column()) if cur.isValid() else (self._model.rowCount(), 0)
+            before = [c for c in cells if c < pos]
+            row, col = before[-1] if before else cells[-1]
+        else:
+            pos = (cur.row(), cur.column()) if cur.isValid() else (-1, -1)
+            after = [c for c in cells if c > pos]
+            row, col = after[0] if after else cells[0]
+        index = self._model.index(row, col)
+        # フォーカスは移さない（検索欄・置換欄で Enter を続けて押せるように）
+        self._view.setCurrentIndex(index)
+        self._view.scrollTo(index)
+        return True
+
+    def _pin_rows(self, rows) -> None:
+        for row in rows:
+            track = self._model.track_at(row)
+            self._pinned[id(track)] = track
+
+    def replace_current(self) -> bool:
+        """現在セルを置換して次の一致セルへ移る（[置換] / 置換欄の Enter）。
+
+        Excel の [置換] と同じく、現在セルが一致していなければ置き換えずに
+        次の一致セルへ移動するだけ。1 回目で位置を確かめ、2 回目以降で 1 件
+        ずつ置き換えていける。置換したら True。
+        """
+        if self._running:
+            return False
+        pattern = self._find_pattern()
+        if pattern is None:
+            self.statusBar().showMessage("検索する文字列を入力してください")
+            return False
+        cur = self._view.currentIndex()
+        replaced = False
+        if (
+            cur.isValid()
+            and not self._view.isRowHidden(cur.row())
+            and cur.column() in self._replace_columns()
+        ):
+            row, col = cur.row(), cur.column()
+            old = self._cell_value(row, col)
+            new, count = replace_in(old, pattern, self._replace_edit.text())
+            if count and new.strip() != old:
+                self._pin_rows([row])
+                self._undo.beginMacro("置換")
+                self.push_edit(row, col, new)
+                self._undo.endMacro()
+                replaced = True
+        found = self.find_next()
+        self._update_replace_label()
+        if replaced:
+            self.statusBar().showMessage(
+                "置換しました" + ("（次の一致へ移動）" if found else "（ほかに一致はありません）")
+            )
+        elif found:
+            self.statusBar().showMessage(
+                "一致したセルへ移動しました。もう一度 [置換] で置き換えます"
+            )
+        return replaced
+
+    def replace_all(self) -> int:
+        """表示中の行の一致をすべて置換する（[すべて置換] / Ctrl+Enter）。
+
+        置換したセル数を返す。1 つの undo macro にまとめるので、Ctrl+Z 1 回で
+        全部戻る。置換した行は検索語に一致しなくなっても表示に残し（_pinned）、
+        選択状態にしてそのまま確認・書き込みへ進めるようにする。
+        """
+        if self._running:
+            return 0
+        pattern = self._find_pattern()
+        if pattern is None:
+            self.statusBar().showMessage("検索する文字列を入力してください")
+            return 0
+        replacement = self._replace_edit.text()
+        edits: list[tuple[int, int, str]] = []
+        occurrences = 0
+        for row in self._visible_rows():
+            for col in self._replace_columns():
+                old = self._cell_value(row, col)
+                new, count = replace_in(old, pattern, replacement)
+                if count and new.strip() != old:
+                    edits.append((row, col, new))
+                    occurrences += count
+        if not edits:
+            self.statusBar().showMessage("置換できる一致はありません")
+            return 0
+        rows = sorted({row for row, _, _ in edits})
+        self._pin_rows(rows)
+        self._undo.beginMacro("すべて置換")
+        for row, col, value in edits:
+            self.push_edit(row, col, value)
+        self._undo.endMacro()
+        self._select_rows(rows)
+        self._update_replace_label()
+        self.statusBar().showMessage(
+            f"{len(rows)} 行・{len(edits)} セルを置換しました（{occurrences} 箇所）。"
+            "Ctrl+Z で元に戻せます"
+        )
+        return len(edits)
+
+    def _update_replace_label(self) -> None:
+        """置換欄の右側に、置換対象になるセル数を出す。"""
+        if not self._search_text:
+            self._replace_label.setText("")
+            return
+        n = len(self._matching_cells())
+        self._replace_label.setText(f"{n} セル一致" if n else "一致なし")
 
     # -- 行追加系 ------------------------------------------------------------
 
