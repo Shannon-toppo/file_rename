@@ -8,7 +8,6 @@
 （Config.from_env() が読む前に載せておく必要があるため）。
 新しいスクリプトでも env 設定を重複させず、このモジュールを import すること。
 """
-import dataclasses
 import logging
 import json
 import os
@@ -29,7 +28,17 @@ from mutagen.id3._util import ID3NoHeaderError
 from mutagen.mp4 import MP4
 from mutagen.oggopus import OggOpus
 from mutagen.wave import WAVE
-from mv2title import Config, LLMClient, TitleInput, extract_titles
+from mv2title import (
+    Config,
+    ConnectionCheckError,
+    LLMClient,
+    TitleInput,
+    check_endpoint,
+    extract_titles,
+    model_aliases,
+)
+from mv2title import ModelMismatchError as LibModelMismatchError
+from mv2title import make_client as _lib_make_client
 from mv2title.connect import DEFAULT_MODEL  # noqa: F401 - MODEL 未設定時の実効値（GUI の表示用に re-export）
 
 import ytdlp_runtime
@@ -290,7 +299,12 @@ class CoreError(Exception):
 
 
 class ModelMismatchError(CoreError):
-    """指定したモデルとは別のモデルが応答した（サーバー側の差し替え）。"""
+    """指定したモデルとは別のモデルが応答した（サーバー側の差し替え）。
+
+    検出自体は mv2title（ModelCheckedClient）が行う。infer_titles が
+    mv2title.ModelMismatchError を捕まえてこちらへ包み直すのは、CoreError で
+    なければ行が ERROR にならないため（と、GUI 向けの案内を足すため）。
+    """
 
 
 class Status(Enum):
@@ -447,132 +461,20 @@ def read_url_list(path: Path) -> list[str]:
 def make_client() -> LLMClient:
     """接続設定（.env / GUI の上書き済み環境変数）で LLMClient を作る。
 
-    MODEL はサーバーの /models にある完全な id へ解決してから使い
-    （resolve_model）、指定と違うモデルが応答したら止めるクライアントを返す
-    （_ModelCheckedClient）。LM Studio は一覧の id と完全一致しない名前を
-    受けると、エラーにせずロード中の別モデルで黙って答えるため。実測:
-    e4b をロード中に "gemma-4-e2b" を指定 → google/gemma-4-e4b が応答、
-    "google/gemma-4-e2b" を指定 → e2b が JIT ロードされて応答した。
+    実体は mv2title の make_client。MODEL をサーバーの /models にある完全な id
+    へ解決し、指定と違うモデルが応答したら止めるクライアントを返す。LM Studio は
+    一覧の id と完全一致しない名前を受けると、エラーにせずロード中の別モデルで
+    黙って答えるため（実測と詳細は mv2title.connect の docstring を参照）。
     """
-    config = Config.from_env()
-    try:
-        ids = _fetch_model_ids(config, timeout=3.0)
-    except CoreError:
-        ids = []  # 一覧が取れなければ解決しない（失敗理由は推論の呼び出しで出る）
-    model = resolve_model(config.model or "", ids)
-    if model and model != config.model:
-        config = dataclasses.replace(config, model=model)
-    return _ModelCheckedClient(config)
-
-
-def _model_aliases(model_id: str) -> set[str]:
-    """モデル名の表記ゆれ（publisher 有無・量子化サフィックス・大小文字）を列挙する。
-
-    /models が返す id は publisher 付き（例: "google/gemma-4-e2b"）だが、
-    LM Studio の画面や設定では publisher を省いた "gemma-4-e2b" と書かれる。
-    これは「同じモデルを指しているか」を比べるためのもので、サーバーへ送る
-    名前には使わない: LM Studio は省略形を同じモデルに解決するとは限らず、
-    別のモデルがロード中だとそちらで答える（make_client 参照）。
-    """
-    base = model_id.strip().lower().split("@", 1)[0]
-    aliases = {base}
-    if "/" in base:
-        aliases.add(base.rsplit("/", 1)[1])
-    return {a for a in aliases if a}
-
-
-def resolve_model(model: str, server_ids: Sequence[str]) -> str:
-    """設定のモデル名を、サーバーの一覧にある完全な id へ解決する。
-
-    大小文字違いを除いた完全一致を最優先し、無ければ表記ゆれ（_model_aliases）
-    で一致する id が 1 つだけのときにそれを返す。候補が複数（量子化違いが
-    並んでいる等）や一覧に無いときは決めつけず、指定をそのまま返す。
-    """
-    wanted = model.strip()
-    for sid in server_ids:
-        if sid.lower() == wanted.lower():
-            return sid
-    aliases = _model_aliases(wanted)
-    matches = [sid for sid in server_ids if _model_aliases(sid) & aliases]
-    return matches[0] if len(matches) == 1 else wanted
-
-
-class _ModelCheckedClient(LLMClient):
-    """応答の model 欄を確かめ、指定と違うモデルが答えたら止める LLMClient。
-
-    resolve_model で解決できなかった名前（一覧に無い・候補が複数）でも、
-    サーバーが黙って別のモデルで推論した結果をタイトルとして使わないための
-    最後の砦。一度不一致を見たら以降はリクエストを送らずに同じ例外を投げる:
-    mv2title は送信時の例外を構造化出力の拒否とみなしてプレーンで再送する
-    ため、そのままだと違うモデルでもう一度推論させてしまう。
-    """
-
-    def __init__(self, config: Config) -> None:
-        super().__init__(config)
-        self._mismatch: ModelMismatchError | None = None
-
-    def send_message(self, prompt, system_prompt=None, model_name=None, **kwargs):
-        if self._mismatch is not None:
-            raise self._mismatch
-        res = super().send_message(prompt, system_prompt, model_name, **kwargs)
-        requested = model_name if model_name is not None else self.config.model
-        answered = getattr(res, "model", None)
-        if isinstance(answered, str) and answered and requested:
-            if not (_model_aliases(requested) & _model_aliases(answered)):
-                self._mismatch = ModelMismatchError(
-                    f"指定したモデル '{requested}' ではなく '{answered}' が応答しました"
-                    "（サーバーが別のモデルに差し替えています）。"
-                    f"LM Studio で '{requested}' をロードするか、[設定] の MODEL を"
-                    "サーバーのモデル一覧にある名前にしてください。"
-                )
-                raise self._mismatch
-        return res
-
-
-def _fetch_model_ids(config: Config, timeout: float) -> list[str]:
-    """GET {base_url}/models でサーバーのモデル id 一覧を取る。
-
-    ステータスコードだけでは判定しない: LM Studio は存在しないパスにも
-    HTTP 200 でエラー JSON を返すため（例: BASE_URL の /v1 抜け）、
-    ボディが /models 応答の形（"data" リスト）であることまで確認する。
-
-    Raises:
-        CoreError: 接続できない・エラー応答・/models 形式でない（文言は利用者向け）。
-    """
-    url = config.base_url.rstrip("/") + "/models"
-    req = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {config.api_key or 'not-needed'}"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            status = getattr(resp, "status", 200)
-            if not 200 <= status < 300:
-                raise CoreError(f"エンドポイントがエラーを返しました (HTTP {status})")
-            body = resp.read(65536)
-    except CoreError:
-        raise
-    except Exception as e:
-        raise CoreError(f"接続できません ({config.base_url}): {e}") from e
-    try:
-        payload = json.loads(body)
-    except ValueError:
-        payload = None
-    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-        raise CoreError(
-            f"応答が OpenAI 互換の /models 形式ではありません ({url})。"
-            "BASE_URL のパス（例: 末尾の /v1）が正しいか確認してください。"
-        )
-    return [
-        m["id"] for m in payload["data"] if isinstance(m, dict) and isinstance(m.get("id"), str)
-    ]
+    return _lib_make_client(Config.from_env(), timeout=3.0)
 
 
 def check_connection(timeout: float = 3.0) -> tuple[bool, str]:
     """LLM エンドポイントの疎通を確認する（補完呼び出しはしない軽量チェック）。
 
-    OpenAI 互換の GET {base_url}/models を短い timeout で叩く（_fetch_model_ids）。
-    LLM の推論を伴わないため、サーバの生死確認としては十分軽い。
+    OpenAI 互換の GET {base_url}/models を短い timeout で叩くだけ
+    （mv2title.check_endpoint）。LLM の推論を伴わないため、サーバの生死確認
+    としては十分軽い。文言の組み立てはこちらの責務（ライブラリは素材だけ返す）。
 
     Returns:
         (成功可否, 人間向けメッセージ)。例外は投げず、失敗理由を文字列で返す。
@@ -583,20 +485,20 @@ def check_connection(timeout: float = 3.0) -> tuple[bool, str]:
         # BASE_URL 未設定
         return False, str(e)
     try:
-        ids = _fetch_model_ids(config, timeout)
-    except CoreError as e:
+        ids, resolved = check_endpoint(config, timeout)
+    except ConnectionCheckError as e:
         return False, str(e)
     # 使用するモデル名がサーバーの一覧に無ければ注意を添える（MODEL 未設定の
     # まま既定値になっている事故などに気付けるように）。LM Studio はその場合
-    # ロード中の別モデルで答えようとし、推論は _ModelCheckedClient が止める。
+    # ロード中の別モデルで答えようとし、推論は make_client が返す
+    # ModelCheckedClient が止める。
     # 一覧に無くても通るサーバーはあり得るので NG（接続失敗）にはしない
     model = config.model or ""
-    if ids and not any(_model_aliases(model) & _model_aliases(i) for i in ids):
+    if ids and not any(model_aliases(model) & model_aliases(i) for i in ids):
         return True, (
             f"接続 OK: {config.base_url}（注意: モデル '{model}' は"
             "サーバーのモデル一覧にありません。[設定] の MODEL を一覧にある名前にしてください）"
         )
-    resolved = resolve_model(model, ids)
     if resolved != model:
         return True, f"接続 OK: {config.base_url}（モデル: {model} → {resolved}）"
     return True, f"接続 OK: {config.base_url}"
@@ -1396,6 +1298,11 @@ def fetch_metadata(
 EMPTY_TITLE_ERROR = "タイトルを推定できませんでした（LLM の応答にこの行の項目がありません）。"
 
 
+# GUI 向けの案内。mv2title の文言は「'X' をロードするか、MODEL を一覧にある
+# 名前にしてください」までなので、その操作場所だけを足す。
+MODEL_MISMATCH_HINT = "（ロードは LM Studio 側で、MODEL の変更は [設定] で行えます）"
+
+
 # --- 空で返った項目の拾い直し（mv2title 0.4.0 で不要になったため無効）---------
 #
 # 症状: 2 件以上を一度に推定すると、1 件目以外の曲名が空欄になる。
@@ -1502,13 +1409,18 @@ def infer_titles(
     if client is None:
         client = make_client()
     try:
-        # 応答に載らなかった項目の拾い直しは mv2title 0.4.0 側で行われる
-        # （bypass_check=True でも部分リトライが走る）。0.3.0 以前で動かすなら
-        # 下の 1 行を戻す（_retry_missing_titles の上のコメント参照）
+        # 応答に載らなかった項目の拾い直しは mv2title 側で行われる
         results = extract_titles(
             inputs, client, batch_size=batch_size, bypass_check=True, use_schema=use_schema
         )
-        # results = _retry_missing_titles(inputs, list(results), client, batch_size)
+    except LibModelMismatchError as e:
+        # 別のモデルが答えた場合。CoreError でないと行が ERROR にならないため
+        # 包み直し、GUI での直し方を添える
+        msg = f"タイトル推定に失敗しました: {e}{MODEL_MISMATCH_HINT}"
+        for t in targets:
+            t.status = Status.ERROR
+            t.error = msg
+        raise ModelMismatchError(msg) from e
     except Exception as e:
         for t in targets:
             t.status = Status.ERROR
