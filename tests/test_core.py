@@ -3,6 +3,7 @@
 import threading
 from pathlib import Path
 
+import mv2title
 import pytest
 from mutagen.id3 import ID3
 from mutagen.id3._util import ID3NoHeaderError
@@ -1585,43 +1586,24 @@ def test_check_connection_shows_resolved_model(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# モデル名の解決と応答モデルの確認
+# make_client / 応答モデルの確認（実装は mv2title 0.5.0、ここは利用側の配線）
 # （LM Studio は一覧と完全一致しない名前だとロード中の別モデルで黙って答える）
 # ---------------------------------------------------------------------------
 
-_SERVER_IDS = ["google/gemma-4-e4b", "google/gemma-4-e2b", "hy-mt2-1.8b@bf16", "hy-mt2-1.8b@8bit"]
 _SERVER_BODY = (
     b'{"data": [{"id": "google/gemma-4-e4b"}, {"id": "google/gemma-4-e2b"},'
     b' {"id": "hy-mt2-1.8b@bf16"}, {"id": "hy-mt2-1.8b@8bit"}]}'
 )
 
 
-@pytest.mark.parametrize(
-    "model, expected",
-    [
-        ("gemma-4-e2b", "google/gemma-4-e2b"),  # publisher 省略 → 完全な id
-        ("Gemma-4-E2B", "google/gemma-4-e2b"),  # 大小文字の揺れ
-        ("google/gemma-4-e2b", "google/gemma-4-e2b"),  # 完全一致
-        ("hy-mt2-1.8b@8bit", "hy-mt2-1.8b@8bit"),  # 完全一致は量子化違いより優先
-        ("hy-mt2-1.8b", "hy-mt2-1.8b"),  # 候補が複数なら決めつけない
-        ("gemma-4-e2b-it", "gemma-4-e2b-it"),  # 一覧に無ければそのまま
-    ],
-)
-def test_resolve_model(model, expected):
-    assert core.resolve_model(model, _SERVER_IDS) == expected
-
-
-def test_resolve_model_without_list():
-    assert core.resolve_model("gemma-4-e2b", []) == "gemma-4-e2b"
-
-
 def test_make_client_resolves_model(monkeypatch):
+    """MODEL の解決は mv2title.make_client が行う（core は設定を渡すだけ）。"""
     monkeypatch.setenv("BASE_URL", "http://127.0.0.1:1234/v1/")
     monkeypatch.setenv("MODEL", "gemma-4-e2b")
     _fake_urlopen(monkeypatch, _SERVER_BODY)
     client = core.make_client()
     assert client.config.model == "google/gemma-4-e2b"
-    assert isinstance(client, core._ModelCheckedClient)
+    assert isinstance(client, mv2title.ModelCheckedClient)
 
 
 def test_make_client_keeps_model_when_list_unavailable(monkeypatch):
@@ -1636,7 +1618,7 @@ def test_make_client_keeps_model_when_list_unavailable(monkeypatch):
 
 
 def _checked_client(monkeypatch, answered, model="google/gemma-4-e2b"):
-    """応答の model 欄が answered になる _ModelCheckedClient と、送信の記録。"""
+    """応答の model 欄が answered になる ModelCheckedClient と、送信の記録。"""
     sent = []
 
     def fake_send(self, prompt, system_prompt=None, model_name=None, **kwargs):
@@ -1648,34 +1630,22 @@ def _checked_client(monkeypatch, answered, model="google/gemma-4-e2b"):
 
     monkeypatch.setattr(core.LLMClient, "send_message", fake_send)
     config = core.Config(base_url="http://127.0.0.1:1234/v1/", model=model)
-    return core._ModelCheckedClient(config), sent
-
-
-def test_checked_client_rejects_substituted_model(monkeypatch):
-    client, sent = _checked_client(monkeypatch, answered="google/gemma-4-e4b")
-    with pytest.raises(core.ModelMismatchError) as exc:
-        client.send_message("p")
-    assert "google/gemma-4-e2b" in str(exc.value) and "google/gemma-4-e4b" in str(exc.value)
-    # 2 回目以降は送らずに同じ理由で止める（違うモデルで推論させない）
-    with pytest.raises(core.ModelMismatchError):
-        client.send_message("p")
-    assert len(sent) == 1
-
-
-@pytest.mark.parametrize("answered", ["google/gemma-4-e2b", "gemma-4-e2b", None, ""])
-def test_checked_client_accepts_same_model(monkeypatch, answered):
-    """表記ゆれの範囲の一致と、model 欄を返さないサーバーは通す。"""
-    client, sent = _checked_client(monkeypatch, answered=answered)
-    client.send_message("p")
-    assert len(sent) == 1
+    return mv2title.ModelCheckedClient(config), sent
 
 
 def test_infer_titles_errors_on_substituted_model(monkeypatch):
-    """違うモデルが答えたら行を ERROR にし、mv2title の再送でも推論させない。"""
+    """違うモデルが答えたら行を ERROR にし、mv2title の再送でも推論させない。
+
+    検出はライブラリ側だが、行を ERROR にするには CoreError で返る必要がある。
+    """
     client, sent = _checked_client(monkeypatch, answered="google/gemma-4-e4b")
     tracks = [Track(stem="MIMI『 Pale 』feat. 初音ミク")]
-    with pytest.raises(core.ModelMismatchError):
+    with pytest.raises(core.ModelMismatchError) as exc:
         core.infer_titles(tracks, client=client)
+    assert isinstance(exc.value, core.CoreError)
+    assert "google/gemma-4-e4b" in str(exc.value)
+    assert core.MODEL_MISMATCH_HINT in str(exc.value)
     assert tracks[0].status == Status.ERROR
     assert "google/gemma-4-e4b" in tracks[0].error
+    # 一度不一致を見たら送信せずに止める（違うモデルでもう一度推論させない）
     assert len(sent) == 1
