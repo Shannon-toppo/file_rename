@@ -545,6 +545,50 @@ def test_fill_artists_keeps_selection(main_window):
     assert win._selected_rows() == [0, 1]
 
 
+def test_fill_titles_from_stem(main_window):
+    """[元タイトル→タイトル] は元タイトルを手入力扱いで推定タイトルへ入れ、undo 可能。"""
+    from pathlib import Path
+
+    from core import Status, Track
+
+    win = main_window
+    url = "https://www.youtube.com/watch?v=x"
+    win._model.add_tracks(
+        [
+            Track(stem="Song A", guessed_title="old", valid=False),
+            Track(stem=url, url=url),  # 未取得の URL 行 → 対象外
+            Track(stem="Song C", url=url, filepath=Path("c.mp3")),
+        ]
+    )
+    win._view.clearSelection()
+    win._on_fill_titles_from_stem()  # 未選択 → 全行が対象
+    a, placeholder, c = (win._model.track_at(r) for r in range(3))
+    assert (a.guessed_title, a.manual, a.status) == ("Song A", True, Status.PENDING)
+    assert placeholder.guessed_title == "" and not placeholder.manual
+    assert c.guessed_title == "Song C" and c.manual
+    assert win._selected_rows() == [0, 2]
+    # macro なので 1 回の undo で全部戻る
+    win._undo.undo()
+    assert (a.guessed_title, a.manual) == ("old", False)
+    assert c.guessed_title == "" and not c.manual
+
+
+def test_fill_titles_from_stem_selected_rows_only(main_window):
+    from core import Track
+
+    win = main_window
+    win._model.add_tracks([Track(stem="a"), Track(stem="b")])
+    win._view.selectRow(1)
+    win._on_fill_titles_from_stem()
+    assert win._model.track_at(0).guessed_title == ""
+    assert win._model.track_at(1).guessed_title == "b"
+    # 実行中は何もしない
+    win._running = True
+    win._view.selectRow(0)
+    win._on_fill_titles_from_stem()
+    assert win._model.track_at(0).guessed_title == ""
+
+
 def test_write_summary_shown_in_statusbar(main_window):
     win = main_window
     win._on_write_summary(3, 1, 0)
