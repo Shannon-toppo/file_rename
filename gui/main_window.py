@@ -586,7 +586,12 @@ class MainWindow(QMainWindow):
             "選択行（未選択なら全行）のアーティスト欄にチャンネル名をそのまま入れる"
         )
         artist_btn.clicked.connect(self._on_fill_artists)
-        for b in (reinfer_btn, artist_btn, write_btn, del_btn):
+        stem_btn = QPushButton("元タイトル→タイトル")
+        stem_btn.setToolTip(
+            "選択行（未選択なら全行）の推定タイトル欄に元タイトルをそのまま入れる（推定しない）"
+        )
+        stem_btn.clicked.connect(self._on_fill_titles_from_stem)
+        for b in (reinfer_btn, stem_btn, artist_btn, write_btn, del_btn):
             bottom.addWidget(b)
         bottom.addStretch(1)
         log_btn = QPushButton("ログ")
@@ -612,6 +617,7 @@ class MainWindow(QMainWindow):
             reinfer_btn,
             write_btn,
             artist_btn,
+            stem_btn,
             add_btn,
             list_btn,
             file_btn,
@@ -1736,6 +1742,37 @@ class MainWindow(QMainWindow):
         # [選択行を書き込み] へ進める状態を明示的に作る。
         self._select_rows(targets)
         self.statusBar().showMessage(f"{len(targets)} 行のアーティスト欄にチャンネル名を入れました")
+
+    def _on_fill_titles_from_stem(self) -> None:
+        """選択行（未選択なら全行）の推定タイトル欄に元タイトルをそのまま入れる。
+
+        手入力と同じ扱い（EditTitleCommand → manual=True / PENDING）なので、
+        再推定で上書きされず [選択行を書き込み] でそのまま書き込める。
+        未取得の URL 行（stem が URL のまま）は曲名ではないので対象外。
+        undo は 1 回でまとめて戻る。
+        """
+        if self._running:
+            return
+        rows = self._selected_rows() or self._visible_rows()
+        targets = []
+        for row in rows:
+            t = self._model.track_at(row)
+            stem = t.stem.strip()
+            if not stem or (t.filepath is None and t.stem == t.url):
+                continue
+            if t.manual and t.guessed_title == stem:
+                continue  # 既に同じ値の手入力 → 積んでも変化なし
+            targets.append(row)
+        if not targets:
+            self.statusBar().showMessage("元タイトルを入れられる行がありません")
+            return
+        self._undo.beginMacro("元タイトルをタイトルへ")
+        for row in targets:
+            self._undo.push(EditTitleCommand(self._model, row, self._model.track_at(row).stem))
+        self._undo.endMacro()
+        # [チャンネル名→アーティスト] と同じく、続けて書き込めるよう選択しておく
+        self._select_rows(targets)
+        self.statusBar().showMessage(f"{len(targets)} 行の推定タイトル欄に元タイトルを入れました")
 
     def _select_rows(self, rows: list[int]) -> None:
         """指定行を行選択し、テーブルへフォーカスを戻す。"""
